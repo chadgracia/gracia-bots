@@ -66,7 +66,7 @@ def main():
                 "rating_scale": None,
                 "rating_source": None,
                 "added_at": f.get("addedDate", now),
-                "watched": "won" in note.lower(),   # past winners are watched
+                "watched": False,                   # set only by an actual win
             }
             if note:
                 item["note"] = note
