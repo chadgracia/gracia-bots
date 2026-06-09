@@ -61,16 +61,19 @@ def _mode_config():
     return {
         "movie": {
             "token_env": "MOVIE_BOT_TOKEN",
+            "token_secret_env": "MOVIE_BOT_TOKEN_SECRET",
             "secret_env": "MOVIE_WEBHOOK_SECRET",
             "handler": handle_movie,
         },
         "cleaning": {
             "token_env": "CLEANING_BOT_TOKEN",
+            "token_secret_env": "CLEANING_BOT_TOKEN_SECRET",
             "secret_env": "CLEANING_WEBHOOK_SECRET",
             "handler": handle_cleaning,
         },
         "salary": {
             "token_env": "SALARY_BOT_TOKEN",
+            "token_secret_env": "SALARY_BOT_TOKEN_SECRET",
             "secret_env": "SALARY_WEBHOOK_SECRET",
             "handler": handle_salary,
         },
@@ -214,12 +217,75 @@ def _tg_request(token, method, payload):
         return {"ok": False, "description": str(e)}
 
 
+# A Telegram bot token is "<bot-id digits>:<35-ish url-safe chars>". We validate
+# this at load so a truncated value (e.g. the leading bot-id digits lost on a
+# bad paste) fails loudly in the logs instead of silently 404ing every send.
+_TOKEN_RE = re.compile(r"^\d{6,}:[A-Za-z0-9_-]{30,}$")
+_token_cache = {}
+_secrets_client = None
+_healthchecked = set()
+
+
+def _get_secret_string(secret_id):
+    """Fetch a secret's value from Secrets Manager. Accepts a raw token or a
+    JSON object like {"token": "..."}."""
+    global _secrets_client
+    if _secrets_client is None:
+        _secrets_client = boto3.client("secretsmanager", region_name=REGION)
+    val = (_secrets_client.get_secret_value(SecretId=secret_id).get("SecretString") or "").strip()
+    if val.startswith("{"):
+        try:
+            d = json.loads(val)
+            return str(d.get("token") or d.get("value") or d.get("MOVIE_BOT_TOKEN") or "").strip()
+        except ValueError:
+            return val
+    return val
+
+
 def _token_for(mode):
+    """Resolve a bot token: Secrets Manager (if <MODE>_BOT_TOKEN_SECRET points at a
+    secret) else the <MODE>_BOT_TOKEN env var. Cached per cold start; format-validated."""
+    if mode in _token_cache:
+        return _token_cache[mode]
     cfg = _mode_config()[mode]
-    token = os.environ.get(cfg["token_env"], "").strip()
+    token = ""
+    secret_id = os.environ.get(cfg.get("token_secret_env", ""), "").strip()
+    if secret_id:
+        try:
+            token = _get_secret_string(secret_id)
+        except Exception as e:
+            log.error("could not read token secret %r for %s: %s", secret_id, mode, e)
+    if not token:                                    # fall back to the plain env var
+        token = os.environ.get(cfg["token_env"], "").strip()
     if not token:
-        raise RuntimeError(f"missing env {cfg['token_env']} for mode {mode}")
+        raise RuntimeError(
+            f"no token for {mode}: set {cfg.get('token_secret_env')} (Secrets Manager) "
+            f"or {cfg['token_env']}")
+    if not _TOKEN_RE.match(token):
+        log.error("BOT TOKEN for %s looks MALFORMED (len=%d, starts %r) — Telegram will "
+                  "404 every send. Expected '<digits>:<35+ url-safe chars>'; a lost "
+                  "bot-id prefix is the usual cause.", mode, len(token), token[:4])
+    _token_cache[mode] = token
     return token
+
+
+def verify_token(mode):
+    """getMe healthcheck — once per cold start per mode; logs the bot on success,
+    loudly on failure (so a bad/truncated token is obvious in CloudWatch)."""
+    if mode in _healthchecked:
+        return
+    _healthchecked.add(mode)
+    try:
+        resp = _tg_request(_token_for(mode), "getMe", {})
+    except Exception as e:
+        log.error("healthcheck %s: could not load token: %s", mode, e)
+        return
+    if resp.get("ok"):
+        u = resp.get("result") or {}
+        log.info("healthcheck %s: getMe ok -> @%s (id %s)", mode, u.get("username"), u.get("id"))
+    else:
+        log.error("healthcheck %s: getMe FAILED -> %s — token bad or truncated.",
+                  mode, resp.get("description"))
 
 
 def send_message(mode, chat_id, text, **kwargs):
@@ -1921,6 +1987,10 @@ def lambda_handler(event, context):
     if not expected or provided != expected:
         log.warning("secret mismatch for mode %s", mode)
         return {"statusCode": 403, "body": "forbidden"}
+
+    # Startup healthcheck (once per cold start, after the secret passes): a bad or
+    # truncated token surfaces immediately in the logs instead of silent 404s.
+    verify_token(mode)
 
     try:
         update = _load_body(event)
