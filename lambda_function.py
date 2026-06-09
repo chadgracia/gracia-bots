@@ -398,39 +398,76 @@ def _http_get(url, timeout=12):
 
 
 def _letterboxd(title):
-    """Letterboxd weighted average (0-5) + slug for a title, or None."""
+    """Resolve a bare title via Letterboxd SEARCH (best/most-popular match),
+    then scrape the film page for canonical name, year, rating (0-5), runtime,
+    genres and synopsis. Returns a dict (any field may be None) or None only if
+    the title can't be resolved to a film at all.
+    """
     try:
-        search_html = _http_get(f"{_LB_BASE}/search/films/{urllib.parse.quote(title)}/")
+        search_html = _http_get(f"{_LB_BASE}/search/films/{urllib.parse.quote(title.strip())}/")
     except Exception as e:
-        log.warning("letterboxd search failed: %s", e)
+        log.warning("letterboxd search failed for %r: %s", title, e)
         return None
-    m = (re.search(r'data-target-link="(/film/[^"]+/)"', search_html)
-         or re.search(r'href="(/film/[^"/]+/)"', search_html))
+    # First film result = Letterboxd's best/most-popular match for the query.
+    m = (re.search(r'data-film-slug="([^"/]+)"', search_html)
+         or re.search(r'data-target-link="/film/([^"/]+)/"', search_html)
+         or re.search(r'href="/film/([^"/]+)/"', search_html))
     if not m:
+        log.warning("letterboxd: no film result for %r", title)
         return None
-    slug_path = m.group(1)
+    slug = m.group(1)
+    slug_path = f"/film/{slug}/"
     try:
         film_html = _http_get(f"{_LB_BASE}{slug_path}")
     except Exception as e:
-        log.warning("letterboxd film page failed: %s", e)
+        log.warning("letterboxd film page failed for %r: %s", slug, e)
         return None
+
+    name = rating = year = runtime = desc = None
+    genres = []
     block = re.search(r'<script type="application/ld\+json">(.*?)</script>',
                       film_html, re.DOTALL)
-    if not block:
-        return None
-    raw = block.group(1).replace("/* <![CDATA[ */", "").replace("/* ]]> */", "").strip()
-    try:
-        data = json.loads(raw)
-    except ValueError:
-        return None
-    agg = data.get("aggregateRating") or {}
-    return {
-        "rating_5": round(float(agg["ratingValue"]), 2) if agg.get("ratingValue") is not None else None,
-        "votes": agg.get("ratingCount"),
-        "title": data.get("name"),
-        "slug": slug_path.strip("/").split("/")[-1],
-        "url": f"{_LB_BASE}{slug_path}",
-    }
+    if block:
+        raw = block.group(1).replace("/* <![CDATA[ */", "").replace("/* ]]> */", "").strip()
+        try:
+            data = json.loads(raw)
+            name = data.get("name")
+            agg = data.get("aggregateRating") or {}
+            if agg.get("ratingValue") is not None:
+                rating = round(float(agg["ratingValue"]), 2)
+            rel = data.get("releasedEvent") or []
+            if rel and rel[0].get("startDate"):
+                year = str(rel[0]["startDate"])[:4]
+            g = data.get("genre")
+            genres = [g] if isinstance(g, str) else (g or [])
+        except (ValueError, TypeError, KeyError, IndexError):
+            pass
+
+    # Fallbacks straight from the page markup (so a JSON-LD miss isn't fatal).
+    if not name:
+        mt = re.search(r'<meta property="og:title" content="([^"]+)"', film_html)
+        name = mt.group(1).strip() if mt else slug.replace("-", " ").title()
+    ym = re.search(r"\((\d{4})\)\s*$", name or "")  # og:title often "Dune (2021)"
+    if ym:
+        name = name[: ym.start()].strip()
+        year = year or ym.group(1)
+    if year is None:
+        my = re.search(r"/films/year/(\d{4})/", film_html)
+        year = my.group(1) if my else None
+    if not runtime:
+        mr = re.search(r"(\d+)\s*mins", film_html)
+        runtime = int(mr.group(1)) if mr else None
+    if not genres:
+        seen = dict.fromkeys(re.findall(r"/films/genre/([a-z0-9-]+)/", film_html))
+        genres = [g.replace("-", " ").title() for g in list(seen)[:4]]
+    md = (re.search(r'<meta name="description" content="([^"]*)"', film_html)
+          or re.search(r'<meta property="og:description" content="([^"]*)"', film_html))
+    if md:
+        desc = md.group(1).strip() or None
+
+    return {"title": name, "slug": slug, "url": f"{_LB_BASE}{slug_path}",
+            "rating_5": rating, "year": year, "runtime_min": runtime,
+            "genres": genres, "description": desc}
 
 
 def _tmdb_get(path, params):
@@ -473,16 +510,18 @@ def lookup_film(title):
         except Exception as e:
             log.warning("tmdb meta failed: %s", e)
     if not lb and not meta:
+        log.info("lookup_film %r -> NOT FOUND", title)
         return {"found": False, "query": title}
     canonical = (lb or {}).get("title") or (meta or {}).get("title") or title
+    # Letterboxd is primary for metadata now; TMDB only fills gaps.
     out = {
         "found": True,
         "title": canonical,
         "slug": (lb or {}).get("slug") or _slugify(canonical),
-        "year": (meta or {}).get("year") or "",
-        "runtime_min": (meta or {}).get("runtime_min"),
-        "genres": (meta or {}).get("genres") or [],
-        "description": (meta or {}).get("description") or "",
+        "year": (lb or {}).get("year") or (meta or {}).get("year") or "",
+        "runtime_min": (lb or {}).get("runtime_min") or (meta or {}).get("runtime_min"),
+        "genres": (lb or {}).get("genres") or (meta or {}).get("genres") or [],
+        "description": (lb or {}).get("description") or (meta or {}).get("description") or "",
         "similar": (meta or {}).get("similar") or [],
         "letterboxd_url": (lb or {}).get("url"),
     }
@@ -493,6 +532,8 @@ def lookup_film(title):
                    rating_source="TMDB (Letterboxd unavailable)")
     else:
         out.update(rating=None, rating_scale=None, rating_source=None)
+    log.info("lookup_film %r -> %s (%s) rating=%s/%s", title, out["title"],
+             out["year"], out.get("rating"), out.get("rating_scale"))
     return out
 
 
@@ -1071,15 +1112,24 @@ MOVIE_TOOLS = [
 ]
 
 MOVIE_SYSTEM = (
-    "You are SirWatchalot, a film-night helper in a Telegram group. Privacy is OFF "
-    "so you see every message — but you must ONLY act on clear film intent: adding/"
-    "removing/listing a personal library, looking up a film, claiming a seeded "
-    "library ('I'm Chad'), starting movie night, or a direct question to you about "
-    "film. For ANY other chatter, reply with exactly '(silent)' and call no tools.\n"
-    "Use the tools — never invent ratings. When you add a film, reply warmly and "
-    "briefly: confirm it, give the Letterboxd average as 'X/5 on Letterboxd' (if the "
-    "tool says the rating came from TMDB, say so and use /10), name one related film "
-    "the tool lists, and offer to add it. Keep replies to 1-3 sentences."
+    "You are SirWatchalot, a film-night helper in a Telegram group. Privacy is OFF so "
+    "you see every message, but ONLY act on clear film intent: add/remove/list a "
+    "personal library, look up a film, claim a seeded library ('I'm Chad'), or start "
+    "movie night. For anything else, reply with exactly '(silent)' and call no tools.\n"
+    "ADD ('add X to my library', 'I want to see X'): immediately call add_to_library(X). "
+    "The tool resolves the title to a SINGLE film via Letterboxd search (the most popular "
+    "match). If a title has several versions (e.g. Dune 1984 vs 2021) it has ALREADY "
+    "picked the prominent/recent one — do NOT ask which; just state the one you saved so "
+    "it's correctable, e.g. 'Added Dune (2021) — say \"the 1984 one\" if you meant that.' "
+    "Then give a one-line synopsis plus the rating as 'X/5 on Letterboxd' (only say "
+    "'/10 on TMDB' if rating_source mentions TMDB), runtime, and genre, and confirm it's "
+    "saved to their library.\n"
+    "LOOK UP ('what's X rated', 'tell me about X'): call lookup_film and answer with the "
+    "rating + a one-line synopsis; offer to add it.\n"
+    "NEVER mention a 'database' or internal storage, and NEVER invent ratings or details "
+    "— use only the tool's fields and omit any that are missing. Ask a clarifying "
+    "question ONLY when the tool returns resolved/found = false (no reasonable match at "
+    "all). Keep replies to 1-3 sentences."
 )
 
 
@@ -1089,7 +1139,9 @@ def _dispatch_tool(name, tool_input, ctx):
         return lookup_film_cached(tool_input["title"])
     if name == "add_to_library":
         item, info = add_to_library(chat_id, uid, tool_input["title"])
-        return {"added": True, "title": item["title"], "year": item.get("year"),
+        return {"added": True, "resolved": info.get("found", False),
+                "title": item["title"], "year": item.get("year"),
+                "runtime_min": item.get("runtime_min"), "genres": item.get("genres"),
                 "rating": info.get("rating"), "rating_scale": info.get("rating_scale"),
                 "rating_source": info.get("rating_source"),
                 "description": info.get("description"), "similar": info.get("similar")}

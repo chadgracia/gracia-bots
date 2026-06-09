@@ -294,6 +294,46 @@ def test_parse_update_kinds():
     assert pc["kind"] == "poll" and pc["poll_is_closed"] is True
 
 
+def test_letterboxd_resolves_via_search_and_scrapes():
+    # 'Dune' must resolve to the best search match and scrape full metadata,
+    # even without a JSON-LD-only path. Fixtures stand in for the network.
+    search_html = (
+        '<ul class="results">'
+        '<li><div class="film-poster" data-film-slug="dune-2021" '
+        'data-target-link="/film/dune-2021/" data-film-name="Dune"></div></li>'
+        '<li><div class="film-poster" data-film-slug="dune-1984" '
+        'data-target-link="/film/dune-1984/"></div></li>'
+        '</ul>'
+    )
+    film_html = (
+        '<html><head>'
+        '<meta property="og:title" content="Dune (2021)">'
+        '<meta name="description" content="Paul Atreides leads a desert rebellion.">'
+        '<script type="application/ld+json">/* <![CDATA[ */ '
+        '{"name":"Dune","releasedEvent":[{"startDate":"2021"}],'
+        '"aggregateRating":{"ratingValue":4.24,"ratingCount":900000}} '
+        '/* ]]> */</script></head><body>'
+        '<a href="/films/genre/science-fiction/">Science Fiction</a>'
+        '<a href="/films/genre/adventure/">Adventure</a>'
+        '<p class="text-footer"><span>155 mins</span></p>'
+        '</body></html>'
+    )
+    orig = L._http_get
+    L._http_get = lambda url, timeout=12: search_html if "/search/" in url else film_html
+    try:
+        r = L._letterboxd("Dune")
+    finally:
+        L._http_get = orig
+    assert r is not None
+    assert r["slug"] == "dune-2021"          # best (top) match, not the 1984 one
+    assert r["title"] == "Dune"              # trailing "(2021)" stripped off og:title
+    assert r["year"] == "2021"
+    assert r["rating_5"] == 4.24
+    assert r["runtime_min"] == 155
+    assert "Science Fiction" in r["genres"]
+    assert r["description"].startswith("Paul Atreides")
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
