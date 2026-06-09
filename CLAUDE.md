@@ -22,9 +22,13 @@ suffix of the Lambda Function URL (`.../movie`, `.../cleaning`, `.../salary`).
   `lambda-deploy` skill / `docs/DEPLOY.md` if present.
 
 ## Platform invariants (apply to every mode)
-- **Telegram privacy mode is ON.** In groups the bot only receives slash commands,
-  @mentions of itself, replies to its own messages, and service messages — **never
-  ambient chat**. Never write logic that depends on reading ordinary messages.
+- **Telegram privacy mode is per-bot.** **movie** runs privacy **OFF** (or bot = admin):
+  it reads every group message and routes them to the LLM for intent — the
+  natural-language design needs this. Modes that keep privacy **ON** (the default)
+  receive only slash-commands, @mentions, replies to the bot's own messages, and
+  service messages, and must **never** write logic that depends on ambient chat.
+  Changing the setting only takes effect after the bot is removed and re-added to the
+  group. (In private 1:1 DMs the bot always sees all messages regardless.)
 - **Never hardcode chat_id.** Persist a chat registry in DynamoDB and resolve it
   from there (proactive senders + supergroup migration depend on this).
 - **Handle supergroup migration** in the send helper: on the 400 "upgraded to
