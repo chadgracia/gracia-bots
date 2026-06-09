@@ -192,6 +192,30 @@ message-scanning artifact. With commands, ownership is simply the **command send
 
 ---
 
+## 7a. Decisions confirmed (2026-06-09)
+
+1. **Library scope:** per-`(chat, user)`. Keep `PK = "movie#{chat_id}"`.
+2. **Roster:** explicit `/join` only (anyone who runs `/movie` is auto-joined too).
+   Veto counts are bounded to joined participants.
+3. **Selection eligibility (per participant library):**
+   - Always **exclude `watched`** films (i.e. past winners).
+   - **Veto-aware exclusion:** a film vetoed by user X is excluded from selection
+     **only if** X is among the current participants **and** the library still has
+     other eligible options. If excluding it would leave nothing, the vetoed film
+     becomes eligible again. → Requires tracking **`vetoed_by: [user_id]`** on each
+     library item (a set of who vetoed it), not just a `times_vetoed` count.
+4. **Finalization: timed, with a warning.** After the pick, players get **90 seconds**.
+   At the **60-second mark**, post a warning ("Veto or press play!"). At 90s with no
+   veto and no explicit play, finalize automatically. A `/veto` or reply-veto before
+   then removes the film, re-picks, and **restarts the 90s clock**. An explicit
+   "press play" (`/go` / `/watch` / ✅ reply) finalizes immediately.
+   - This needs an **external one-off scheduler** (no in-process waiting): an
+     EventBridge Scheduler one-time schedule (auto-delete after firing) or an SQS
+     delayed message re-invokes the Lambda with a timer payload `{kind: warn|finalize,
+     chat_id, session_id, pick_token}`. The handler must branch on
+     webhook-update vs. timer-callback invocations. Guard against stale timers with a
+     `pick_token` so a timer for an already-vetoed/finalized pick is ignored.
+
 ## 8. Test checklist (run before declaring it works — the old setup "passed" while broken)
 
 - [ ] `/movie` in a group with privacy ON is received and attributed to the sender.
