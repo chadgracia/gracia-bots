@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 
 import boto3
+from botocore.exceptions import ClientError
 
 log = logging.getLogger()
 log.setLevel(logging.INFO)
@@ -159,6 +160,34 @@ def migrate_chat(mode, old_chat_id, new_chat_id):
     remember_chat(mode, new_chat_id)
 
 
+def seen_update(mode, chat_id, update_id):
+    """Idempotency: True if this update_id was already processed for this chat.
+
+    Telegram retries webhook deliveries; a duplicate must never double-add a
+    film, double-count a veto, or re-roll a selection. We claim the update_id
+    with a conditional put — the first writer wins, retries see it and bail.
+    """
+    if update_id is None:
+        return False
+    try:
+        _table.put_item(
+            Item={
+                "PK": _pk(mode, chat_id),
+                "SK": f"dedupe#{update_id}",
+                "seen_at": _now_iso(),
+                # epoch TTL (1 day) — harmless if TTL isn't enabled on the table.
+                "ttl": int(datetime.now(timezone.utc).timestamp()) + 86400,
+            },
+            ConditionExpression="attribute_not_exists(PK)",
+        )
+        return False
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            return True
+        log.warning("dedupe check errored (proceeding): %s", e)
+        return False
+
+
 # --------------------------------------------------------------------------- #
 # Telegram I/O
 # --------------------------------------------------------------------------- #
@@ -224,27 +253,118 @@ def send_photo(mode, chat_id, photo_url, caption=None, **kwargs):
     return resp
 
 
+def send_poll(mode, chat_id, question, options, **kwargs):
+    """Send a native poll. Returns the Telegram response (result.poll.id, message_id)."""
+    token = _token_for(mode)
+    payload = {"chat_id": chat_id, "question": question,
+               "options": [{"text": o} for o in options], **kwargs}
+    resp = _tg_request(token, "sendPoll", payload)
+    if not resp.get("ok"):
+        params = resp.get("parameters") or {}
+        new_id = params.get("migrate_to_chat_id")
+        if new_id and "supergroup" in (resp.get("description") or "").lower():
+            migrate_chat(mode, chat_id, new_id)
+            payload["chat_id"] = new_id
+            resp = _tg_request(token, "sendPoll", payload)
+        else:
+            log.error("sendPoll to %s failed: %s", chat_id, resp.get("description"))
+    return resp
+
+
+def stop_poll(mode, chat_id, message_id):
+    return _tg_request(_token_for(mode), "stopPoll",
+                       {"chat_id": chat_id, "message_id": message_id})
+
+
+def answer_callback(mode, callback_query_id, text=None):
+    payload = {"callback_query_id": callback_query_id}
+    if text:
+        payload["text"] = text
+    return _tg_request(_token_for(mode), "answerCallbackQuery", payload)
+
+
+def edit_message_text(mode, chat_id, message_id, text, **kwargs):
+    return _tg_request(_token_for(mode), "editMessageText",
+                       {"chat_id": chat_id, "message_id": message_id, "text": text, **kwargs})
+
+
 def parse_update(update):
-    """Flatten the bits we care about out of a Telegram update."""
-    msg = (
-        update.get("message")
-        or update.get("edited_message")
-        or update.get("channel_post")
-        or {}
-    )
-    chat = msg.get("chat", {}) or {}
-    frm = msg.get("from", {}) or {}
-    return {
-        "chat_id": chat.get("id"),
-        "chat_title": chat.get("title") or chat.get("username"),
-        "chat_type": chat.get("type"),
-        "text": msg.get("text") or msg.get("caption") or "",
-        "user_id": frm.get("id"),
-        "user_name": (frm.get("first_name") or frm.get("username") or "someone"),
-        "migrate_to_chat_id": msg.get("migrate_to_chat_id"),
-        "migrate_from_chat_id": msg.get("migrate_from_chat_id"),
-        "raw_message": msg,
-    }
+    """Normalize a Telegram update into a flat event dict with a 'kind'.
+
+    Movie mode runs privacy OFF, so we handle ordinary messages plus the
+    interactive update types the game needs: callback_query (Join/Start and the
+    thumb fallback buttons), message_reaction (👍/👎 on selection cards), and
+    poll / poll_answer (the veto poll). poll / poll_answer carry no chat_id —
+    the caller resolves it from the stored poll map.
+    """
+    ev = {"update_id": update.get("update_id"), "kind": "other",
+          "chat_id": None, "chat_title": None, "chat_type": None,
+          "text": "", "user_id": None, "user_name": "someone", "username": None,
+          "message_id": None, "reactions": [], "callback_data": None,
+          "callback_query_id": None, "poll_id": None, "poll_is_closed": None,
+          "poll_option_ids": [], "reply_to_message_id": None,
+          "migrate_to_chat_id": None, "migrate_from_chat_id": None}
+
+    if "callback_query" in update:
+        cq = update["callback_query"]
+        msg = cq.get("message") or {}
+        chat = msg.get("chat") or {}
+        frm = cq.get("from") or {}
+        ev.update(kind="callback", chat_id=chat.get("id"),
+                  chat_title=chat.get("title") or chat.get("username"),
+                  chat_type=chat.get("type"), message_id=msg.get("message_id"),
+                  callback_data=cq.get("data"), callback_query_id=cq.get("id"),
+                  user_id=frm.get("id"),
+                  user_name=frm.get("first_name") or frm.get("username") or "someone",
+                  username=frm.get("username"))
+        return ev
+
+    if "message_reaction" in update:
+        mr = update["message_reaction"]
+        chat = mr.get("chat") or {}
+        frm = mr.get("user") or {}
+        emojis = [r.get("emoji") for r in (mr.get("new_reaction") or [])
+                  if r.get("type") == "emoji" and r.get("emoji")]
+        ev.update(kind="reaction", chat_id=chat.get("id"),
+                  chat_title=chat.get("title") or chat.get("username"),
+                  chat_type=chat.get("type"), message_id=mr.get("message_id"),
+                  reactions=emojis, user_id=frm.get("id"),
+                  user_name=frm.get("first_name") or frm.get("username") or "someone",
+                  username=frm.get("username"))
+        return ev
+
+    if "poll_answer" in update:
+        pa = update["poll_answer"]
+        frm = pa.get("user") or {}
+        ev.update(kind="poll_answer", poll_id=pa.get("poll_id"),
+                  poll_option_ids=pa.get("option_ids") or [],
+                  user_id=frm.get("id"),
+                  user_name=frm.get("first_name") or frm.get("username") or "someone",
+                  username=frm.get("username"))
+        return ev
+
+    if "poll" in update:
+        p = update["poll"]
+        ev.update(kind="poll", poll_id=p.get("id"), poll_is_closed=p.get("is_closed"))
+        return ev
+
+    msg = (update.get("message") or update.get("edited_message")
+           or update.get("channel_post") or {})
+    if msg:
+        chat = msg.get("chat") or {}
+        frm = msg.get("from") or {}
+        reply_to = msg.get("reply_to_message") or {}
+        ev.update(kind="message", chat_id=chat.get("id"),
+                  chat_title=chat.get("title") or chat.get("username"),
+                  chat_type=chat.get("type"),
+                  text=msg.get("text") or msg.get("caption") or "",
+                  user_id=frm.get("id"),
+                  user_name=frm.get("first_name") or frm.get("username") or "someone",
+                  username=frm.get("username"),
+                  reply_to_message_id=reply_to.get("message_id"),
+                  migrate_to_chat_id=msg.get("migrate_to_chat_id"),
+                  migrate_from_chat_id=msg.get("migrate_from_chat_id"))
+    return ev
 
 
 def parse_command(text):
@@ -257,11 +377,18 @@ def parse_command(text):
 
 
 # --------------------------------------------------------------------------- #
-# Film data — Letterboxd is the rating source (0-5). TMDB supplies everything
-# else (runtime/genres/synopsis/similar) and is the rating fallback only.
-# All of this is isolated here so the source can be swapped later.
+# Film data — Letterboxd is the rating source. We scrape the public film page
+# and read the rating + metadata from its embedded JSON-LD. The official API is
+# application-gated and NOT used. TMDB (optional, TMDB_API_KEY) fills in
+# runtime/genres/synopsis/similar. Isolated here so the source can be swapped;
+# results are cached in DynamoDB (lookup_film_cached) to rate-limit politely.
 # --------------------------------------------------------------------------- #
 _LB_BASE = "https://letterboxd.com"
+
+
+def _slugify(s):
+    s = re.sub(r"[^a-z0-9]+", "-", (s or "").lower()).strip("-")
+    return s or "film"
 
 
 def _http_get(url, timeout=12):
@@ -270,14 +397,8 @@ def _http_get(url, timeout=12):
         return r.read().decode("utf-8", "replace")
 
 
-def _letterboxd_rating(title):
-    """Scrape the Letterboxd weighted average (0-5) for a title.
-
-    Letterboxd has no public API, so this searches, opens the top film result,
-    and reads aggregateRating out of that page's JSON-LD block. Returns a dict
-    or None. It is HTML scraping: it can break if Letterboxd changes their
-    markup, or be blocked from some server IPs — TMDB is the rating fallback.
-    """
+def _letterboxd(title):
+    """Letterboxd weighted average (0-5) + slug for a title, or None."""
     try:
         search_html = _http_get(f"{_LB_BASE}/search/films/{urllib.parse.quote(title)}/")
     except Exception as e:
@@ -287,9 +408,9 @@ def _letterboxd_rating(title):
          or re.search(r'href="(/film/[^"/]+/)"', search_html))
     if not m:
         return None
-    slug = m.group(1)
+    slug_path = m.group(1)
     try:
-        film_html = _http_get(f"{_LB_BASE}{slug}")
+        film_html = _http_get(f"{_LB_BASE}{slug_path}")
     except Exception as e:
         log.warning("letterboxd film page failed: %s", e)
         return None
@@ -303,13 +424,12 @@ def _letterboxd_rating(title):
     except ValueError:
         return None
     agg = data.get("aggregateRating") or {}
-    if agg.get("ratingValue") is None:
-        return None
     return {
-        "rating_5": round(float(agg["ratingValue"]), 2),
+        "rating_5": round(float(agg["ratingValue"]), 2) if agg.get("ratingValue") is not None else None,
         "votes": agg.get("ratingCount"),
         "title": data.get("name"),
-        "url": f"{_LB_BASE}{slug}",
+        "slug": slug_path.strip("/").split("/")[-1],
+        "url": f"{_LB_BASE}{slug_path}",
     }
 
 
@@ -321,7 +441,6 @@ def _tmdb_get(path, params):
 
 
 def _tmdb_meta(title):
-    """Runtime / genres / synopsis / similar + a fallback rating (0-10)."""
     search = _tmdb_get("/search/movie", {"query": title, "include_adult": "false"})
     results = search.get("results") or []
     if not results:
@@ -329,47 +448,46 @@ def _tmdb_meta(title):
     movie_id = results[0]["id"]
     details = _tmdb_get(f"/movie/{movie_id}", {})
     recs = _tmdb_get(f"/movie/{movie_id}/recommendations", {})
+    overview = (details.get("overview") or "").replace("\n", " ").strip()
     return {
         "title": details.get("title"),
         "year": (details.get("release_date") or "")[:4],
         "tmdb_rating_10": details.get("vote_average"),
         "runtime_min": details.get("runtime"),
         "genres": [g["name"] for g in (details.get("genres") or [])],
-        "overview": details.get("overview"),
+        "description": overview,
         "similar": [r["title"] for r in (recs.get("results") or [])[:5]],
     }
 
 
 def lookup_film(title):
-    """Rating (Letterboxd, 0-5) + metadata + similar titles.
-
-    Letterboxd is the rating source. TMDB supplies runtime/genres/synopsis/
-    similar, and is used for the rating ONLY when Letterboxd can't be reached.
+    """Canonical title, year, runtime, genres, one-line description, Letterboxd
+    rating, slug, and similar titles. Letterboxd is the rating source; TMDB is
+    metadata + the rating fallback only. Returns {'found': False} when nothing.
     """
-    lb = _letterboxd_rating(title)
+    lb = _letterboxd(title)
     meta = None
     if TMDB_API_KEY:
         try:
             meta = _tmdb_meta(title)
         except Exception as e:
             log.warning("tmdb meta failed: %s", e)
-
     if not lb and not meta:
         return {"found": False, "query": title}
-
+    canonical = (lb or {}).get("title") or (meta or {}).get("title") or title
     out = {
         "found": True,
-        "title": (lb or {}).get("title") or (meta or {}).get("title") or title,
+        "title": canonical,
+        "slug": (lb or {}).get("slug") or _slugify(canonical),
         "year": (meta or {}).get("year") or "",
         "runtime_min": (meta or {}).get("runtime_min"),
         "genres": (meta or {}).get("genres") or [],
-        "overview": (meta or {}).get("overview"),
+        "description": (meta or {}).get("description") or "",
         "similar": (meta or {}).get("similar") or [],
         "letterboxd_url": (lb or {}).get("url"),
     }
-    if lb:
-        out.update(rating=lb["rating_5"], rating_scale=5,
-                   rating_source="Letterboxd", letterboxd_votes=lb.get("votes"))
+    if lb and lb.get("rating_5") is not None:
+        out.update(rating=lb["rating_5"], rating_scale=5, rating_source="Letterboxd")
     elif meta and meta.get("tmdb_rating_10") is not None:
         out.update(rating=meta["tmdb_rating_10"], rating_scale=10,
                    rating_source="TMDB (Letterboxd unavailable)")
@@ -378,133 +496,634 @@ def lookup_film(title):
     return out
 
 
+def lookup_film_cached(title):
+    """lookup_film with a DynamoDB cache (stored as JSON to dodge float/Decimal)."""
+    key = f"filmcache#{title.strip().lower()}"
+    try:
+        cached = ddb_get(key, "ref")
+        if cached and cached.get("json"):
+            return json.loads(cached["json"])
+    except Exception as e:
+        log.warning("film cache read failed: %s", e)
+    info = lookup_film(title)
+    if info.get("found"):
+        try:
+            ddb_put({"PK": key, "SK": "ref", "json": json.dumps(info),
+                     "cached_at": _now_iso()})
+        except Exception as e:
+            log.warning("film cache write failed: %s", e)
+    return info
+
+
 # --------------------------------------------------------------------------- #
-# Movie domain (DynamoDB-backed)
+# Members — captured so the bot can address/mention people later.
 # --------------------------------------------------------------------------- #
-def add_film(chat_id, title, added_by, added_by_id=None, year=None):
-    film_id = str(uuid.uuid4())
+def remember_member(chat_id, user_id, display_name, username=None):
+    if user_id is None:
+        return None
+    sk = f"member#{user_id}"
+    existing = ddb_get(_pk("movie", chat_id), sk)
     item = {
-        "PK": _pk("movie", chat_id),
-        "SK": f"film#{film_id}",
-        "film_id": film_id,
-        "title": title,
-        "year": str(year) if year else "",
-        "added_by": added_by,
-        "added_by_id": str(added_by_id) if added_by_id else "",
-        "added_at": _now_iso(),
+        "PK": _pk("movie", chat_id), "SK": sk, "user_id": int(user_id),
+        "display_name": display_name, "username": username,
+        "first_seen": (existing or {}).get("first_seen") or _now_iso(),
+        "last_seen": _now_iso(),
     }
     ddb_put(item)
     return item
 
 
-def list_films(chat_id):
-    items = ddb_query(_pk("movie", chat_id))
-    films = [i for i in items if str(i.get("SK", "")).startswith("film#")]
+def get_member(chat_id, user_id):
+    return ddb_get(_pk("movie", chat_id), f"member#{user_id}")
+
+
+def mention_for(chat_id, user_id):
+    m = get_member(chat_id, user_id) or {}
+    if m.get("username"):
+        return f"@{m['username']}"
+    return m.get("display_name") or "someone"
+
+
+# --------------------------------------------------------------------------- #
+# Library — per (chat, user), keyed by Letterboxd slug. Metadata is cached on
+# the item so cards render without re-scraping. Floats are stored as strings
+# (DynamoDB resource rejects float).
+# --------------------------------------------------------------------------- #
+def add_to_library(chat_id, user_id, title):
+    info = lookup_film_cached(title)
+    slug = info.get("slug") or _slugify(title)
+    name = info.get("title") or title
+    item = {
+        "PK": _pk("movie", chat_id), "SK": f"lib#{user_id}#{slug}",
+        "slug": slug, "owner_id": int(user_id), "title": name,
+        "year": str(info.get("year") or ""),
+        "runtime_min": info.get("runtime_min"),
+        "genres": info.get("genres") or [],
+        "description": info.get("description") or "",
+        "rating": (str(info["rating"]) if info.get("rating") is not None else None),
+        "rating_scale": info.get("rating_scale"),
+        "rating_source": info.get("rating_source"),
+        "added_at": _now_iso(), "watched": False,
+    }
+    ddb_put(item)
+    return item, info
+
+
+def get_library(chat_id, user_id):
+    prefix = f"lib#{user_id}#"
+    films = [i for i in ddb_query(_pk("movie", chat_id))
+             if str(i.get("SK", "")).startswith(prefix)]
     films.sort(key=lambda f: f.get("added_at", ""))
     return films
 
 
-def draw_film(chat_id):
-    """Pick ONE film at random — in Python, never via the LLM."""
-    films = list_films(chat_id)
-    if not films:
+def get_film(chat_id, user_id, slug):
+    return ddb_get(_pk("movie", chat_id), f"lib#{user_id}#{slug}")
+
+
+def mark_watched(chat_id, user_id, slug):
+    f = get_film(chat_id, user_id, slug)
+    if f:
+        f["watched"] = True
+        ddb_put(f)
+
+
+def remove_from_library(chat_id, user_id, title):
+    """Best-effort remove by slug, then exact title, then substring."""
+    info = lookup_film_cached(title)
+    lib = get_library(chat_id, user_id)
+    slug = info.get("slug")
+    tl = title.strip().lower()
+    target = None
+    if slug:
+        target = next((f for f in lib if f.get("slug") == slug), None)
+    if not target:
+        target = next((f for f in lib if f.get("title", "").strip().lower() == tl), None)
+    if not target:
+        target = next((f for f in lib if tl and tl in f.get("title", "").lower()), None)
+    if not target:
         return None
-    return random.choice(films)
+    ddb_delete(_pk("movie", chat_id), f"lib#{user_id}#{target['slug']}")
+    return target["title"]
 
 
 # --------------------------------------------------------------------------- #
-# Bedrock Converse tool-use loop
+# Seeding — link a named starter library to a real Telegram user_id (never a
+# phone number; bots can't see those). Starter films load under owner
+# "seed:<name>" (tools/seed_libraries.py); /claim or NL "I'm <name>" reassigns.
+# --------------------------------------------------------------------------- #
+def _seed_owner(name):
+    return f"seed:{name.strip().lower()}"
+
+
+def list_seed_names(chat_id):
+    names = set()
+    for i in ddb_query(_pk("movie", chat_id)):
+        sk = str(i.get("SK", ""))
+        if sk.startswith("lib#seed:"):
+            names.add(sk.split("#", 2)[1].split(":", 1)[1])
+    return sorted(names)
+
+
+def claim_library(chat_id, name, user_id):
+    """Reassign the seeded 'name' library to user_id. Idempotent; one claimer."""
+    key = name.strip().lower()
+    marker_sk = f"seedclaim#{key}"
+    marker = ddb_get(_pk("movie", chat_id), marker_sk)
+    if marker and str(marker.get("claimed_by")) != str(user_id):
+        return {"status": "taken", "by": marker.get("claimed_by")}
+    seed_prefix = f"lib#{_seed_owner(name)}#"
+    seed_items = [i for i in ddb_query(_pk("movie", chat_id))
+                  if str(i.get("SK", "")).startswith(seed_prefix)]
+    if not seed_items and not marker:
+        return {"status": "none"}
+    moved = 0
+    for it in seed_items:
+        seg = str(it["SK"]).split("#")[-1]
+        it["SK"] = f"lib#{user_id}#{seg}"
+        it["owner_id"] = int(user_id)
+        it.pop("seed_name", None)
+        ddb_put(it)
+        ddb_delete(_pk("movie", chat_id), f"{seed_prefix}{seg}")
+        moved += 1
+    ddb_put({"PK": _pk("movie", chat_id), "SK": marker_sk,
+             "claimed_by": int(user_id), "seed_name": name.strip(),
+             "claimed_at": _now_iso()})
+    return {"status": "ok", "moved": moved}
+
+
+# --------------------------------------------------------------------------- #
+# Game state machine: IDLE -> JOINING -> SELECTING -> VETO -> DONE.
+# All randomness (3-per-player draw, pool pick), thumb/lock tracking, veto
+# counting and win resolution are plain Python. The LLM never does game math.
+# --------------------------------------------------------------------------- #
+def _now_epoch():
+    return int(datetime.now(timezone.utc).timestamp())
+
+
+def get_game(chat_id):
+    return ddb_get(_pk("movie", chat_id), "game#current")
+
+
+def put_game(game):
+    ddb_put(game)
+    return game
+
+
+def clear_game(chat_id):
+    ddb_delete(_pk("movie", chat_id), "game#current")
+
+
+def new_game(chat_id, initiator_id):
+    return {
+        "PK": _pk("movie", chat_id), "SK": "game#current",
+        "session_id": str(uuid.uuid4()), "phase": "JOINING",
+        "players": [], "initiator": int(initiator_id) if initiator_id else None,
+        "vetoes_remaining": {},
+        "join_message_id": None,
+        "selection": {},   # {uid: {slots:[{slug,title,state}], shown:[slug], locked}}
+        "cards": {},       # {message_id: {uid, slot}}
+        "pool": [],        # [{owner, slug, title}]
+        "current": None,   # {film, poll_id, poll_message_id, presented_at, resolved}
+        "created_at": _now_iso(),
+    }
+
+
+# ---- global poll map (poll/poll_answer updates carry no chat_id) ---------- #
+def put_poll_map(poll_id, chat_id, film):
+    ddb_put({"PK": f"pollmap#{poll_id}", "SK": "ref",
+             "chat_id": int(chat_id), "film": film, "at": _now_iso()})
+
+
+def get_poll_map(poll_id):
+    return ddb_get(f"pollmap#{poll_id}", "ref")
+
+
+def del_poll_map(poll_id):
+    ddb_delete(f"pollmap#{poll_id}", "ref")
+
+
+def _add_player(game, user_id):
+    if user_id is None:
+        return False
+    uid = str(user_id)
+    if uid not in [str(p) for p in game["players"]]:
+        game["players"].append(int(user_id))
+        game["vetoes_remaining"][uid] = 1
+        return True
+    return False
+
+
+# ---- presentation --------------------------------------------------------- #
+def _item_rating_phrase(item):
+    r = item.get("rating")
+    if r in (None, "", "None"):
+        return ""
+    src = item.get("rating_source") or "Letterboxd"
+    src = "Letterboxd" if str(src).startswith("Letterboxd") else "TMDB"
+    return f"{src} {r}/{item.get('rating_scale') or 5}"
+
+
+def _film_card(item):
+    """A selection / candidate card: title, runtime, genre, one-line description."""
+    if not item:
+        return "(film)"
+    yr = f" ({item['year']})" if item.get("year") else ""
+    lines = [f"🎬 {item['title']}{yr}"]
+    meta = []
+    rp = _item_rating_phrase(item)
+    if rp:
+        meta.append(rp)
+    if item.get("runtime_min"):
+        meta.append(f"{item['runtime_min']} min")
+    if item.get("genres"):
+        meta.append(", ".join(item["genres"][:2]))
+    if meta:
+        lines.append(" · ".join(meta))
+    if item.get("description"):
+        d = item["description"]
+        lines.append(d if len(d) <= 200 else d[:197] + "…")
+    return "\n".join(lines)
+
+
+def _join_keyboard():
+    return {"inline_keyboard": [
+        [{"text": "🎬 Join", "callback_data": "join"}],
+        [{"text": "▶️ Start", "callback_data": "start"}],
+    ]}
+
+
+def _thumb_keyboard():
+    return {"inline_keyboard": [[
+        {"text": "👍", "callback_data": "up"},
+        {"text": "👎", "callback_data": "down"},
+    ]]}
+
+
+def _join_text(chat_id, game):
+    if game["players"]:
+        roster = ", ".join(mention_for(chat_id, p) for p in game["players"])
+    else:
+        roster = "(nobody yet)"
+    return ("🎬 Movie night! Tap 🎬 Join to play.\n"
+            f"In so far: {roster}\n\n"
+            "When everyone's in, the host taps ▶️ Start.")
+
+
+# ---- start / roster ------------------------------------------------------- #
+def start_game(mode, chat_id, initiator_id):
+    if get_game(chat_id):
+        send_message(mode, chat_id, "A movie night's already going. Tap 🎬 Join on the card above.")
+        return
+    game = new_game(chat_id, initiator_id)
+    _add_player(game, initiator_id)
+    resp = send_message(mode, chat_id, _join_text(chat_id, game),
+                        reply_markup=_join_keyboard())
+    game["join_message_id"] = (resp.get("result") or {}).get("message_id")
+    put_game(game)
+
+
+def on_callback(mode, ev):
+    chat_id, uid = ev["chat_id"], ev.get("user_id")
+    data, cqid, mid = ev.get("callback_data"), ev.get("callback_query_id"), ev.get("message_id")
+    answer_callback(mode, cqid)
+    game = get_game(chat_id)
+    if not game:
+        return
+    if _veto_backstop(mode, chat_id, game):
+        return
+    if data == "join" and game["phase"] == "JOINING":
+        remember_member(chat_id, uid, ev["user_name"], ev.get("username"))
+        if _add_player(game, uid):
+            put_game(game)
+            if game.get("join_message_id"):
+                edit_message_text(mode, chat_id, game["join_message_id"],
+                                  _join_text(chat_id, game), reply_markup=_join_keyboard())
+        return
+    if data == "start" and game["phase"] == "JOINING":
+        if game.get("initiator") and uid != game["initiator"]:
+            answer_callback(mode, cqid, "Only the host can start.")
+            return
+        if not game["players"]:
+            answer_callback(mode, cqid, "Nobody has joined yet.")
+            return
+        _begin_selection(mode, chat_id, game)
+        return
+    if data in ("up", "down") and game["phase"] == "SELECTING":
+        _handle_thumb(mode, chat_id, game, uid, mid, up=(data == "up"))
+        return
+
+
+# ---- selection ------------------------------------------------------------ #
+def _begin_selection(mode, chat_id, game):
+    game["phase"] = "SELECTING"
+    game["selection"] = {}
+    game["cards"] = {}
+    put_game(game)
+    send_message(mode, chat_id,
+                 "🎲 Drawing 3 films from each player's library. "
+                 "React 👍 to keep a card or 👎 to swap it. Three 👍 locks you in.")
+    for uid in list(game["players"]):
+        _start_player_selection(mode, chat_id, game, uid)
+    put_game(game)
+    _maybe_finish_selection(mode, chat_id, game)
+
+
+def _start_player_selection(mode, chat_id, game, uid):
+    lib = [f for f in get_library(chat_id, uid) if not f.get("watched")]
+    sel = {"slots": [], "shown": [], "locked": False}
+    game["selection"][str(uid)] = sel
+    picks = random.sample(lib, min(3, len(lib))) if lib else []
+    for f in picks:
+        sel["shown"].append(f["slug"])
+        slot = len(sel["slots"])
+        sel["slots"].append({"slug": f["slug"], "title": f["title"], "state": "pending"})
+        _post_selection_card(mode, chat_id, game, uid, slot)
+    if not picks:
+        sel["locked"] = True  # empty library contributes nothing
+
+
+def _post_selection_card(mode, chat_id, game, uid, slot):
+    sel = game["selection"][str(uid)]
+    item = get_film(chat_id, uid, sel["slots"][slot]["slug"])
+    text = f"{mention_for(chat_id, uid)} — pick {slot + 1}:\n\n{_film_card(item)}"
+    resp = send_message(mode, chat_id, text, reply_markup=_thumb_keyboard())
+    mid = (resp.get("result") or {}).get("message_id")
+    if mid is not None:
+        game["cards"][str(mid)] = {"uid": str(uid), "slot": slot}
+
+
+def _handle_thumb(mode, chat_id, game, uid, message_id, up):
+    card = game["cards"].get(str(message_id))
+    if not card or str(uid) != str(card["uid"]):
+        return  # only the card's owner controls it
+    sel = game["selection"][card["uid"]]
+    slot = card["slot"]
+    if up:
+        sel["slots"][slot]["state"] = "locked"
+        if sel["slots"] and all(s["state"] == "locked" for s in sel["slots"]):
+            sel["locked"] = True
+        put_game(game)
+        _maybe_finish_selection(mode, chat_id, game)
+        return
+    # thumbs-down: replace with another unshown random film from THIS library
+    lib = [f for f in get_library(chat_id, int(card["uid"])) if not f.get("watched")]
+    avail = [f for f in lib if f["slug"] not in sel["shown"]]
+    if not avail:
+        send_message(mode, chat_id,
+                     f"{mention_for(chat_id, int(card['uid']))}, no more films to swap in — "
+                     "react 👍 to keep this one.")
+        return
+    nf = random.choice(avail)
+    sel["shown"].append(nf["slug"])
+    sel["slots"][slot] = {"slug": nf["slug"], "title": nf["title"], "state": "pending"}
+    del game["cards"][str(message_id)]
+    _post_selection_card(mode, chat_id, game, int(card["uid"]), slot)
+    put_game(game)
+
+
+def _maybe_finish_selection(mode, chat_id, game):
+    if not game["players"]:
+        return
+    if all(game["selection"].get(str(p), {}).get("locked") for p in game["players"]):
+        _begin_veto(mode, chat_id, game)
+
+
+# ---- veto ----------------------------------------------------------------- #
+def _begin_veto(mode, chat_id, game):
+    pool = []
+    for uid in game["players"]:
+        for s in game["selection"].get(str(uid), {}).get("slots", []):
+            if s["state"] == "locked":
+                pool.append({"owner": str(uid), "slug": s["slug"], "title": s["title"]})
+    game["phase"] = "VETO"
+    game["pool"] = pool
+    game["current"] = None
+    if not pool:
+        send_message(mode, chat_id, "Nobody had any films to put forward — no winner tonight.")
+        clear_game(chat_id)
+        return
+    send_message(mode, chat_id,
+                 f"🗳 Veto round! {len(pool)} films in the pool, one veto each. "
+                 "Vote 🚫 Veto within 90s to knock a pick out.")
+    _present_candidate(mode, chat_id, game)
+    put_game(game)
+
+
+def _present_candidate(mode, chat_id, game):
+    pool = game["pool"]
+    if not pool:
+        send_message(mode, chat_id, "Pool's empty — no winner.")
+        clear_game(chat_id)
+        return
+    cand = random.choice(pool)        # random pick, in code
+    pool.remove(cand)
+    item = get_film(chat_id, int(cand["owner"]), cand["slug"])
+    send_message(mode, chat_id, f"🎲 Candidate:\n\n{_film_card(item) if item else cand['title']}")
+    resp = send_poll(mode, chat_id, "Veto this pick?", ["🚫 Veto", "👍 Fine by me"],
+                     is_anonymous=False, open_period=90)
+    result = resp.get("result") or {}
+    poll_id = (result.get("poll") or {}).get("id")
+    game["current"] = {
+        "film": cand, "poll_id": poll_id,
+        "poll_message_id": result.get("message_id"),
+        "presented_at": _now_epoch(), "resolved": False,
+    }
+    if poll_id:
+        put_poll_map(poll_id, chat_id, cand)
+
+
+def on_poll_answer(mode, ev):
+    chat_id = ev["chat_id"]
+    game = get_game(chat_id)
+    if not game or game.get("phase") != "VETO":
+        return
+    if _veto_backstop(mode, chat_id, game):
+        return
+    cur = game.get("current")
+    if not cur or cur.get("poll_id") != ev.get("poll_id") or cur.get("resolved"):
+        return  # stale or already resolved poll
+    if 0 not in (ev.get("poll_option_ids") or []):
+        return  # only the Veto option (index 0) matters
+    uid = str(ev.get("user_id"))
+    if game["vetoes_remaining"].get(uid, 0) <= 0:
+        return  # no veto left — ignore
+    game["vetoes_remaining"][uid] -= 1
+    cur["resolved"] = True
+    if cur.get("poll_message_id"):
+        stop_poll(mode, chat_id, cur["poll_message_id"])
+    if cur.get("poll_id"):
+        del_poll_map(cur["poll_id"])
+    send_message(mode, chat_id,
+                 f"🚫 {mention_for(chat_id, ev.get('user_id'))} vetoed "
+                 f"“{cur['film']['title']}”. Next pick…")
+    _present_candidate(mode, chat_id, game)
+    put_game(game)
+
+
+def on_poll(mode, ev):
+    if not ev.get("poll_is_closed"):
+        return
+    chat_id = ev["chat_id"]
+    game = get_game(chat_id)
+    if not game or game.get("phase") != "VETO":
+        return
+    cur = game.get("current")
+    if not cur or cur.get("poll_id") != ev.get("poll_id") or cur.get("resolved"):
+        return  # only the un-vetoed CURRENT poll auto-closing declares a winner
+    _declare_winner(mode, chat_id, game, cur["film"])
+
+
+def _veto_backstop(mode, chat_id, game):
+    """No scheduler: if an un-vetoed candidate is past its 90s and any update
+    arrives, resolve it as the winner now. Returns True if it fired."""
+    if not game or game.get("phase") != "VETO":
+        return False
+    cur = game.get("current")
+    if cur and not cur.get("resolved") and _now_epoch() - cur.get("presented_at", 0) >= 90:
+        _declare_winner(mode, chat_id, game, cur["film"])
+        return True
+    return False
+
+
+def _declare_winner(mode, chat_id, game, film):
+    cur = game.get("current") or {}
+    cur["resolved"] = True
+    owner, slug = int(film["owner"]), film["slug"]
+    item = get_film(chat_id, owner, slug)
+    title = (item or {}).get("title") or film["title"]
+    year = (item or {}).get("year") or ""
+    mark_watched(chat_id, owner, slug)
+    ddb_put({
+        "PK": _pk("movie", chat_id), "SK": f"history#{game['session_id']}",
+        "session_id": game["session_id"], "winner_title": title,
+        "winner_slug": slug, "winner_owner_id": owner,
+        "watched_date": _now_iso(),
+        "participants": [int(p) for p in game["players"]], "ratings": {},
+    })
+    if cur.get("poll_id"):
+        del_poll_map(cur["poll_id"])
+    note = winner_note(title, year)
+    card = _film_card(item) if item else title
+    text = f"🏆 Tonight's winner:\n\n{card}"
+    if note:
+        text += f"\n\n{note}"
+    text += "\n\nEnjoy! 🎬"
+    send_message(mode, chat_id, text)
+    clear_game(chat_id)
+
+
+def winner_note(title, year):
+    """Short, spoiler-free context for the winner. LLM writes prose; picks nothing."""
+    if not AI_ENABLED:
+        return ""
+    try:
+        ystr = f" ({year})" if year else ""
+        resp = _bedrock.converse(
+            modelId=BEDROCK_MODEL_ID,
+            system=[{"text": (
+                "You write a 2-3 sentence, SPOILER-FREE note about a film for a "
+                "film-night group: production facts, trivia, legacy, why it's worth "
+                "watching. NEVER reveal plot, twists, or the ending. Warm and concise."
+            )}],
+            messages=[{"role": "user", "content": [
+                {"text": f'The film is "{title}"{ystr}. Write the note.'}]}],
+            inferenceConfig={"maxTokens": 250, "temperature": 0.7},
+        )
+        return "".join(b.get("text", "") for b in resp["output"]["message"]["content"]).strip()
+    except Exception as e:
+        log.warning("winner note failed: %s", e)
+        return ""
+
+
+# --------------------------------------------------------------------------- #
+# Natural-language intent (Bedrock). The model parses what people say and calls
+# tools; code performs the action. Privacy is OFF, so EVERY message arrives —
+# the model must stay silent on anything that isn't a film/library/game intent.
 # --------------------------------------------------------------------------- #
 MOVIE_TOOLS = [
-    {
-        "toolSpec": {
-            "name": "lookup_film",
-            "description": "Look up a film's Letterboxd rating (0-5), plus runtime, genres, synopsis and similar titles. The result names which source the rating came from.",
-            "inputSchema": {
-                "json": {
-                    "type": "object",
-                    "properties": {"title": {"type": "string"}},
-                    "required": ["title"],
-                }
-            },
-        }
-    },
-    {
-        "toolSpec": {
-            "name": "add_film",
-            "description": "Add a film to this group's list, attributed to the given person.",
-            "inputSchema": {
-                "json": {
-                    "type": "object",
-                    "properties": {
-                        "title": {"type": "string"},
-                        "year": {"type": "string"},
-                    },
-                    "required": ["title"],
-                }
-            },
-        }
-    },
-    {
-        "toolSpec": {
-            "name": "list_films",
-            "description": "List the films currently on this group's list with who added each.",
-            "inputSchema": {"json": {"type": "object", "properties": {}}},
-        }
-    },
-    {
-        "toolSpec": {
-            "name": "draw_film",
-            "description": "Pick one film at random from this group's list.",
-            "inputSchema": {"json": {"type": "object", "properties": {}}},
-        }
-    },
+    {"toolSpec": {"name": "lookup_film",
+                  "description": "Look up a film's Letterboxd rating (0-5), year, runtime, genres, one-line description and similar titles.",
+                  "inputSchema": {"json": {"type": "object",
+                                           "properties": {"title": {"type": "string"}},
+                                           "required": ["title"]}}}},
+    {"toolSpec": {"name": "add_to_library",
+                  "description": "Add a film to the SENDER's personal library for this chat (also for 'I want to see X').",
+                  "inputSchema": {"json": {"type": "object",
+                                           "properties": {"title": {"type": "string"}},
+                                           "required": ["title"]}}}},
+    {"toolSpec": {"name": "remove_from_library",
+                  "description": "Remove a film from the SENDER's library.",
+                  "inputSchema": {"json": {"type": "object",
+                                           "properties": {"title": {"type": "string"}},
+                                           "required": ["title"]}}}},
+    {"toolSpec": {"name": "list_library",
+                  "description": "List the films in the SENDER's library.",
+                  "inputSchema": {"json": {"type": "object", "properties": {}}}}},
+    {"toolSpec": {"name": "claim_library",
+                  "description": "Link a seeded starter library (by person's name, e.g. 'Chad') to the sender.",
+                  "inputSchema": {"json": {"type": "object",
+                                           "properties": {"name": {"type": "string"}},
+                                           "required": ["name"]}}}},
+    {"toolSpec": {"name": "start_movie_night",
+                  "description": "Start a movie-night game in this chat (posts the Join/Start card).",
+                  "inputSchema": {"json": {"type": "object", "properties": {}}}}},
 ]
+
+MOVIE_SYSTEM = (
+    "You are SirWatchalot, a film-night helper in a Telegram group. Privacy is OFF "
+    "so you see every message — but you must ONLY act on clear film intent: adding/"
+    "removing/listing a personal library, looking up a film, claiming a seeded "
+    "library ('I'm Chad'), starting movie night, or a direct question to you about "
+    "film. For ANY other chatter, reply with exactly '(silent)' and call no tools.\n"
+    "Use the tools — never invent ratings. When you add a film, reply warmly and "
+    "briefly: confirm it, give the Letterboxd average as 'X/5 on Letterboxd' (if the "
+    "tool says the rating came from TMDB, say so and use /10), name one related film "
+    "the tool lists, and offer to add it. Keep replies to 1-3 sentences."
+)
 
 
 def _dispatch_tool(name, tool_input, ctx):
-    """ctx carries chat_id / sender so the model can't pick the wrong group."""
-    chat_id = ctx["chat_id"]
+    chat_id, uid, mode = ctx["chat_id"], ctx.get("user_id"), ctx["mode"]
     if name == "lookup_film":
-        return lookup_film(tool_input["title"])
-    if name == "add_film":
-        item = add_film(
-            chat_id,
-            tool_input["title"],
-            ctx["user_name"],
-            ctx.get("user_id"),
-            tool_input.get("year"),
-        )
-        return {"added": True, "title": item["title"], "added_by": item["added_by"]}
-    if name == "list_films":
-        return {
-            "films": [
-                {"title": f["title"], "year": f.get("year"), "added_by": f.get("added_by")}
-                for f in list_films(chat_id)
-            ]
-        }
-    if name == "draw_film":
-        chosen = draw_film(chat_id)  # random.choice in code
-        return {"chosen": chosen["title"]} if chosen else {"chosen": None}
+        return lookup_film_cached(tool_input["title"])
+    if name == "add_to_library":
+        item, info = add_to_library(chat_id, uid, tool_input["title"])
+        return {"added": True, "title": item["title"], "year": item.get("year"),
+                "rating": info.get("rating"), "rating_scale": info.get("rating_scale"),
+                "rating_source": info.get("rating_source"),
+                "description": info.get("description"), "similar": info.get("similar")}
+    if name == "remove_from_library":
+        removed = remove_from_library(chat_id, uid, tool_input["title"])
+        return {"removed": removed}
+    if name == "list_library":
+        return {"films": [{"title": f["title"], "year": f.get("year")}
+                          for f in get_library(chat_id, uid)]}
+    if name == "claim_library":
+        res = claim_library(chat_id, tool_input["name"], uid)
+        if res.get("status") == "ok":
+            remember_member(chat_id, uid, ctx.get("user_name"), ctx.get("username"))
+        return res
+    if name == "start_movie_night":
+        start_game(mode, chat_id, uid)
+        return {"started": True}
     return {"error": f"unknown tool {name}"}
 
 
 def converse(system_prompt, user_text, ctx, tools=MOVIE_TOOLS, max_turns=6):
-    """Run the tool-use loop and return the model's final text."""
+    """Run the Bedrock tool-use loop; return the model's final text."""
     messages = [{"role": "user", "content": [{"text": user_text}]}]
     for _ in range(max_turns):
         resp = _bedrock.converse(
-            modelId=BEDROCK_MODEL_ID,
-            system=[{"text": system_prompt}],
-            messages=messages,
-            inferenceConfig={"maxTokens": 1000, "temperature": 0.7},
+            modelId=BEDROCK_MODEL_ID, system=[{"text": system_prompt}],
+            messages=messages, inferenceConfig={"maxTokens": 1000, "temperature": 0.5},
             toolConfig={"tools": tools},
         )
         out = resp["output"]["message"]
         messages.append(out)
         if resp.get("stopReason") != "tool_use":
             return "".join(b.get("text", "") for b in out["content"]).strip()
-        tool_results = []
+        results = []
         for block in out["content"]:
             if "toolUse" not in block:
                 continue
@@ -514,153 +1133,64 @@ def converse(system_prompt, user_text, ctx, tools=MOVIE_TOOLS, max_turns=6):
             except Exception as e:
                 log.error("tool %s failed: %s", tu["name"], e)
                 result = {"error": str(e)}
-            tool_results.append(
-                {
-                    "toolResult": {
-                        "toolUseId": tu["toolUseId"],
-                        "content": [{"json": {"result": result}}],
-                    }
-                }
-            )
-        messages.append({"role": "user", "content": tool_results})
-    return "I got a bit tangled up there — try again?"
+            results.append({"toolResult": {"toolUseId": tu["toolUseId"],
+                                           "content": [{"json": {"result": result}}]}})
+        messages.append({"role": "user", "content": results})
+    return ""
 
 
-# --------------------------------------------------------------------------- #
-# Mode handler: MOVIE
-# --------------------------------------------------------------------------- #
-MOVIE_SYSTEM = (
-    "You are Gracia's film-night helper in a Telegram group chat. Talk like a "
-    "person, warm and brief, not like a system. The film named by the user has "
-    "already been added to the group's list (attributed to them). Use lookup_film "
-    "to get its rating and similar titles, then in one short reply: confirm the "
-    "add, give the rating (the Letterboxd average out of 5 — state it plainly as "
-    "'X/5 on Letterboxd'; if the tool says the rating came from TMDB instead, "
-    "say it's the TMDB score out of 10 because Letterboxd was unavailable), name "
-    "one related film fans also enjoy, and offer to add it. Use the tools rather "
-    "than guessing ratings."
-)
-
-FREEFORM_SYSTEM = (
-    "You are Gracia's film-night helper in a Telegram group chat. Be warm and "
-    "concise. You can look up films, add them to the group's list, list what's on "
-    "it, or draw one at random, using your tools. Ratings come from Letterboxd "
-    "(out of 5); the tool tells you the source and scale — present them honestly "
-    "and never invent ratings."
-)
-
-
-def _rating_phrase(info):
-    """'Letterboxd 4.1/5' / 'TMDB 7.6/10' / '' — from a lookup_film result."""
-    if not info.get("found") or info.get("rating") is None:
-        return ""
-    src = "Letterboxd" if str(info.get("rating_source", "")).startswith("Letterboxd") else "TMDB"
-    return f"{src} {info['rating']}/{info.get('rating_scale', 5)}"
-
-
-def _plain_add_reply(film_item):
-    """Used when AI is off or Bedrock fails — still acknowledge the add."""
-    line = f"Added \u201c{film_item['title']}\u201d for {film_item['added_by']} \U0001f3ac"
+def on_message(mode, ev):
+    chat_id, uid = ev["chat_id"], ev.get("user_id")
+    text = (ev.get("text") or "").strip()
+    remember_member(chat_id, uid, ev["user_name"], ev.get("username"))
+    game = get_game(chat_id)
+    if _veto_backstop(mode, chat_id, game):
+        return
+    if not text or not AI_ENABLED:
+        return
+    ctx = {"chat_id": chat_id, "user_id": uid, "user_name": ev["user_name"],
+           "username": ev.get("username"), "mode": mode}
     try:
-        info = lookup_film(film_item["title"])
+        reply = converse(MOVIE_SYSTEM, text, ctx)
     except Exception as e:
-        log.warning("lookup for plain reply failed: %s", e)
-        return line
-    phrase = _rating_phrase(info)
-    if phrase:
-        yr = f" ({info['year']})" if info.get("year") else ""
-        line = (
-            f"Added \u201c{info['title']}\u201d{yr} for {film_item['added_by']} \U0001f3ac "
-            f"\u2014 {phrase}."
-        )
-    return line
-
-
-def handle_movie(mode, upd):
-    chat_id = upd["chat_id"]
-    text = upd["text"].strip()
-    cmd, arg = parse_command(text)
-
-    if cmd == "movie":
-        if not arg:
-            send_message(mode, chat_id, "Usage: /movie <title> — e.g. /movie Rear Window")
-            return
-        item = add_film(chat_id, arg, upd["user_name"], upd.get("user_id"))
-        if AI_ENABLED:
-            try:
-                ctx = {"chat_id": chat_id, "user_name": upd["user_name"], "user_id": upd.get("user_id")}
-                reply = converse(
-                    MOVIE_SYSTEM,
-                    f'I just added the film "{arg}". Respond now.',
-                    ctx,
-                )
-                send_message(mode, chat_id, reply or _plain_add_reply(item))
-                return
-            except Exception as e:
-                log.error("bedrock movie add failed: %s", e)
-        send_message(mode, chat_id, _plain_add_reply(item))
+        log.error("bedrock movie failed: %s", e)
         return
+    reply = (reply or "").strip()
+    if reply and reply.lower() != "(silent)":
+        send_message(mode, chat_id, reply)
 
-    if cmd == "movies":
-        films = list_films(chat_id)
-        if not films:
-            send_message(mode, chat_id, "No films on the list yet. Add one with /movie <title>.")
-            return
-        lines = ["\U0001f37f This group's film list:"]
-        for f in films:
-            yr = f" ({f['year']})" if f.get("year") else ""
-            lines.append(f"\u2022 {f['title']}{yr} — added by {f.get('added_by', '?')}")
-        send_message(mode, chat_id, "\n".join(lines))
+
+# --------------------------------------------------------------------------- #
+# Mode handler: MOVIE — dispatch by update kind.
+# --------------------------------------------------------------------------- #
+def handle_movie(mode, ev):
+    kind = ev.get("kind")
+    if kind == "message":
+        on_message(mode, ev)
+    elif kind == "callback":
+        on_callback(mode, ev)
+    elif kind == "reaction":
+        _on_reaction(mode, ev)
+    elif kind == "poll_answer":
+        on_poll_answer(mode, ev)
+    elif kind == "poll":
+        on_poll(mode, ev)
+
+
+def _on_reaction(mode, ev):
+    chat_id, uid = ev["chat_id"], ev.get("user_id")
+    game = get_game(chat_id)
+    if not game:
         return
-
-    if cmd == "draw":
-        chosen = draw_film(chat_id)  # random.choice in code
-        if not chosen:
-            send_message(mode, chat_id, "Nothing to draw from — add films with /movie first.")
-            return
-        yr = f" ({chosen['year']})" if chosen.get("year") else ""
-        line = f"\U0001f3b2 Tonight's pick: {chosen['title']}{yr} (added by {chosen.get('added_by', '?')})"
-        try:
-            info = lookup_film(chosen["title"])
-            phrase = _rating_phrase(info)
-            if phrase:
-                line += f"\n{phrase}"
-                if info.get("runtime_min"):
-                    line += f" \u00b7 {info['runtime_min']} min"
-                if info.get("genres"):
-                    line += f" \u00b7 {', '.join(info['genres'][:2])}"
-        except Exception as e:
-            log.warning("draw lookup failed: %s", e)
-        send_message(mode, chat_id, line)
+    if _veto_backstop(mode, chat_id, game):
         return
-
-    if cmd in ("start", "help"):
-        send_message(
-            mode, chat_id,
-            "\U0001f3ac Film-night helper. Commands:\n"
-            "/movie <title> — add a film\n"
-            "/movies — show the list\n"
-            "/draw — pick one at random\n"
-            "Or just talk to me about films.",
-        )
+    if game.get("phase") != "SELECTING":
         return
-
-    if cmd is not None:
-        return  # unknown command — stay quiet
-
-    # Free-form (privacy mode ON means we only see mentions/replies here).
-    if not text:
-        return
-    if AI_ENABLED:
-        try:
-            ctx = {"chat_id": chat_id, "user_name": upd["user_name"], "user_id": upd.get("user_id")}
-            reply = converse(FREEFORM_SYSTEM, text, ctx)
-            if reply:
-                send_message(mode, chat_id, reply)
-            return
-        except Exception as e:
-            log.error("bedrock freeform failed: %s", e)
-    send_message(mode, chat_id, "I can add films (/movie), list them (/movies) or draw one (/draw).")
+    emojis = ev.get("reactions") or []
+    if "👎" in emojis:
+        _handle_thumb(mode, chat_id, game, uid, ev.get("message_id"), up=False)
+    elif "👍" in emojis:
+        _handle_thumb(mode, chat_id, game, uid, ev.get("message_id"), up=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -731,21 +1261,34 @@ def lambda_handler(event, context):
         return {"statusCode": 200, "body": "ok"}  # don't make Telegram retry
 
     try:
-        upd = parse_update(update)
-        if upd["chat_id"] is None:
+        ev = parse_update(update)
+        chat_id = ev.get("chat_id")
+
+        # poll / poll_answer updates carry no chat — resolve via the global poll map.
+        if chat_id is None and ev.get("poll_id"):
+            ref = get_poll_map(ev["poll_id"]) if mode == "movie" else None
+            if ref:
+                chat_id = ref.get("chat_id")
+        if chat_id is None:
             return {"statusCode": 200, "body": "ok"}
+        ev["chat_id"] = chat_id
 
         # Persist / refresh the chat id (never hardcoded).
-        remember_chat(mode, upd["chat_id"], upd.get("chat_title"))
+        remember_chat(mode, chat_id, ev.get("chat_title"))
+
+        # Idempotency: drop Telegram's retried deliveries before any state change.
+        if seen_update(mode, chat_id, ev.get("update_id")):
+            log.info("duplicate update %s ignored", ev.get("update_id"))
+            return {"statusCode": 200, "body": "ok"}
 
         # Handle migration service messages on the way in.
-        if upd.get("migrate_to_chat_id"):
-            migrate_chat(mode, upd["chat_id"], upd["migrate_to_chat_id"])
+        if ev.get("migrate_to_chat_id"):
+            migrate_chat(mode, chat_id, ev["migrate_to_chat_id"])
             return {"statusCode": 200, "body": "ok"}
-        if upd.get("migrate_from_chat_id"):
-            migrate_chat(mode, upd["migrate_from_chat_id"], upd["chat_id"])
+        if ev.get("migrate_from_chat_id"):
+            migrate_chat(mode, ev["migrate_from_chat_id"], chat_id)
 
-        modes[mode]["handler"](mode, upd)
+        modes[mode]["handler"](mode, ev)
     except Exception as e:
         log.exception("handler error in mode %s: %s", mode, e)
         # Always 200 so Telegram doesn't hammer us with retries.
