@@ -194,7 +194,8 @@ def _two_player_game_to_veto():
     L.add_to_library(CHAT, 2, "Film B")
     L.start_game(MODE, CHAT, 1)             # initiator 1 auto-joins
     L.handle_movie(MODE, cb(2, "join"))     # player 2 joins
-    L.handle_movie(MODE, cb(1, "start"))    # begins selection
+    L.handle_movie(MODE, cb(1, "start"))    # -> CONSTRAINTS window
+    L.handle_movie(MODE, message(1, "go"))  # no constraints -> SELECTING
     game = L.get_game(CHAT)
     assert game["phase"] == "SELECTING"
     for uid in (1, 2):
@@ -267,6 +268,7 @@ def test_thumbs_down_replaces_card():
         L.add_to_library(CHAT, 1, t)
     L.start_game(MODE, CHAT, 1)
     L.handle_movie(MODE, cb(1, "start"))
+    L.handle_movie(MODE, message(1, "go"))   # close constraints -> SELECTING
     game = L.get_game(CHAT)
     sel = game["selection"]["1"]
     assert len(sel["slots"]) == 3 and len(sel["shown"]) == 3
@@ -308,6 +310,96 @@ def test_seed_starter_libraries_then_claim():
     assert "chad" not in L.list_seed_names(CHAT)      # claimed, no longer a seed
     L.seed_starter_libraries(CHAT)                    # re-seed skips the claimed name
     assert "chad" not in L.list_seed_names(CHAT)
+
+
+def test_filter_merge_and_passes():
+    f = L._empty_filter()
+    L._merge_filter(f, {"exclude_genres": ["Documentary"]})
+    L._merge_filter(f, {"max_runtime_min": 150})
+    L._merge_filter(f, {"min_year": 1960})
+    L._merge_filter(f, {"max_runtime_min": 120})   # tighter, from another person -> AND
+    assert f["exclude_genres"] == ["documentary"]
+    assert f["max_runtime_min"] == 120 and f["min_year"] == 1960
+    P = L._passes_filter
+    assert P({"genres": ["Documentary"], "year": "1970", "runtime_min": 90}, f) is False
+    assert P({"genres": ["Drama"], "year": "1955", "runtime_min": 100}, f) is False   # year
+    assert P({"genres": ["Drama"], "year": "1980", "runtime_min": 130}, f) is False   # runtime
+    assert P({"genres": ["Drama"], "year": "1980", "runtime_min": 100}, f) is True
+    # unknown metadata is kept rather than dropped
+    assert P({"genres": [], "year": "1980", "runtime_min": None}, f) is True
+    assert P({"genres": ["Drama"], "year": "", "runtime_min": 100}, f) is True
+
+
+def test_eligible_pool_excludes_definitive_violations():
+    _reset()
+    pk = L._pk(MODE, CHAT)
+    STORE[(pk, "lib#1#doc")] = {"PK": pk, "SK": "lib#1#doc", "slug": "doc", "owner_id": 1,
+        "title": "A Doc", "year": "1970", "genres": ["documentary"], "runtime_min": 90}
+    STORE[(pk, "lib#1#dra")] = {"PK": pk, "SK": "lib#1#dra", "slug": "dra", "owner_id": 1,
+        "title": "A Drama", "year": "1980", "genres": ["drama"], "runtime_min": 100}
+    game = L.new_game(CHAT, 1)
+    game["pool_all"] = [{"owner": "1", "slug": "doc", "title": "A Doc"},
+                        {"owner": "1", "slug": "dra", "title": "A Drama"}]
+    game["filter"]["exclude_genres"] = ["documentary"]
+    elig, unknown = L._eligible_pool(CHAT, game)
+    assert {e["slug"] for e in elig} == {"dra"} and unknown == []
+
+
+def test_over_constrained_offers_relax_then_unfilter():
+    _reset()
+    pk = L._pk(MODE, CHAT)
+    STORE[(pk, "lib#1#dra")] = {"PK": pk, "SK": "lib#1#dra", "slug": "dra", "owner_id": 1,
+        "title": "A Drama", "year": "1980", "genres": ["drama"], "runtime_min": 100}
+    game = L.new_game(CHAT, 1)
+    L._add_player(game, 1)
+    game["phase"] = "SELECTING"
+    game["selection"] = {"1": {"slots": [{"slug": "dra", "title": "A Drama", "state": "locked"}],
+                               "shown": [], "locked": True}}
+    game["filter"]["exclude_genres"] = ["drama"]      # excludes the only film
+    L.put_game(game)
+    L._begin_veto(MODE, CHAT, game)
+    g = L.get_game(CHAT)
+    assert g["awaiting_relax"] is True and g.get("current") is None   # no silent unfilter
+    L.handle_movie(MODE, message(1, "play without filters"))
+    g = L.get_game(CHAT)
+    assert g["awaiting_relax"] is False
+    assert g["current"]["film"]["slug"] == "dra"      # now eligible, presented
+
+
+def test_constraints_window_parses_three_people_then_go_closes():
+    _reset()
+    L.add_to_library(CHAT, 1, "Film A")
+    L.start_game(MODE, CHAT, 1)
+    L.handle_movie(MODE, cb(1, "start"))              # -> CONSTRAINTS, question asked once
+    assert L.get_game(CHAT)["phase"] == "CONSTRAINTS"
+    assert sum("constraints tonight" in t.lower() for t, _ in SENT) == 1
+    mapping = {"no documentaries": {"exclude_genres": ["documentary"]},
+               "under 2.5 hours": {"max_runtime_min": 150},
+               "nothing earlier than 1960": {"min_year": 1960}}
+    orig = L.parse_constraint_text
+    L.parse_constraint_text = lambda t: mapping.get(t.strip().lower(), {})
+    try:
+        L.handle_movie(MODE, message(1, "no documentaries"))
+        L.handle_movie(MODE, message(2, "under 2.5 hours"))
+        L.handle_movie(MODE, message(3, "nothing earlier than 1960"))
+        f = L.get_game(CHAT)["filter"]
+        assert f["exclude_genres"] == ["documentary"]
+        assert f["max_runtime_min"] == 150 and f["min_year"] == 1960
+        L.handle_movie(MODE, message(1, "go"))        # explicit close
+        assert L.get_game(CHAT)["phase"] == "SELECTING"
+    finally:
+        L.parse_constraint_text = orig
+
+
+def test_constraints_backstop_closes_after_60s_silence():
+    _reset()
+    L.add_to_library(CHAT, 1, "Film A")
+    L.start_game(MODE, CHAT, 1)
+    L.handle_movie(MODE, cb(1, "start"))
+    assert L.get_game(CHAT)["phase"] == "CONSTRAINTS"
+    NOW[0] += 61
+    L.handle_movie(MODE, message(2, "anything"))      # next event past deadline closes it
+    assert L.get_game(CHAT)["phase"] == "SELECTING"
 
 
 def test_omdb_reads_rt_from_ratings_array():

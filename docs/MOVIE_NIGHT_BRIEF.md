@@ -97,6 +97,25 @@ Command names below are proposals — rename freely. The mechanics matter, not t
 - **Decision needed:** is the roster (a) explicit `/join` only, or (b) auto = every known member with
   a library? I recommend explicit `/join` so veto counts stay bounded and predictable.
 
+### Phase 1.5: Constraints (optional)
+Once the player list is settled, ask once: "Any constraints tonight? Length, genre, or
+year range — or just say go." Wait up to 60 seconds.
+
+* No replies in 60s → proceed with no filter, exactly as normal.
+* Replies → parse each into a filter ("no documentaries", "under 2.5 hours", "nothing
+  before 1960") and combine everyone's together.
+* Apply the combined filter as the eligibility gate for the Pick: only films that fit can
+  be drawn. Year is exact from the library; genre/runtime use looked-up metadata; when a
+  film's metadata is unknown, keep it rather than drop it.
+* If nothing fits, say so and offer to relax one constraint or play unfiltered — never
+  silently ignore the filter. An explicit "go" / "let's pick" closes the window early.
+
+Implementation notes (this repo): the live flow is JOINING → **CONSTRAINTS** → SELECTING
+→ VETO → DONE; the filter gates the VETO candidate pool (the `random.choice` Pick). The
+60s window uses the **lazy backstop** — it closes on the next inbound event past the
+deadline (no scheduler/EventBridge), matching the veto round. Downside: if the group goes
+silent the window doesn't advance until someone speaks; the host can always say "go".
+
 ### Phase 2 — Selection ("3 from each")
 - For each participant with a non-empty library, code does `random.sample(library, min(3, len))`.
   **In Python, not the LLM.** Store the chosen `film_uuid`s in `selections` so re-invocations are
