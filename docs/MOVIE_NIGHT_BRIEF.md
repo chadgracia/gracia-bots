@@ -204,17 +204,14 @@ message-scanning artifact. With commands, ownership is simply the **command send
      other eligible options. If excluding it would leave nothing, the vetoed film
      becomes eligible again. → Requires tracking **`vetoed_by: [user_id]`** on each
      library item (a set of who vetoed it), not just a `times_vetoed` count.
-4. **Finalization: timed, with a warning.** After the pick, players get **90 seconds**.
-   At the **60-second mark**, post a warning ("Veto or press play!"). At 90s with no
-   veto and no explicit play, finalize automatically. A `/veto` or reply-veto before
-   then removes the film, re-picks, and **restarts the 90s clock**. An explicit
-   "press play" (`/go` / `/watch` / ✅ reply) finalizes immediately.
-   - This needs an **external one-off scheduler** (no in-process waiting): an
-     EventBridge Scheduler one-time schedule (auto-delete after firing) or an SQS
-     delayed message re-invokes the Lambda with a timer payload `{kind: warn|finalize,
-     chat_id, session_id, pick_token}`. The handler must branch on
-     webhook-update vs. timer-callback invocations. Guard against stale timers with a
-     `pick_token` so a timer for an already-vetoed/finalized pick is ignored.
+4. **Finalization: explicit, with flavor text (no real timer).** After the pick, the
+   bot posts the card plus a static nudge — **"⏳ You have 60 seconds — veto or press
+   play!"** — but there is **no actual clock and no scheduler** (keeps us on zero new
+   infra). The pick simply stands until: a `/veto` (or reply `veto`/❌ to the pick)
+   removes the film, decrements that user's veto, and re-picks; or an explicit
+   "press play" (`/watch`, or reply `✅`/`go`) finalizes the winner. A second veto from
+   the same user is rejected. Pool exhausted → pick from the vetoed pile, no more vetoes,
+   finalize.
 
 ## 8. Test checklist (run before declaring it works — the old setup "passed" while broken)
 
