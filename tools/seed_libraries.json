@@ -1,5 +1,5 @@
 {
-  "_note": "INCOMPLETE — the paste was cut off after Khimka. Add any remaining people/films before seeding. Films with a 'Won session' note are imported as already-watched. 'Previously vetoed' notes are kept as text only (vetoed_by needs real user_ids, applied after /claim).",
+  "_note": "COMPLETE roster (confirmed 2026-06-09: Khimka was the last to add). Counts: Chad 40, Alberto 8, Asa 6, Anya 3; Maryna and Dasha empty. Films with a 'Won session' note import as already-watched.",
   "libraries": {
     "Chad": [
       { "title": "Red River", "year": 1948, "addedDate": "2026-05-16" },
