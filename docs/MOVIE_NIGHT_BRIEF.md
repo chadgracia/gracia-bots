@@ -1,0 +1,210 @@
+# Brief for Claude Code — Movie Night game management in `movie` mode (bot: SirWatchalot_bot)
+
+This extends the existing `movie` mode in the telegram-bots-deploy Lambda. It does **not**
+replace the platform conventions in the project overview — those still hold (mode routing,
+shared core, DynamoDB key scheme, Bedrock via env `BEDROCK_MODEL_ID`, no hardcoded chat_id,
+no secrets in repo). Read this against the project overview, not instead of it.
+
+---
+
+## 0. The decision that shapes everything: privacy mode ON
+
+The original `MOVIE_NIGHT__Game_Rules` doc was written for a bot that reads **every** message
+in the group. This platform runs with **Telegram privacy mode ON, no admin**. With privacy ON,
+a bot in a group receives only:
+
+1. messages that start with a slash command (`/...`),
+2. messages that **@mention the bot** by username,
+3. **replies to one of the bot's own messages**,
+4. service messages (member joined/left, group→supergroup migration).
+
+It does **not** receive ambient chat. So the rules' free-text detection — watching for "veto",
+"nope", "let's go", scanning history for posted movies — is not implementable as written. Every
+player action in the game must be a command, an @mention, or a reply to a bot message. The whole
+flow below is built on that. Do not introduce any step that depends on reading ambient messages.
+
+---
+
+## 1. What changes vs. the current `movie` mode
+
+The current spec stores a single group list. The new requirement is **per-player libraries**, and
+the game selects **3 films from each participating player**. Concrete changes:
+
+- `/movie <title>` now adds to the **sender's own library** within this chat (attributed to the
+  sender), not a shared group list.
+- Add `/library [@user]` (or `/movies`) to show the sender's library, or another player's if named.
+- A library can be large; never dump it all into one message — paginate or summarize. Selection of
+  3 happens at game time, in code.
+- The game is a new, stateful, multi-message flow (sections 3–5).
+
+Keep `/draw` semantics (random pick **in code**, never the LLM) — the game's selection and pick
+reuse that principle.
+
+---
+
+## 2. Data model additions (one DynamoDB table, existing key scheme)
+
+`PK = "movie#{chat_id}"`. Item types via `SK`:
+
+- **Member**: `SK = "member#{user_id}"` → `{ display_name, username (nullable), first_seen }`.
+  Capture this every time a user interacts, so the bot can address/mention people later.
+- **Library item**: `SK = "lib#{user_id}#{film_uuid}"` → `{ title, year, added_by=user_id,
+  added_at, watched (bool), times_vetoed (int) }`.
+- **Game session**: `SK = "game#current"` (single active game per chat) →
+  `{ session_id, phase, participants:[user_id], selections:{user_id:[film_uuid]},
+  message_index:{ message_id: {kind, user_id, film_uuids} }, pool:[film_uuid],
+  vetoes_left:{user_id:int}, picked:film_uuid, status }`.
+- **History**: `SK = "history#{session_id}"` → `{ winner, watched_date, participants,
+  ratings:{}, poll_message_id }`. Ratings filled later by the morning poll.
+
+`message_index` is the routing table: when an incoming update is a reply, look up
+`reply_to_message.message_id` here to know which player/film(s)/phase the reply belongs to. This is
+how confirmation/veto work under privacy mode.
+
+**Decision needed — library scope.** Under this key, libraries are per `(chat, user)`. If you want a
+player's library to follow them across groups, that needs a different key (`PK = "user#{user_id}"`)
+and a join at game time. The seed file lists people (Chad, Alberto, …) not tied to a group, so
+confirm which you want. I recommend per-`(chat, user)` to match the existing scheme; flag if not.
+
+**Decision needed — seeding existing libraries.** The current `Library_of_movies_to_start_with`
+JSON keys films by display name. The bot can't know "Chad" = which Telegram `user_id` until that
+person interacts or you map it by hand. Plan a one-time seed step that maps names → user_ids; don't
+let the bot silently attribute films to the wrong account.
+
+---
+
+## 3. Game lifecycle (command + reply driven)
+
+Command names below are proposals — rename freely. The mechanics matter, not the spelling.
+
+### Phase 1 — Start & roster
+- `/movienight` (or `@SirWatchalot_bot let's play`) creates `game#current` for this chat, `phase=roster`.
+- Participants join via `/join`. Auto-add anyone who runs `/movie` or `/join` during the night.
+- Each participant gets **one veto for the night** (`vetoes_left[user_id]=1`), whether or not their
+  library contributes films (mirrors the old "non-submitters still get a veto" rule).
+- Bot announces who's in and that selection is about to happen. There is no "scan history" step —
+  films come from libraries, not from the chat.
+- **Decision needed:** is the roster (a) explicit `/join` only, or (b) auto = every known member with
+  a library? I recommend explicit `/join` so veto counts stay bounded and predictable.
+
+### Phase 2 — Selection ("3 from each")
+- For each participant with a non-empty library, code does `random.sample(library, min(3, len))`.
+  **In Python, not the LLM.** Store the chosen `film_uuid`s in `selections` so re-invocations are
+  stable (Lambda is stateless; never re-roll on a retry).
+- **Decision needed:** exclude films already `watched` (in history)? Deprioritize `times_vetoed > 0`?
+  The seed data has "previously vetoed" notes, so this is a real choice. I'd exclude watched and
+  allow (not exclude) previously vetoed. Confirm.
+
+### Phase 3 — Confirmation
+- For each participant, the bot posts **one card** with their 3 films, each enriched via
+  `lookup_film` (Letterboxd rating + TMDB metadata, per the existing tool contract). Post all cards
+  before waiting. @mention the player on their card.
+- The player **replies to their own card** (privacy mode delivers replies to the bot) to keep/swap:
+  - Keep all: reply `/confirm`, or `👍`, or just don't change anything before lock.
+  - Swap: `/swap <n>` (replace film n with another `random.sample` from their library not already
+    shown), or reply with one emoji per film in order (`👍`/`👎`, `✅`/`❌`, `y`/`n`) — parsed **in
+    code**, deterministically, left to right. Count mismatch → ask them to resubmit.
+- Store each card's `message_id` in `message_index` so the reply router knows whose card it is.
+- Mentioning people: prefer `@username`; if a user has no username, use a `text_mention` entity with
+  their `user_id` so the ping still works.
+
+### Phase 4 — Lock
+- `/lock` (host) or once everyone has confirmed: drop all `👎` films, optionally backfill from
+  libraries to keep ~3 each, build `pool`, post the final list, ask for `go`.
+- "go" must be a command or a reply to the lock message (`/go` or reply `go`/`👍`), not ambient text.
+
+### Phase 5 — The pick + veto
+- Code does `random.choice(pool)` (**not** the LLM). Announce the pick with a full info card.
+- Veto must be explicit: `/veto`, or a **reply** to the pick message with `veto`/`❌`. On veto:
+  confirm it, decrement `vetoes_left` for that user, mark "out of vetoes," remove the film, re-pick.
+  Reject a second veto from the same user ("you already played your veto").
+- **No 60-second wait.** Lambda has no long-running process. Two options:
+  - (recommended) the pick stands until someone vetoes or someone confirms with `/watch` (or reply
+    `✅`). Clean, no scheduler, and explicit in a group.
+  - (alternative) schedule a one-off EventBridge callback ~60s out that re-invokes the Lambda to
+    finalize if no veto landed. More moving parts; only do this if you specifically want the timer.
+- Pool exhausted: `random.choice` from the vetoed pile, no more vetoes, finalize.
+
+### Phase 6 — Winner
+- Announce winner with a full info card **plus a spoiler-free context note** (production facts,
+  trivia, legacy — never plot/endings). The LLM may write this note; it must not pick the winner.
+- Write `history#{session_id}` (winner, date, participants, empty ratings). Clear `game#current`.
+
+---
+
+## 4. Telegram / Lambda hard requirements (this is where the old setup failed)
+
+These map directly to the failures catalogued in the third-party doc. Treat them as acceptance
+criteria, not nice-to-haves.
+
+- **Never hardcode chat_id.** Read/write it from DynamoDB. Every "chat not found" / "went silent"
+  failure in the old logs traced to a stale or wrong chat_id.
+- **Supergroup migration** must be handled in the shared send helper (already in the overview):
+  catch the 400 "group chat was upgraded to a supergroup chat", read `parameters.migrate_to_chat_id`,
+  update the stored chat_id, retry once. Also handle `migrate_to_chat_id` / `migrate_from_chat_id`
+  on **incoming** service updates and rewrite stored state to the new id. Both the movie group and
+  the cleaning group migrated in the old logs — assume it will happen.
+- **Idempotency.** Telegram retries webhook deliveries. Dedupe on `update_id` (store last processed,
+  or a short-TTL per-update marker) so a retry never double-adds a film, double-counts a veto, or
+  re-rolls a selection. The old system double-processed messages against stale sessions; don't
+  reproduce that.
+- **No in-process state, no wait loops.** Each update is a fresh invocation. All "waiting" is just
+  state persisted in `game#current` between invocations. Anything in the rules phrased as "wait N
+  seconds" or "watch the room" must become persisted state + an explicit trigger (or an EventBridge
+  schedule).
+- **Reply routing.** On every incoming update, if it's a reply, resolve
+  `reply_to_message.message_id` against `message_index` in `game#current`. If it matches, route to the
+  right phase/player. If not, ignore. This is the backbone of confirmation and veto under privacy ON.
+- **Verify the per-mode secret token** (`X-Telegram-Bot-Api-Secret-Token`) before doing anything —
+  the Function URL is public.
+
+---
+
+## 5. LLM (Bedrock) boundaries
+
+Same philosophy as salary mode (model parses/communicates; code decides):
+
+- **LLM does:** the conversational confirmation/nudge wording, the spoiler-free winner context note,
+  free-form "film-night helper" replies when @mentioned.
+- **LLM does not:** select the 3-per-player, count vetoes, or pick the winner. All randomness and all
+  game-state transitions are plain Python. Emoji/yes-no confirmation parsing is code, not LLM, so it's
+  deterministic.
+- `lookup_film` stays isolated: Letterboxd for the rating, TMDB (`TMDB_API_KEY`) for everything else,
+  swappable later.
+
+---
+
+## 6. Attribution (simplified by going command-based)
+
+The old rule ("a movie belongs to whoever sent the message; handle quoted/replied text") was a
+message-scanning artifact. With commands, ownership is simply the **command sender**: `/movie <title>`
+→ `added_by = sender user_id`. No inference across messages. Drop the quote/reply attribution logic.
+
+---
+
+## 7. Open decisions to confirm before building
+
+1. Library scope: per-`(chat, user)` (recommended) vs. global per user.
+2. Roster: explicit `/join` (recommended) vs. auto-include every member with a library.
+3. Selection filters: exclude `watched`? include/exclude previously vetoed?
+4. Veto finalization: explicit confirm (recommended) vs. EventBridge 60s callback.
+5. How to seed the existing named libraries → real Telegram `user_id`s.
+
+---
+
+## 8. Test checklist (run before declaring it works — the old setup "passed" while broken)
+
+- [ ] `/movie` in a group with privacy ON is received and attributed to the sender.
+- [ ] A reply to a bot card is received and routed to the correct player/phase.
+- [ ] An @mention with no slash command is received.
+- [ ] An ambient (non-command, non-mention, non-reply) message is correctly **not** received — confirm
+      the flow doesn't depend on it.
+- [ ] Selection produces exactly `min(3, library_size)` per participant, stable across a retried update.
+- [ ] Duplicate `update_id` does not double-add / double-veto / re-roll.
+- [ ] Force a supergroup migration (or simulate the 400 + `migrate_to_chat_id`): send retries to the
+      new id and stored chat_id is updated.
+- [ ] Second veto from the same user is rejected; veto by a user with one left removes the film and
+      re-picks.
+- [ ] Winner is written to history and `game#current` is cleared.
+- [ ] Morning poll / weekly nudge run as scheduled (EventBridge) invocations that read chat_id from
+      DynamoDB — not as webhook events, and not against a hardcoded id.
