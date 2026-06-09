@@ -791,13 +791,14 @@ def seed_starter_libraries(chat_id):
         n = 0
         for f in films:
             slug = _slugify(f["title"])
-            note = (f.get("note") or "").lower()
+            # Seeded films are never pre-marked watched — "watched" is only set
+            # when a film actually wins a movie night in this chat.
             ddb_put({"PK": _pk("movie", chat_id), "SK": f"lib#{owner}#{slug}",
                      "slug": slug, "owner_id": owner, "seed_name": name.strip(),
                      "title": f["title"], "year": str(f.get("year") or ""),
                      "genres": [], "description": "", "lb_rating": None,
                      "rt_rating": None, "added_at": _now_iso(),
-                     "watched": "won" in note})
+                     "watched": False})
             n += 1
         written[name] = n
     return written
