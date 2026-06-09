@@ -92,6 +92,16 @@ def _tg(token, method, payload):
         return {"ok": False, "status": status, "description": body}
 
 
+# movie runs natural-language + the interactive game, so it needs reactions,
+# polls and button taps. message_reaction is NOT in Telegram's default set and
+# must be listed explicitly (and the bot must be a group admin to receive it).
+_ALLOWED_UPDATES = {
+    "movie": ["message", "edited_message", "channel_post", "message_reaction",
+              "poll", "poll_answer", "callback_query"],
+}
+_DEFAULT_ALLOWED = ["message", "edited_message", "channel_post"]
+
+
 def cmd_set():
     base = _base_url()
     for mode, token, secret in _configured():
@@ -99,7 +109,7 @@ def cmd_set():
         resp = _tg(token, "setWebhook", {
             "url": target,
             "secret_token": secret,
-            "allowed_updates": ["message", "edited_message", "channel_post"],
+            "allowed_updates": _ALLOWED_UPDATES.get(mode, _DEFAULT_ALLOWED),
             "drop_pending_updates": True,
         })
         ok = "OK " if resp.get("ok") else "ERR"

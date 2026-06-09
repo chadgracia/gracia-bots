@@ -1,5 +1,15 @@
 # Brief for Claude Code — Movie Night game management in `movie` mode (bot: SirWatchalot_bot)
 
+> **⚠️ SUPERSEDED (2026-06-09).** The shipped build now follows the **"Movie mode —
+> full build spec"**: **natural language, no slash commands, privacy OFF (bot is a
+> group admin)**, and a reaction/poll-driven state machine
+> `IDLE → JOINING → SELECTING → VETO → DONE` (inline Join/Start buttons, 👍/👎
+> reactions on selection cards, a 90s non-anonymous veto **poll** per candidate with
+> a no-scheduler backstop). See `lambda_function.py` (`on_message`, `on_callback`,
+> `_on_reaction`, `on_poll_answer`, `on_poll`, `_begin_selection`, `_begin_veto`).
+> The command-based, privacy-ON design described below is **historical** — kept for
+> the rationale and the Telegram/idempotency hard-requirements, which still apply.
+
 This extends the existing `movie` mode in the telegram-bots-deploy Lambda. It does **not**
 replace the platform conventions in the project overview — those still hold (mode routing,
 shared core, DynamoDB key scheme, Bedrock via env `BEDROCK_MODEL_ID`, no hardcoded chat_id,

@@ -18,8 +18,13 @@ This tool is operator-only; it does not ship in the Lambda package.
 import argparse
 import json
 import os
-import uuid
+import re
 from datetime import datetime, timezone
+
+
+def _slugify(s):
+    s = re.sub(r"[^a-z0-9]+", "-", (s or "").lower()).strip("-")
+    return s or "film"
 
 
 def main():
@@ -45,19 +50,23 @@ def main():
     for name, films in libraries.items():
         owner = f"seed:{name.strip().lower()}"
         for f in films:
-            fid = str(uuid.uuid4())
             note = f.get("note", "")
+            slug = _slugify(f["title"])
             item = {
                 "PK": pk,
-                "SK": f"lib#{owner}#{fid}",
-                "film_id": fid,
-                "owner_id": owner,            # placeholder until /claim
+                "SK": f"lib#{owner}#{slug}",     # slug-keyed, like add_to_library
+                "slug": slug,
+                "owner_id": owner,               # placeholder until claimed
                 "seed_name": name.strip(),
                 "title": f["title"],
                 "year": str(f.get("year", "")),
+                "genres": [],                    # filled when looked up later
+                "description": "",
+                "rating": None,
+                "rating_scale": None,
+                "rating_source": None,
                 "added_at": f.get("addedDate", now),
                 "watched": "won" in note.lower(),   # past winners are watched
-                "vetoed_by": [],
             }
             if note:
                 item["note"] = note
