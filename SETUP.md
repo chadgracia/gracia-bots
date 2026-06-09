@@ -6,6 +6,23 @@ per AWS account; after that, code changes ship on every push to `main`.
 
 Order matters — each step depends on the one above it.
 
+## 0. The bot in Telegram (BotFather)
+The `movie` bot already exists: **Sir Watchalot** — `@SirWatchalot_bot`
+(t.me/SirWatchalot_bot). Its token is the `MOVIE_BOT_TOKEN` env var in step 3.
+For future bots (cleaning/salary), repeat `/newbot` in @BotFather.
+
+Two BotFather settings on Sir Watchalot:
+- `/setprivacy` → **Enable** — in groups the bot only sees commands and
+  replies/mentions, which is what the free-form handler assumes.
+- `/setcommands` → paste:
+  ```
+  movie - Add a film to the list
+  movies - Show the group's film list
+  draw - Pick one at random
+  ```
+
+> The token never goes in this repo — only in the Lambda env var (step 3).
+
 ## 1. DynamoDB table
 Create the table the handler reads/writes (`DDB_TABLE`, default `GraciaBotData`):
 
