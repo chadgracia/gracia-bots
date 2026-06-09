@@ -505,6 +505,11 @@ def _omdb(title, year=None):
         if r.get("Source") == "Rotten Tomatoes":
             rt = clean(r.get("Value"))             # e.g. "83%"
     genre = clean(data.get("Genre"))
+    imdb = clean(data.get("imdbRating"))
+    try:
+        imdb_rating = float(imdb) if imdb else None
+    except ValueError:
+        imdb_rating = None
     return {
         "title": clean(data.get("Title")),
         "year": (clean(data.get("Year")) or "")[:4],
@@ -512,6 +517,7 @@ def _omdb(title, year=None):
         "genres": [g.strip() for g in genre.split(",")] if genre else [],
         "description": clean(data.get("Plot")),
         "rt_rating": rt,
+        "imdb_rating": imdb_rating,
     }
 
 
@@ -522,64 +528,74 @@ def _tmdb_get(path, params):
     return json.loads(_http_get(f"https://api.themoviedb.org/3{path}?{qs}", timeout=15))
 
 
-def _tmdb_meta(title):
-    search = _tmdb_get("/search/movie", {"query": title, "include_adult": "false"})
-    results = search.get("results") or []
+def _tmdb(title, year=None):
+    """Primary resolver: a BROAD TMDB search. The year is passed as a SEPARATE
+    parameter (primary_release_year) — never concatenated into the query string —
+    and we drop it and retry if it yields nothing (weak-match guard). Returns the
+    top match's canonical metadata + alt candidates, or None."""
+    if not TMDB_API_KEY:
+        return None
+    base = {"query": title.strip(), "include_adult": "false"}
+    try:
+        params = dict(base)
+        if year:
+            params["primary_release_year"] = str(year)[:4]
+        results = _tmdb_get("/search/movie", params).get("results") or []
+        if not results and year:
+            results = _tmdb_get("/search/movie", base).get("results") or []
+    except Exception as e:
+        log.warning("tmdb search failed for %r: %s", title, e)
+        return None
     if not results:
         return None
-    movie_id = results[0]["id"]
-    details = _tmdb_get(f"/movie/{movie_id}", {})
-    recs = _tmdb_get(f"/movie/{movie_id}/recommendations", {})
-    overview = (details.get("overview") or "").replace("\n", " ").strip()
+    top = results[0]
+    try:
+        d = _tmdb_get(f"/movie/{top['id']}", {})
+    except Exception:
+        d = {}
+    overview = (d.get("overview") or top.get("overview") or "").replace("\n", " ").strip()
+    rating = d.get("vote_average") or top.get("vote_average")
     return {
-        "title": details.get("title"),
-        "year": (details.get("release_date") or "")[:4],
-        "tmdb_rating_10": details.get("vote_average"),
-        "runtime_min": details.get("runtime"),
-        "genres": [g["name"] for g in (details.get("genres") or [])],
+        "tmdb_id": top["id"],
+        "title": d.get("title") or top.get("title") or title,
+        "year": (d.get("release_date") or top.get("release_date") or "")[:4],
+        "runtime_min": d.get("runtime") or None,
+        "genres": [g["name"] for g in (d.get("genres") or [])],
+        "rating_10": round(float(rating), 1) if rating else None,
         "description": overview,
-        "similar": [r["title"] for r in (recs.get("results") or [])[:5]],
+        "alts": [{"title": r.get("title"), "year": (r.get("release_date") or "")[:4]}
+                 for r in results[:4]],
     }
 
 
-def lookup_film(title):
-    """Canonical title, year, runtime, genres, one-line description, Letterboxd
-    rating, slug, and similar titles. Letterboxd is the rating source; TMDB is
-    metadata + the rating fallback only. Returns {'found': False} when nothing.
+def lookup_film(title, year=None):
+    """Resolve a film independent of any one source. TMDB is the primary matcher
+    (year is a separate param); OMDb then Letterboxd are fallbacks. Returns
+    canonical title/year/id/genres/runtime + a rating (TMDB vote_average baseline).
+    A missing rating NEVER blocks. found=False only when nothing resolves at all.
     """
-    # --- Resolution + overview: source-agnostic, never gated on one provider. ---
-    lb = None
-    try:
-        lb = _letterboxd(title)        # popularity-ordered search; also the LB rating
-    except Exception as e:
-        log.warning("letterboxd lookup failed for %r: %s", title, e)
-    tmdb = None
-    if TMDB_API_KEY:
-        try:
-            tmdb = _tmdb_meta(title)
-        except Exception as e:
-            log.warning("tmdb meta failed: %s", e)
-    # Canonical resolution comes from a popularity-ordered source if available.
-    base = lb or tmdb
-    year_hint = (base or {}).get("year")
-    # --- Ratings: independent, non-blocking. RT is fetched for the SAME film
-    #     (year_hint) so we never show RT for a different version. ---
+    tmdb = _tmdb(title, year)
     omdb = None
-    try:
-        omdb = _omdb(title, year_hint)
-    except Exception as e:
-        log.warning("omdb lookup failed for %r: %s", title, e)
-    base = base or omdb
+    if (not tmdb or not tmdb.get("genres") or tmdb.get("runtime_min") is None
+            or tmdb.get("rating_10") is None):
+        try:
+            omdb = _omdb(title, year or (tmdb or {}).get("year"))
+        except Exception as e:
+            log.warning("omdb lookup failed for %r: %s", title, e)
+    lb = None
+    if not tmdb and not omdb:
+        try:
+            lb = _letterboxd(title)   # last-resort finder only
+        except Exception as e:
+            log.warning("letterboxd lookup failed for %r: %s", title, e)
+    if not (tmdb or omdb or lb):
+        log.info("lookup_film %r (%s) -> NOT FOUND (adding bare title)", title, year)
+        return {"found": False, "title": title, "year": str(year or ""),
+                "slug": _slugify(title), "tmdb_id": None, "runtime_min": None,
+                "genres": [], "description": "", "rating": None, "rating_scale": None,
+                "rt_rating": None, "alts": []}
 
-    if not base:
-        # Nothing resolved at all — still return a usable record so the add and
-        # the overview are never blocked; ratings are simply absent.
-        log.info("lookup_film %r -> NOT FOUND (adding bare title)", title)
-        return {"found": False, "title": title, "year": "", "slug": _slugify(title),
-                "runtime_min": None, "genres": [], "description": "", "similar": [],
-                "letterboxd_url": None, "lb_rating": None, "rt_rating": None}
-
-    sources = [base, lb, omdb, tmdb]
+    sources = [tmdb, omdb, lb]
 
     def pick(field):
         for s in sources:
@@ -588,35 +604,46 @@ def lookup_film(title):
         return None
 
     canonical = pick("title") or title
-    year = pick("year") or ""
+    yr = pick("year") or str(year or "")
+    # Rating baseline: TMDB vote_average (/10), else OMDb IMDb (/10), else Letterboxd (/5).
+    rating = rating_scale = None
+    if tmdb and tmdb.get("rating_10") is not None:
+        rating, rating_scale = tmdb["rating_10"], 10
+    elif omdb and omdb.get("imdb_rating") is not None:
+        rating, rating_scale = omdb["imdb_rating"], 10
+    elif lb and lb.get("rating_5") is not None:
+        rating, rating_scale = lb["rating_5"], 5
     out = {
         "found": True,
         "title": canonical,
-        "year": year,
-        "slug": (lb or {}).get("slug") or _slugify(f"{canonical} {year}".strip()),
+        "year": yr,
+        "slug": (lb or {}).get("slug") or _slugify(f"{canonical} {yr}".strip()),
+        "tmdb_id": (tmdb or {}).get("tmdb_id"),
         "runtime_min": pick("runtime_min"),
         "genres": pick("genres") or [],
         "description": pick("description") or "",
-        "similar": (tmdb or {}).get("similar") or [],
-        "letterboxd_url": (lb or {}).get("url"),
-        "lb_rating": (lb or {}).get("rating_5"),     # 0-5, or None
-        "rt_rating": (omdb or {}).get("rt_rating"),  # "83%", or None
+        "rating": rating,
+        "rating_scale": rating_scale,
+        "rt_rating": (omdb or {}).get("rt_rating"),
+        "alts": (tmdb or {}).get("alts") or [],
     }
-    log.info("lookup_film %r -> %s (%s) LB=%s RT=%s", title, out["title"],
-             out["year"], out.get("lb_rating"), out.get("rt_rating"))
+    log.info("lookup_film %r (%s) -> %s (%s) rating=%s/%s genres=%s rt=%s",
+             title, year, out["title"], out["year"], rating, rating_scale,
+             out["genres"], out["rt_rating"])
     return out
 
 
-def lookup_film_cached(title):
-    """lookup_film with a DynamoDB cache (stored as JSON to dodge float/Decimal)."""
-    key = f"filmcache#{title.strip().lower()}"
+def lookup_film_cached(title, year=None):
+    """lookup_film with a DynamoDB cache (JSON, to dodge float/Decimal). Cache key
+    includes the year so 'Dune' and 'Dune 1984' don't collide."""
+    key = f"filmcache#{title.strip().lower()}#{year or ''}"
     try:
         cached = ddb_get(key, "ref")
         if cached and cached.get("json"):
             return json.loads(cached["json"])
     except Exception as e:
         log.warning("film cache read failed: %s", e)
-    info = lookup_film(title)
+    info = lookup_film(title, year)
     if info.get("found"):
         try:
             ddb_put({"PK": key, "SK": "ref", "json": json.dumps(info),
@@ -660,19 +687,21 @@ def mention_for(chat_id, user_id):
 # the item so cards render without re-scraping. Floats are stored as strings
 # (DynamoDB resource rejects float).
 # --------------------------------------------------------------------------- #
-def add_to_library(chat_id, user_id, title):
-    info = lookup_film_cached(title)
+def add_to_library(chat_id, user_id, title, year=None):
+    info = lookup_film_cached(title, year)
     slug = info.get("slug") or _slugify(title)
     name = info.get("title") or title
     item = {
         "PK": _pk("movie", chat_id), "SK": f"lib#{user_id}#{slug}",
         "slug": slug, "owner_id": int(user_id), "title": name,
-        "year": str(info.get("year") or ""),
+        "year": str(info.get("year") or year or ""),
+        "tmdb_id": info.get("tmdb_id"),
         "runtime_min": info.get("runtime_min"),
         "genres": info.get("genres") or [],
         "description": info.get("description") or "",
-        # ratings stored as strings (DDB resource rejects float); either may be None
-        "lb_rating": (str(info["lb_rating"]) if info.get("lb_rating") is not None else None),
+        # rating stored as a string (DDB resource rejects float); may be None
+        "rating": (str(info["rating"]) if info.get("rating") is not None else None),
+        "rating_scale": info.get("rating_scale"),
         "rt_rating": info.get("rt_rating"),
         "added_at": _now_iso(), "watched": False,
     }
@@ -723,8 +752,25 @@ def remove_from_library(chat_id, user_id, title):
 # phone number; bots can't see those). Starter films load under owner
 # "seed:<name>" (tools/seed_libraries.py); /claim or NL "I'm <name>" reassigns.
 # --------------------------------------------------------------------------- #
+# Reconcile what people type / their @username with the seeded first names, so
+# "I'm Dasha" (seeded as Dasha but stored elsewhere as Daria) and username-only
+# accounts still find their library. Extend as new aliases turn up.
+_SEED_ALIASES = {
+    "daria": "dasha", "dariuozy": "dasha", "dash": "dasha",
+    "al": "alberto", "berto": "alberto",
+    "anya": "anya", "anna": "anya",
+    "asa": "asa", "khimka": "khimka", "maryna": "maryna", "marina": "maryna",
+    "chad": "chad",
+}
+
+
 def _seed_owner(name):
     return f"seed:{name.strip().lower()}"
+
+
+def _canonical_seed_name(name):
+    n = name.strip().lower().lstrip("@")
+    return _SEED_ALIASES.get(n, n)
 
 
 def list_seed_names(chat_id):
@@ -737,13 +783,15 @@ def list_seed_names(chat_id):
 
 
 def claim_library(chat_id, name, user_id):
-    """Reassign the seeded 'name' library to user_id. Idempotent; one claimer."""
-    key = name.strip().lower()
+    """Reassign the seeded 'name' library to user_id. Idempotent; one claimer.
+    The name is normalised through the alias map first (libraries are keyed by
+    Telegram user_id once claimed)."""
+    key = _canonical_seed_name(name)
     marker_sk = f"seedclaim#{key}"
     marker = ddb_get(_pk("movie", chat_id), marker_sk)
     if marker and str(marker.get("claimed_by")) != str(user_id):
         return {"status": "taken", "by": marker.get("claimed_by")}
-    seed_prefix = f"lib#{_seed_owner(name)}#"
+    seed_prefix = f"lib#seed:{key}#"
     seed_items = [i for i in ddb_query(_pk("movie", chat_id))
                   if str(i.get("SK", "")).startswith(seed_prefix)]
     if not seed_items and not marker:
@@ -796,9 +844,9 @@ def seed_starter_libraries(chat_id):
             ddb_put({"PK": _pk("movie", chat_id), "SK": f"lib#{owner}#{slug}",
                      "slug": slug, "owner_id": owner, "seed_name": name.strip(),
                      "title": f["title"], "year": str(f.get("year") or ""),
-                     "genres": [], "description": "", "lb_rating": None,
-                     "rt_rating": None, "added_at": _now_iso(),
-                     "watched": False})
+                     "tmdb_id": None, "runtime_min": None, "genres": [],
+                     "description": "", "rating": None, "rating_scale": None,
+                     "rt_rating": None, "added_at": _now_iso(), "watched": False})
             n += 1
         written[name] = n
     return written
@@ -878,12 +926,20 @@ def _add_player(game, user_id):
 
 
 # ---- presentation --------------------------------------------------------- #
+def _fmt_runtime(m):
+    if not m:
+        return None
+    h, mm = divmod(int(m), 60)
+    return f"{h}h {mm}m" if h else f"{mm}m"
+
+
 def _item_rating_phrase(item):
-    """Whatever ratings we have, shown together; empty string if none."""
+    """Rating(s) we have: '★ 7.8/10' (+ ' · 83% RT'); empty string if none."""
     parts = []
-    lb = item.get("lb_rating")
-    if lb not in (None, "", "None"):
-        parts.append(f"{lb}/5 Letterboxd")
+    r = item.get("rating")
+    if r not in (None, "", "None"):
+        scale = item.get("rating_scale")
+        parts.append(f"★ {r}/{scale}" if scale else f"★ {r}")
     rt = item.get("rt_rating")
     if rt not in (None, "", "N/A"):
         parts.append(f"{rt} RT")
@@ -891,25 +947,24 @@ def _item_rating_phrase(item):
 
 
 def _film_card(item):
-    """A selection / candidate card: title, runtime, genre, one-line description."""
+    """One-line card: 'Title (year) · Genre · 2h 50m · ★ 7.8/10' + a synopsis line."""
     if not item:
         return "(film)"
     yr = f" ({item['year']})" if item.get("year") else ""
-    lines = [f"🎬 {item['title']}{yr}"]
-    meta = []
+    bits = [f"🎬 {item['title']}{yr}"]
+    if item.get("genres"):
+        bits.append(", ".join(item["genres"][:2]))
+    rt = _fmt_runtime(item.get("runtime_min"))
+    if rt:
+        bits.append(rt)
     rp = _item_rating_phrase(item)
     if rp:
-        meta.append(rp)
-    if item.get("runtime_min"):
-        meta.append(f"{item['runtime_min']} min")
-    if item.get("genres"):
-        meta.append(", ".join(item["genres"][:2]))
-    if meta:
-        lines.append(" · ".join(meta))
+        bits.append(rp)
+    line = " · ".join(bits)
     if item.get("description"):
         d = item["description"]
-        lines.append(d if len(d) <= 200 else d[:197] + "…")
-    return "\n".join(lines)
+        line += "\n" + (d if len(d) <= 200 else d[:197] + "…")
+    return line
 
 
 def _join_keyboard():
@@ -1123,18 +1178,81 @@ def _begin_selection(mode, chat_id, game):
     _maybe_finish_selection(mode, chat_id, game)
 
 
+def _enrich_item(chat_id, item):
+    """Fill missing genres/runtime/rating from the resolver and persist, so the
+    constraint filter and the cards have real metadata. Best-effort: on failure
+    the item is left as-is (and kept)."""
+    if (item.get("genres") and item.get("runtime_min") is not None
+            and item.get("rating") is not None):
+        return item
+    yr = (str(item.get("year") or "")[:4]) or None
+    try:
+        info = lookup_film_cached(item["title"], yr)
+    except Exception as e:
+        log.warning("enrich failed for %s: %s", item.get("title"), e)
+        return item
+    changed = False
+    if not item.get("genres") and info.get("genres"):
+        item["genres"] = info["genres"]; changed = True
+    if item.get("runtime_min") is None and info.get("runtime_min") is not None:
+        item["runtime_min"] = info["runtime_min"]; changed = True
+    if not item.get("rating") and info.get("rating") is not None:
+        item["rating"] = str(info["rating"]); item["rating_scale"] = info.get("rating_scale"); changed = True
+    if not item.get("rt_rating") and info.get("rt_rating"):
+        item["rt_rating"] = info["rt_rating"]; changed = True
+    if item.get("tmdb_id") is None and info.get("tmdb_id") is not None:
+        item["tmdb_id"] = info["tmdb_id"]; changed = True
+    if not item.get("description") and info.get("description"):
+        item["description"] = info["description"]; changed = True
+    if changed:
+        try:
+            ddb_put(item)
+        except Exception as e:
+            log.warning("persist enriched item failed: %s", e)
+    return item
+
+
+def _draw_eligible(chat_id, uid, game, n, exclude_slugs):
+    """Up to n unwatched films from uid's library that pass the game filter.
+    Genre/runtime are resolved (enriched) BEFORE the draw so the filter has real
+    data — this is what makes constraints actually gate the pick. Draws in random
+    order, stops once n eligible are found; the chosen are enriched for the card."""
+    f = game.get("filter") or _empty_filter()
+    active = _filter_active(f)
+    lib = [x for x in get_library(chat_id, uid)
+           if not x.get("watched") and x["slug"] not in exclude_slugs]
+    random.shuffle(lib)
+    chosen = []
+    for item in lib:
+        if active and (not item.get("genres") or item.get("runtime_min") is None):
+            item = _enrich_item(chat_id, item)
+        if not active or _passes_filter(item, f):
+            chosen.append(item)
+            if len(chosen) >= n:
+                break
+    for it in chosen:   # cards need genre/runtime/rating even with no filter
+        _enrich_item(chat_id, it)
+    return chosen
+
+
 def _start_player_selection(mode, chat_id, game, uid):
-    lib = [f for f in get_library(chat_id, uid) if not f.get("watched")]
     sel = {"slots": [], "shown": [], "locked": False}
     game["selection"][str(uid)] = sel
-    picks = random.sample(lib, min(3, len(lib))) if lib else []
+    picks = _draw_eligible(chat_id, uid, game, 3, set())
+    lib_total = len([x for x in get_library(chat_id, uid) if not x.get("watched")])
     for f in picks:
         sel["shown"].append(f["slug"])
         slot = len(sel["slots"])
         sel["slots"].append({"slug": f["slug"], "title": f["title"], "state": "pending"})
         _post_selection_card(mode, chat_id, game, uid, slot)
     if not picks:
-        sel["locked"] = True  # empty library contributes nothing
+        sel["locked"] = True  # nothing to contribute (empty lib, or none fit the filter)
+        if lib_total and _filter_active(game["filter"]):
+            send_message(mode, chat_id,
+                         f"{mention_for(chat_id, uid)} has no films matching tonight's filter.")
+    elif len(picks) < 3 and _filter_active(game["filter"]):
+        send_message(mode, chat_id,
+                     f"(Only {len(picks)} of {mention_for(chat_id, uid)}'s films fit the filter.)")
 
 
 def _post_selection_card(mode, chat_id, game, uid, slot):
@@ -1160,15 +1278,14 @@ def _handle_thumb(mode, chat_id, game, uid, message_id, up):
         put_game(game)
         _maybe_finish_selection(mode, chat_id, game)
         return
-    # thumbs-down: replace with another unshown random film from THIS library
-    lib = [f for f in get_library(chat_id, int(card["uid"])) if not f.get("watched")]
-    avail = [f for f in lib if f["slug"] not in sel["shown"]]
-    if not avail:
+    # thumbs-down: swap for another unshown ELIGIBLE film from THIS library
+    repl = _draw_eligible(chat_id, int(card["uid"]), game, 1, set(sel["shown"]))
+    if not repl:
         send_message(mode, chat_id,
-                     f"{mention_for(chat_id, int(card['uid']))}, no more films to swap in — "
-                     "react 👍 to keep this one.")
+                     f"{mention_for(chat_id, int(card['uid']))}, no more eligible films to "
+                     "swap in — react 👍 to keep this one.")
         return
-    nf = random.choice(avail)
+    nf = repl[0]
     sel["shown"].append(nf["slug"])
     sel["slots"][slot] = {"slug": nf["slug"], "title": nf["title"], "state": "pending"}
     del game["cards"][str(message_id)]
@@ -1346,9 +1463,20 @@ def on_poll_answer(mode, ev):
     cur = game.get("current")
     if not cur or cur.get("poll_id") != ev.get("poll_id") or cur.get("resolved"):
         return  # stale or already resolved poll
-    if 0 not in (ev.get("poll_option_ids") or []):
-        return  # only the Veto option (index 0) matters
+    opts = ev.get("poll_option_ids") or []
     uid = str(ev.get("user_id"))
+    if 0 not in opts:
+        # "Fine by me" (option 1): event-driven consent — once every player has
+        # said fine, finalize this pick immediately rather than waiting on the clock.
+        if 1 in opts:
+            fine = set(cur.get("fine") or [])
+            fine.add(uid)
+            cur["fine"] = list(fine)
+            if {str(p) for p in game["players"]}.issubset(fine):
+                _declare_winner(mode, chat_id, game, cur["film"])
+            else:
+                put_game(game)
+        return
     if game["vetoes_remaining"].get(uid, 0) <= 0:
         return  # no veto left — ignore
     game["vetoes_remaining"][uid] -= 1
@@ -1446,15 +1574,22 @@ def winner_note(title, year):
 # --------------------------------------------------------------------------- #
 MOVIE_TOOLS = [
     {"toolSpec": {"name": "lookup_film",
-                  "description": "Look up a film: year, runtime, genres, one-line synopsis, plus ratings (lb_rating 0-5 from Letterboxd, rt_rating like '83%' from Rotten Tomatoes). Any rating may be null.",
+                  "description": "Resolve a film via TMDB and return canonical title, year, genres, runtime, synopsis and a rating (★/10). Pass year separately when the user gives one; NEVER put the year inside title.",
                   "inputSchema": {"json": {"type": "object",
-                                           "properties": {"title": {"type": "string"}},
+                                           "properties": {"title": {"type": "string"},
+                                                          "year": {"type": "integer"}},
                                            "required": ["title"]}}}},
     {"toolSpec": {"name": "add_to_library",
-                  "description": "Add a film to the SENDER's personal library for this chat (also for 'I want to see X').",
+                  "description": "Add a film to the SENDER's personal library (also for 'I want to see X'). Pass year separately when known; NEVER concatenate the year into title.",
                   "inputSchema": {"json": {"type": "object",
-                                           "properties": {"title": {"type": "string"}},
+                                           "properties": {"title": {"type": "string"},
+                                                          "year": {"type": "integer"}},
                                            "required": ["title"]}}}},
+    {"toolSpec": {"name": "add_director",
+                  "description": "Add every film directed by a person ('add all Lanthimos films') — resolves the filmography via TMDB, not from memory.",
+                  "inputSchema": {"json": {"type": "object",
+                                           "properties": {"director": {"type": "string"}},
+                                           "required": ["director"]}}}},
     {"toolSpec": {"name": "remove_from_library",
                   "description": "Remove a film from the SENDER's library.",
                   "inputSchema": {"json": {"type": "object",
@@ -1479,43 +1614,86 @@ MOVIE_TOOLS = [
 MOVIE_SYSTEM = (
     "You are SirWatchalot, a film-night helper in a Telegram group. Privacy is OFF so "
     "you see every message, but ONLY act on clear film intent: add/remove/list a "
-    "personal library, look up a film, claim a seeded library ('I'm Chad'), load the "
-    "starter libraries, or start movie night. For anything else, reply with exactly "
-    "'(silent)' and call no tools.\n"
+    "personal library, add a director's films, look up a film, claim a seeded library "
+    "('I'm Chad'), load the starter libraries, or start movie night. For anything else, "
+    "reply with exactly '(silent)' and call no tools.\n"
     "SEED ('load/seed the starter libraries'): call seed_starter_libraries, report the "
     "per-name counts, and tell people to claim theirs by saying 'I'm <name>'.\n"
     "START ('start movie night', 'Let's play!', 'Start the game!', or @mention): call "
-    "start_movie_night.\n"
-    "ADD ('add X to my library', 'I want to see X'): immediately call add_to_library(X). "
-    "The tool resolves the title to a SINGLE film via Letterboxd search (the most popular "
-    "match). If a title has several versions (e.g. Dune 1984 vs 2021) it has ALREADY "
-    "picked the prominent/recent one — do NOT ask which; just state the one you saved so "
-    "it's correctable, e.g. 'Added Dune (2021) — say \"the 1984 one\" if you meant that.' "
-    "Then give a one-line synopsis, the runtime and genre, and whatever ratings came back: "
-    "Letterboxd as 'lb_rating/5 on Letterboxd' and/or Rotten Tomatoes as 'rt_rating on "
-    "Rotten Tomatoes'. Confirm it's saved. The overview and the add do NOT depend on "
-    "ratings — if lb_rating and/or rt_rating are null, simply omit them and proceed.\n"
-    "LOOK UP ('what's X rated', 'tell me about X'): call lookup_film and answer with a "
-    "one-line synopsis + whatever ratings are present; offer to add it.\n"
+    "start_movie_night and add NO text of your own (the bot posts the Join card itself).\n"
+    "ADD ('add X to my library', 'I want to see X'): immediately call add_to_library with "
+    "title, and year as a SEPARATE argument if the user gave one (never put the year in "
+    "title). The resolver picks one film; if it resolved (resolved=true) just confirm what "
+    "was saved — 'Added Funny Games (1997) ✅' — with genre, runtime and the ★ rating, and "
+    "offer to switch if they meant another year. For 'every <director> film' call "
+    "add_director. NEVER ask which version unless resolved=false.\n"
+    "LOOK UP ('what's X rated', 'tell me about X'): call lookup_film and answer with the "
+    "rating + a one-line synopsis; offer to add it.\n"
+    "CONFIRM: if you just offered a film and the user says yes/add it, call add_to_library "
+    "for it.\n"
     "NEVER mention a 'database' or internal storage, and NEVER invent ratings or details "
-    "— use only the tool's fields and omit any that are missing. Ask a clarifying "
-    "question ONLY when the tool returns resolved/found = false (no reasonable match at "
-    "all). Keep replies to 1-3 sentences."
+    "— use only the tool's fields and omit any that are missing. Keep replies to 1-3 "
+    "sentences and always post a concrete 'added ✅' when something is saved."
 )
+
+
+def _set_pending(chat_id, uid, title, year):
+    if uid is None:
+        return
+    ddb_put({"PK": _pk("movie", chat_id), "SK": f"pending#{uid}",
+             "title": title, "year": str(year or ""), "ts": _now_epoch()})
+
+
+def _get_pending(chat_id, uid):
+    p = ddb_get(_pk("movie", chat_id), f"pending#{uid}")
+    if p and _now_epoch() - int(p.get("ts", 0)) <= 600:   # valid 10 minutes
+        return p
+    return None
+
+
+def _clear_pending(chat_id, uid):
+    ddb_delete(_pk("movie", chat_id), f"pending#{uid}")
+
+
+_AFFIRM_LEAD = {"yes", "yep", "yeah", "yup", "ya", "ok", "okay", "sure", "confirm",
+                "yies", "yas"}
+_AFFIRM_PHRASES = {"add it", "add that", "do it", "go for it", "go ahead",
+                   "save it", "keep it", "add it please", "yes do it"}
+
+
+def _is_affirmative(text):
+    """A short, clearly-affirmative reply ('yes', 'I confirm', 'yes, add it')."""
+    words = re.findall(r"[a-z']+", (text or "").lower())
+    if not words or len(words) > 5:
+        return False
+    if words[0] in _AFFIRM_LEAD or "confirm" in words:
+        return True
+    return " ".join(words) in _AFFIRM_PHRASES
+
+
+def _tool_result_for_add(item, info):
+    return {"added": True, "resolved": info.get("found", False),
+            "title": item["title"], "year": item.get("year"),
+            "runtime_min": item.get("runtime_min"), "genres": item.get("genres"),
+            "description": info.get("description"), "rating": info.get("rating"),
+            "rating_scale": info.get("rating_scale"), "rt_rating": info.get("rt_rating"),
+            "alts": info.get("alts")}
 
 
 def _dispatch_tool(name, tool_input, ctx):
     chat_id, uid, mode = ctx["chat_id"], ctx.get("user_id"), ctx["mode"]
     if name == "lookup_film":
-        return lookup_film_cached(tool_input["title"])
+        info = lookup_film_cached(tool_input["title"], tool_input.get("year"))
+        if info.get("found"):   # remember it so a follow-up "yes/add it" can bind
+            _set_pending(chat_id, uid, info["title"], info.get("year"))
+        return info
     if name == "add_to_library":
-        item, info = add_to_library(chat_id, uid, tool_input["title"])
-        return {"added": True, "resolved": info.get("found", False),
-                "title": item["title"], "year": item.get("year"),
-                "runtime_min": item.get("runtime_min"), "genres": item.get("genres"),
-                "description": info.get("description"),
-                "lb_rating": info.get("lb_rating"), "rt_rating": info.get("rt_rating"),
-                "similar": info.get("similar")}
+        item, info = add_to_library(chat_id, uid, tool_input["title"], tool_input.get("year"))
+        _clear_pending(chat_id, uid)
+        return _tool_result_for_add(item, info)
+    if name == "add_director":
+        added = add_director(chat_id, uid, tool_input["director"])
+        return {"added_titles": added, "count": len(added)}
     if name == "remove_from_library":
         removed = remove_from_library(chat_id, uid, tool_input["title"])
         return {"removed": removed}
@@ -1529,11 +1707,47 @@ def _dispatch_tool(name, tool_input, ctx):
         return res
     if name == "start_movie_night":
         start_game(mode, chat_id, uid)
+        ctx["suppress_reply"] = True   # the Join card is the only message; no LLM echo
         return {"started": True}
     if name == "seed_starter_libraries":
         written = seed_starter_libraries(chat_id)
         return {"seeded": written, "names": list(_STARTER_LIBRARIES.keys())}
     return {"error": f"unknown tool {name}"}
+
+
+def _tmdb_director_films(name):
+    """A director's feature filmography via TMDB (not the model's memory)."""
+    if not TMDB_API_KEY:
+        return []
+    try:
+        people = (_tmdb_get("/search/person",
+                            {"query": name.strip(), "include_adult": "false"}).get("results") or [])
+        if not people:
+            return []
+        credits = _tmdb_get(f"/person/{people[0]['id']}/movie_credits", {})
+    except Exception as e:
+        log.warning("tmdb director lookup failed for %r: %s", name, e)
+        return []
+    seen, films = set(), []
+    for c in credits.get("crew") or []:
+        if c.get("job") != "Director" or c["id"] in seen or not c.get("title"):
+            continue
+        seen.add(c["id"])
+        films.append({"title": c["title"], "year": (c.get("release_date") or "")[:4]})
+    films.sort(key=lambda f: f["year"] or "9999")
+    return films
+
+
+def add_director(chat_id, uid, name):
+    """Add every film a director made, resolving each through the normal resolver."""
+    added = []
+    for f in _tmdb_director_films(name)[:30]:    # cap to avoid runaway adds
+        try:
+            item, _ = add_to_library(chat_id, uid, f["title"], f["year"] or None)
+            added.append(item["title"])
+        except Exception as e:
+            log.warning("add_director: %s failed: %s", f["title"], e)
+    return added
 
 
 def converse(system_prompt, user_text, ctx, tools=MOVIE_TOOLS, max_turns=6):
@@ -1588,17 +1802,29 @@ def on_message(mode, ev):
         if text:
             _handle_constraints_message(mode, chat_id, game, text)
         return
-    if not text or not AI_ENABLED:
+    if not text:
+        return
+    # Confirm -> save: a bare affirmative binds to the pending film (deterministic,
+    # so "yes / I confirm / add it" always saves even if the model lost the thread).
+    if _is_affirmative(text):
+        pending = _get_pending(chat_id, uid)
+        if pending:
+            yr = pending.get("year") or None
+            item, info = add_to_library(chat_id, uid, pending["title"], yr)
+            _clear_pending(chat_id, uid)
+            send_message(mode, chat_id, f"Added ✅ {_film_card(item)}")
+            return
+    if not AI_ENABLED:
         return
     ctx = {"chat_id": chat_id, "user_id": uid, "user_name": ev["user_name"],
-           "username": ev.get("username"), "mode": mode}
+           "username": ev.get("username"), "mode": mode, "suppress_reply": False}
     try:
         reply = converse(MOVIE_SYSTEM, text, ctx)
     except Exception as e:
         log.error("bedrock movie failed: %s", e)
         return
     reply = (reply or "").strip()
-    if reply and reply.lower() != "(silent)":
+    if reply and reply.lower() != "(silent)" and not ctx.get("suppress_reply"):
         send_message(mode, chat_id, reply)
 
 

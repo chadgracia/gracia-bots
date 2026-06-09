@@ -99,11 +99,11 @@ def fake_send_poll(mode, chat_id, question, options, **kwargs):
     return {"ok": True, "result": {"message_id": _mid[0], "poll": {"id": f"poll{_pid[0]}"}}}
 
 
-def fake_lookup(title):
+def fake_lookup(title, year=None):
     return {"found": True, "title": title, "slug": L._slugify(title),
-            "year": "1950", "runtime_min": 120, "genres": ["Drama"],
-            "description": "A film.", "lb_rating": 4.0, "rt_rating": "88%",
-            "similar": ["Other Film"]}
+            "year": str(year or "1950"), "runtime_min": 120, "genres": ["Drama"],
+            "description": "A film.", "rating": 4.0, "rating_scale": 10,
+            "rt_rating": "88%", "tmdb_id": 1, "alts": []}
 
 
 L.ddb_get = fake_get
@@ -158,7 +158,8 @@ def test_add_to_library_is_slug_keyed_with_metadata():
     _reset()
     item, info = L.add_to_library(CHAT, 1, "Rear Window")
     assert item["slug"] == "rear-window"
-    assert item["lb_rating"] == "4.0"       # stored as string (DDB has no float)
+    assert item["rating"] == "4.0"          # stored as string (DDB has no float)
+    assert item["rating_scale"] == 10
     assert item["rt_rating"] == "88%"
     assert item["owner_id"] == 1
     lib = L.get_library(CHAT, 1)
@@ -368,7 +369,10 @@ def test_over_constrained_offers_relax_then_unfilter():
 
 def test_constraints_window_parses_three_people_then_go_closes():
     _reset()
-    L.add_to_library(CHAT, 1, "Film A")
+    pk = L._pk(MODE, CHAT)   # a film that survives the filter below (1980, drama, 100m)
+    STORE[(pk, "lib#1#film-a")] = {"PK": pk, "SK": "lib#1#film-a", "slug": "film-a",
+        "owner_id": 1, "title": "Film A", "year": "1980", "genres": ["drama"],
+        "runtime_min": 100, "watched": False}
     L.start_game(MODE, CHAT, 1)
     L.handle_movie(MODE, cb(1, "start"))              # -> CONSTRAINTS, question asked once
     assert L.get_game(CHAT)["phase"] == "CONSTRAINTS"
@@ -400,6 +404,54 @@ def test_constraints_backstop_closes_after_60s_silence():
     NOW[0] += 61
     L.handle_movie(MODE, message(2, "anything"))      # next event past deadline closes it
     assert L.get_game(CHAT)["phase"] == "SELECTING"
+
+
+def test_resolver_passes_year_as_separate_param():
+    # The year must go in primary_release_year, never concatenated into the query.
+    calls = []
+
+    def fake_get(path, params):
+        calls.append((path, dict(params)))
+        if path == "/search/movie":
+            return {"results": [{"id": 7, "title": "Funny Games",
+                                 "release_date": "1997-03-11", "vote_average": 7.6}]}
+        return {"id": 7, "title": "Funny Games", "release_date": "1997-03-11",
+                "runtime": 108, "genres": [{"name": "Thriller"}], "vote_average": 7.6,
+                "overview": "A family is taken hostage."}
+
+    orig_get, orig_key = L._tmdb_get, L.TMDB_API_KEY
+    L._tmdb_get, L.TMDB_API_KEY = fake_get, "testkey"
+    try:
+        r = L._tmdb("Funny Games", 1997)
+    finally:
+        L._tmdb_get, L.TMDB_API_KEY = orig_get, orig_key
+    search = next(p for path, p in calls if path == "/search/movie")
+    assert search["query"] == "Funny Games"                  # no year in the query
+    assert str(search.get("primary_release_year")) == "1997"  # year is separate
+    assert r["title"] == "Funny Games" and r["year"] == "1997"
+    assert r["runtime_min"] == 108 and r["genres"] == ["Thriller"]
+    assert r["rating_10"] == 7.6
+
+
+def test_confirm_saves_pending_film():
+    _reset()
+    L._set_pending(CHAT, 1, "One from the Heart", "1981")
+    L.handle_movie(MODE, message(1, "yes, add it"))     # affirmative binds to pending
+    lib = L.get_library(CHAT, 1)
+    assert [f["title"] for f in lib] == ["One from the Heart"]
+    assert L._get_pending(CHAT, 1) is None               # cleared after add
+    assert any("Added" in t for t, _ in SENT)
+
+
+def test_unanimous_fine_finalizes_without_clock():
+    game = _two_player_game_to_veto()
+    pid = game["current"]["poll_id"]
+    L.handle_movie(MODE, poll_answer(1, pid, [1]))       # player 1: fine by me
+    assert L.get_game(CHAT) is not None                  # not yet — player 2 pending
+    L.handle_movie(MODE, poll_answer(2, pid, [1]))       # player 2: fine -> unanimous
+    assert L.get_game(CHAT) is None                      # finalized immediately
+    hist = [v for (_p, s), v in STORE.items() if s.startswith("history#")]
+    assert len(hist) == 1
 
 
 def test_omdb_reads_rt_from_ratings_array():
