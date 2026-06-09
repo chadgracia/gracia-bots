@@ -256,6 +256,33 @@ def test_veto_then_second_veto_rejected_then_finalize():
     assert L.get_film(CHAT, wowner, pick_now)["watched"] is True
 
 
+def test_claim_links_seed_library_to_user():
+    _reset()
+    pk = L._pk(MODE, CHAT)
+    # simulate a seeded "Chad" library (2 films) under the placeholder owner
+    for t in ["Red River", "Barry Lyndon"]:
+        fid = t.replace(" ", "")
+        STORE[(pk, f"lib#seed:chad#{fid}")] = {
+            "PK": pk, "SK": f"lib#seed:chad#{fid}", "film_id": fid,
+            "owner_id": "seed:chad", "seed_name": "Chad", "title": t,
+            "year": "1948", "added_at": "x", "watched": False, "vetoed_by": [],
+        }
+    assert L.list_seed_names(CHAT) == ["chad"]
+    # Chad (user 1) claims
+    res = L.claim_library(CHAT, "Chad", 1)
+    assert res == {"status": "ok", "moved": 2}, res
+    lib = L.get_library(CHAT, 1)
+    assert {f["title"] for f in lib} == {"Red River", "Barry Lyndon"}
+    assert all(f["owner_id"] == 1 for f in lib)
+    assert L.list_seed_names(CHAT) == []          # no longer a seed
+    # someone else can't steal it
+    assert L.claim_library(CHAT, "Chad", 2)["status"] == "taken"
+    # re-claim by the same user is a no-op
+    assert L.claim_library(CHAT, "Chad", 1)["moved"] == 0
+    # unknown name
+    assert L.claim_library(CHAT, "Nobody", 3)["status"] == "none"
+
+
 def test_parse_confirm_tokens():
     assert L._parse_confirm_tokens("👍")[1] is True            # keep_all
     assert L._parse_confirm_tokens("y n y")[0] == [True, False, True]

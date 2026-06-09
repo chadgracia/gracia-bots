@@ -510,6 +510,52 @@ def record_veto(chat_id, owner_id, film_id, vetoer_id):
     ddb_put(f)
 
 
+# ---- Seeding: link a named starter library to a real Telegram user_id ----- #
+# Starter libraries are loaded under a placeholder owner "seed:<name>" (see
+# tools/seed_libraries.py). The person then "claims" their name once, which
+# rewrites those films to their real user_id. We map by user_id, never phone
+# number — Telegram never gives bots a phone number.
+def _seed_owner(name):
+    return f"seed:{name.strip().lower()}"
+
+
+def list_seed_names(chat_id):
+    """Names that still have an unclaimed seeded library in this chat."""
+    names = set()
+    for i in ddb_query(_pk("movie", chat_id)):
+        sk = str(i.get("SK", ""))
+        if sk.startswith("lib#seed:"):
+            names.add(sk.split("#", 2)[1].split(":", 1)[1])
+    return sorted(names)
+
+
+def claim_library(chat_id, name, user_id):
+    """Reassign the seeded 'name' library to user_id. Idempotent; one claimer."""
+    key = name.strip().lower()
+    marker_sk = f"seedclaim#{key}"
+    marker = ddb_get(_pk("movie", chat_id), marker_sk)
+    if marker and str(marker.get("claimed_by")) != str(user_id):
+        return {"status": "taken", "by": marker.get("claimed_by")}
+    seed_prefix = f"lib#{_seed_owner(name)}#"
+    seed_items = [i for i in ddb_query(_pk("movie", chat_id))
+                  if str(i.get("SK", "")).startswith(seed_prefix)]
+    if not seed_items and not marker:
+        return {"status": "none"}
+    moved = 0
+    for it in seed_items:
+        fid = it["film_id"]
+        it["SK"] = f"lib#{user_id}#{fid}"
+        it["owner_id"] = int(user_id)
+        it.pop("seed_name", None)
+        ddb_put(it)
+        ddb_delete(_pk("movie", chat_id), f"{seed_prefix}{fid}")
+        moved += 1
+    ddb_put({"PK": _pk("movie", chat_id), "SK": marker_sk,
+             "claimed_by": int(user_id), "seed_name": name.strip(),
+             "claimed_at": _now_iso()})
+    return {"status": "ok", "moved": moved}
+
+
 # ---- Selection (all randomness in Python, never the LLM) ------------------ #
 def eligible_films(library, participant_ids):
     """Films a player's library may contribute to selection.
@@ -1125,7 +1171,8 @@ _HELP_TEXT = (
     "Library:\n"
     "/movie <title> — add a film to your library\n"
     "/library [@user] — show a library\n"
-    "/draw — surprise me from your library\n\n"
+    "/draw — surprise me from your library\n"
+    "/claim <name> — link a seeded starter library to you\n\n"
     "Game:\n"
     "/movienight — start a night\n"
     "/join — join the night\n"
@@ -1196,6 +1243,28 @@ def handle_movie(mode, upd):
             send_message(mode, chat_id, "Your library is empty — add films with /movie first.")
             return
         send_message(mode, chat_id, f"🎲 From your library:\n\n{_enriched_card(chosen)}")
+        return
+
+    if cmd == "claim":
+        if not arg:
+            names = list_seed_names(chat_id)
+            hint = f" Available: {', '.join(names)}." if names else ""
+            send_message(mode, chat_id, f"Usage: /claim <name> — e.g. /claim Chad.{hint}")
+            return
+        res = claim_library(chat_id, arg.strip(), user_id)
+        if res["status"] == "taken":
+            send_message(mode, chat_id,
+                         f"That library's already claimed by {mention_for(chat_id, res['by'])}.")
+        elif res["status"] == "none":
+            names = list_seed_names(chat_id)
+            hint = f" Available: {', '.join(names)}." if names else ""
+            send_message(mode, chat_id, f"No seeded library named “{arg.strip()}”.{hint}")
+        elif res["moved"]:
+            send_message(mode, chat_id,
+                         f"✅ Linked {res['moved']} films to you, {mention_for(chat_id, user_id)}. "
+                         "See them with /library.")
+        else:
+            send_message(mode, chat_id, "That library's already yours — /library to see it.")
         return
 
     # ---- Game lifecycle ----

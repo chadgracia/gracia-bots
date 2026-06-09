@@ -1,0 +1,77 @@
+{
+  "_note": "INCOMPLETE — the paste was cut off after Khimka. Add any remaining people/films before seeding. Films with a 'Won session' note are imported as already-watched. 'Previously vetoed' notes are kept as text only (vetoed_by needs real user_ids, applied after /claim).",
+  "libraries": {
+    "Chad": [
+      { "title": "Red River", "year": 1948, "addedDate": "2026-05-16" },
+      { "title": "Barry Lyndon", "year": 1975, "addedDate": "2026-05-16" },
+      { "title": "Tokyo Story", "year": 1953, "addedDate": "2026-05-16", "note": "Previously vetoed (by Chad himself)" },
+      { "title": "Scenes from a Marriage", "year": 1973, "addedDate": "2026-05-16" },
+      { "title": "Where Is the Friend's House?", "year": 1987, "addedDate": "2026-05-16" },
+      { "title": "All About Eve", "year": 1950, "addedDate": "2026-05-16" },
+      { "title": "Rear Window", "year": 1954, "addedDate": "2026-05-16" },
+      { "title": "Brief Encounter", "year": 1945, "addedDate": "2026-05-16" },
+      { "title": "Mirror", "year": 1975, "addedDate": "2026-05-16" },
+      { "title": "Fail Safe", "year": 1964, "addedDate": "2026-05-16" },
+      { "title": "Ace in the Hole", "year": 1951, "addedDate": "2026-05-16" },
+      { "title": "Winter Light", "year": 1963, "addedDate": "2026-05-16" },
+      { "title": "The Third Man", "year": 1949, "addedDate": "2026-05-16" },
+      { "title": "Moonlight", "year": 2016, "addedDate": "2026-05-16" },
+      { "title": "The Cook, the Thief, His Wife & Her Lover", "year": 1989, "addedDate": "2026-05-16" },
+      { "title": "All the President's Men", "year": 1976, "addedDate": "2026-05-16" },
+      { "title": "Touch of Evil", "year": 1958, "addedDate": "2026-05-16" },
+      { "title": "Synecdoche, New York", "year": 2008, "addedDate": "2026-05-16" },
+      { "title": "The Virgin Spring", "year": 1960, "addedDate": "2026-05-16" },
+      { "title": "Hiroshima Mon Amour", "year": 1959, "addedDate": "2026-05-16" },
+      { "title": "Brokeback Mountain", "year": 2005, "addedDate": "2026-05-16" },
+      { "title": "Midnight Cowboy", "year": 1969, "addedDate": "2026-05-16" },
+      { "title": "Icarus", "year": 2017, "addedDate": "2026-05-16" },
+      { "title": "7 Up", "year": 1964, "addedDate": "2026-05-16" },
+      { "title": "Brother's Keeper", "year": 1992, "addedDate": "2026-05-16" },
+      { "title": "Man on Wire", "year": 2008, "addedDate": "2026-05-16" },
+      { "title": "Salesman", "year": 1969, "addedDate": "2026-05-16" },
+      { "title": "The Overnighters", "year": 2014, "addedDate": "2026-05-16" },
+      { "title": "Won't You Be My Neighbor?", "year": 2018, "addedDate": "2026-05-16" },
+      { "title": "Cameraperson", "year": 2016, "addedDate": "2026-05-16" },
+      { "title": "Grizzly Man", "year": 2005, "addedDate": "2026-05-16" },
+      { "title": "When We Were Kings", "year": 1996, "addedDate": "2026-05-16" },
+      { "title": "Hoop Dreams", "year": 1994, "addedDate": "2026-05-16" },
+      { "title": "The Thin Blue Line", "year": 1988, "addedDate": "2026-05-16" },
+      { "title": "To Be and to Have", "year": 2002, "addedDate": "2026-05-16" },
+      { "title": "The King of Kong", "year": 2007, "addedDate": "2026-05-16" },
+      { "title": "Stop Making Sense", "year": 1984, "addedDate": "2026-05-16" },
+      { "title": "Koyaanisqatsi", "year": 1982, "addedDate": "2026-05-16" },
+      { "title": "Senna", "year": 2010, "addedDate": "2026-05-16" },
+      { "title": "L'eclisse", "year": 1962, "addedDate": "2026-06-04" }
+    ],
+    "Alberto": [
+      { "title": "The Shop Around the Corner", "year": 1940, "addedDate": "2026-05-16" },
+      { "title": "The Good, the Bad and the Ugly", "year": 1966, "addedDate": "2026-05-16" },
+      { "title": "Unforgiven", "year": 1992, "addedDate": "2026-05-16", "note": "Won session 1" },
+      { "title": "Once Upon a Time in Hollywood", "year": 2019, "addedDate": "2026-05-16" },
+      { "title": "Spartacus", "year": 1960, "addedDate": "2026-05-16" },
+      { "title": "The War Wagon", "year": 1967, "addedDate": "2026-05-16" },
+      { "title": "Meet John Doe", "year": 1941, "addedDate": "2026-05-16" },
+      { "title": "Druk (Another Round)", "year": 2020, "addedDate": "2026-05-16" }
+    ],
+    "Asa": [
+      { "title": "Buena Vista Social Club", "year": 1999, "addedDate": "2026-05-16" },
+      { "title": "The American Friend", "year": 1977, "addedDate": "2026-05-16", "note": "Previously vetoed by Asa" },
+      { "title": "Kings of the Road", "year": 1976, "addedDate": "2026-05-16", "note": "Previously vetoed by Alberto" },
+      { "title": "Woman in the Dunes", "year": 1964, "addedDate": "2026-05-18" },
+      { "title": "Red Sorghum", "year": 1988, "addedDate": "2026-05-31" },
+      { "title": "Poetry", "year": 2010, "addedDate": "2026-05-31" }
+    ],
+    "Maryna": [],
+    "Anya": [
+      { "title": "Perfect Days", "year": 2023, "addedDate": "2026-05-31" },
+      { "title": "Natural Born Killers", "year": 1994, "addedDate": "2026-05-31" },
+      { "title": "The Night Porter", "year": 1974, "addedDate": "2026-05-31", "note": "Italian: Il Portiere di Notte" }
+    ],
+    "Dasha": [],
+    "Khimka": [
+      { "title": "Nowhere", "year": 1997, "addedDate": "2026-05-31" },
+      { "title": "Ritual", "year": 2000, "addedDate": "2026-05-31" },
+      { "title": "Lost Highway", "year": 1997, "addedDate": "2026-05-31" }
+    ]
+  }
+}
