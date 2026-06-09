@@ -826,6 +826,11 @@ def clear_game(chat_id):
     ddb_delete(_pk("movie", chat_id), "game#current")
 
 
+def _empty_filter():
+    return {"exclude_genres": [], "include_genres": [], "max_runtime_min": None,
+            "min_runtime_min": None, "min_year": None, "max_year": None}
+
+
 def new_game(chat_id, initiator_id):
     return {
         "PK": _pk("movie", chat_id), "SK": "game#current",
@@ -835,7 +840,13 @@ def new_game(chat_id, initiator_id):
         "join_message_id": None,
         "selection": {},   # {uid: {slots:[{slug,title,state}], shown:[slug], locked}}
         "cards": {},       # {message_id: {uid, slot}}
-        "pool": [],        # [{owner, slug, title}]
+        "filter": _empty_filter(),   # Phase 1.5 constraints (AND across people)
+        "constraints_open": False,
+        "constraints_deadline": None,
+        "awaiting_relax": False,
+        "relax_deadline": None,
+        "pool_all": [],    # full locked pool (kept for relax re-filtering)
+        "pool": [],        # [{owner, slug, title}] eligible after the filter
         "current": None,   # {film, poll_id, poll_message_id, presented_at, resolved}
         "created_at": _now_iso(),
     }
@@ -962,11 +973,139 @@ def on_callback(mode, ev):
         if not game["players"]:
             answer_callback(mode, cqid, "Nobody has joined yet.")
             return
-        _begin_selection(mode, chat_id, game)
+        _begin_constraints(mode, chat_id, game)
         return
     if data in ("up", "down") and game["phase"] == "SELECTING":
         _handle_thumb(mode, chat_id, game, uid, mid, up=(data == "up"))
         return
+
+
+# ---- constraints (Phase 1.5, optional) ------------------------------------ #
+# After the roster settles we ask once for constraints and open a 60s window.
+# No scheduler: the window closes on the next inbound event past the deadline
+# (same lazy backstop as the veto round), or early on an explicit "go".
+_CONSTRAINTS_PARSE_SYSTEM = (
+    "Parse ONE chat message into movie-night filter constraints. Output ONLY a JSON "
+    "object, including just the keys actually mentioned, from: exclude_genres (list of "
+    "lowercase genre names), include_genres (list, for 'only X'), max_runtime_min (int), "
+    "min_runtime_min (int), min_year (int), max_year (int). Examples: 'no documentaries' "
+    "-> {\"exclude_genres\":[\"documentary\"]}; 'no horror' -> {\"exclude_genres\":[\"horror\"]}; "
+    "'only westerns' -> {\"include_genres\":[\"western\"]}; 'under 2.5 hours' -> "
+    "{\"max_runtime_min\":150}; 'at least 90 minutes' -> {\"min_runtime_min\":90}; "
+    "'nothing earlier than 1960' -> {\"min_year\":1960}; 'made after 2000' -> "
+    "{\"min_year\":2001}; 'something from the 90s' -> {\"min_year\":1990,\"max_year\":1999}. "
+    "If the message states no constraint, output {}."
+)
+
+_CONSTRAINTS_DONE = {"go", "go!", "let's go", "lets go", "let's pick", "lets pick",
+                     "pick", "that's it", "thats it", "that's all", "thats all",
+                     "done", "start", "no constraints", "none", "nope"}
+
+
+def _begin_constraints(mode, chat_id, game):
+    game["phase"] = "CONSTRAINTS"
+    game["filter"] = _empty_filter()
+    game["constraints_open"] = True
+    game["constraints_deadline"] = _now_epoch() + 60
+    put_game(game)
+    send_message(mode, chat_id,
+                 "🎛 Any constraints tonight? Length, genre, or year range — "
+                 "or just say go. (You've got about a minute.)")
+
+
+def parse_constraint_text(text):
+    """LLM parses a free-text reply into the filter schema. Code merges/applies."""
+    if not AI_ENABLED:
+        return {}
+    try:
+        resp = _bedrock.converse(
+            modelId=BEDROCK_MODEL_ID,
+            system=[{"text": _CONSTRAINTS_PARSE_SYSTEM}],
+            messages=[{"role": "user", "content": [{"text": text}]}],
+            inferenceConfig={"maxTokens": 200, "temperature": 0},
+        )
+        out = "".join(b.get("text", "") for b in resp["output"]["message"]["content"])
+        m = re.search(r"\{.*\}", out, re.DOTALL)
+        return json.loads(m.group(0)) if m else {}
+    except Exception as e:
+        log.warning("constraint parse failed: %s", e)
+        return {}
+
+
+def _merge_filter(f, delta):
+    """Combine a parsed delta into the running filter with AND (most restrictive)."""
+    for key in ("exclude_genres", "include_genres"):
+        for g in delta.get(key) or []:
+            g = str(g).strip().lower()
+            if g and g not in f[key]:
+                f[key].append(g)
+    def tighten(key, val, op):
+        if val is None:
+            return
+        f[key] = val if f[key] is None else op(f[key], val)
+    tighten("max_runtime_min", delta.get("max_runtime_min"), min)
+    tighten("min_runtime_min", delta.get("min_runtime_min"), max)
+    tighten("min_year", delta.get("min_year"), max)
+    tighten("max_year", delta.get("max_year"), min)
+    return f
+
+
+def _filter_active(f):
+    return bool(f and (f["exclude_genres"] or f["include_genres"]
+                       or f["max_runtime_min"] or f["min_runtime_min"]
+                       or f["min_year"] or f["max_year"]))
+
+
+def _describe_filter(f):
+    bits = []
+    if f["exclude_genres"]:
+        bits.append("no " + "/".join(f["exclude_genres"]))
+    if f["include_genres"]:
+        bits.append("only " + "/".join(f["include_genres"]))
+    if f["max_runtime_min"]:
+        bits.append(f"≤{f['max_runtime_min']} min")
+    if f["min_runtime_min"]:
+        bits.append(f"≥{f['min_runtime_min']} min")
+    if f["min_year"]:
+        bits.append(f"≥{f['min_year']}")
+    if f["max_year"]:
+        bits.append(f"≤{f['max_year']}")
+    return ", ".join(bits)
+
+
+def _handle_constraints_message(mode, chat_id, game, text):
+    """A message during the open constraints window: close early on 'go', else
+    parse it into the filter and acknowledge."""
+    t = (text or "").strip().lower()
+    if t in _CONSTRAINTS_DONE:
+        _close_constraints(mode, chat_id, game, announce=True)
+        return
+    delta = parse_constraint_text(text)
+    if delta:
+        _merge_filter(game["filter"], delta)
+        put_game(game)
+        send_message(mode, chat_id, f"Got it — {_describe_filter(game['filter'])}. "
+                                    "More, or say go.")
+    # a non-constraint, non-"go" message just leaves the window open
+
+
+def _close_constraints(mode, chat_id, game, announce):
+    game["constraints_open"] = False
+    if announce:
+        if _filter_active(game["filter"]):
+            send_message(mode, chat_id, f"🎛 Constraints locked: {_describe_filter(game['filter'])}.")
+        else:
+            send_message(mode, chat_id, "No constraints — playing the full libraries.")
+    _begin_selection(mode, chat_id, game)
+
+
+def _constraints_backstop(mode, chat_id, game):
+    """Lazy 60s window: any later event past the deadline closes the window."""
+    if game and game.get("phase") == "CONSTRAINTS" and game.get("constraints_open"):
+        if _now_epoch() >= (game.get("constraints_deadline") or 0):
+            _close_constraints(mode, chat_id, game, announce=True)
+            return True
+    return False
 
 
 # ---- selection ------------------------------------------------------------ #
@@ -1045,24 +1184,133 @@ def _maybe_finish_selection(mode, chat_id, game):
 
 
 # ---- veto ----------------------------------------------------------------- #
+def _passes_filter(item, f):
+    """True unless the film DEFINITIVELY violates a constraint. Unknown metadata
+    is kept, not dropped (over-exclusion is the worse failure)."""
+    genres = [g.lower() for g in (item.get("genres") or [])]
+    rt = item.get("runtime_min")
+    try:
+        year = int(str(item.get("year") or "")[:4])
+    except ValueError:
+        year = None
+    if f["min_year"] is not None and year is not None and year < f["min_year"]:
+        return False
+    if f["max_year"] is not None and year is not None and year > f["max_year"]:
+        return False
+    if f["exclude_genres"] and genres and any(g in f["exclude_genres"] for g in genres):
+        return False
+    if f["include_genres"] and genres and not any(g in f["include_genres"] for g in genres):
+        return False
+    if f["max_runtime_min"] is not None and rt is not None and rt > f["max_runtime_min"]:
+        return False
+    if f["min_runtime_min"] is not None and rt is not None and rt < f["min_runtime_min"]:
+        return False
+    return True
+
+
+def _eligible_pool(chat_id, game):
+    """Filter pool_all by the game filter. Year is exact from the library; for
+    genre/runtime constraints we lazily enrich thin metadata via lookup_film_cached
+    (small pool, cached), and keep anything still unknown."""
+    f = game["filter"]
+    need_meta = bool(f["exclude_genres"] or f["include_genres"]
+                     or f["max_runtime_min"] or f["min_runtime_min"])
+    eligible, unknown = [], []
+    for entry in game.get("pool_all", []):
+        item = get_film(chat_id, int(entry["owner"]), entry["slug"])
+        if not item:
+            continue
+        if need_meta and (not item.get("genres") or item.get("runtime_min") is None):
+            try:
+                info = lookup_film_cached(item["title"])
+                changed = False
+                if not item.get("genres") and info.get("genres"):
+                    item["genres"] = info["genres"]; changed = True
+                if item.get("runtime_min") is None and info.get("runtime_min") is not None:
+                    item["runtime_min"] = info["runtime_min"]; changed = True
+                if changed:
+                    ddb_put(item)
+            except Exception as e:
+                log.warning("enrich for filter failed (%s): %s", entry.get("title"), e)
+        if _passes_filter(item, f):
+            eligible.append(entry)
+            if need_meta and (not item.get("genres") or item.get("runtime_min") is None):
+                unknown.append(item["title"])
+    return eligible, unknown
+
+
 def _begin_veto(mode, chat_id, game):
-    pool = []
+    pool_all = []
     for uid in game["players"]:
         for s in game["selection"].get(str(uid), {}).get("slots", []):
             if s["state"] == "locked":
-                pool.append({"owner": str(uid), "slug": s["slug"], "title": s["title"]})
+                pool_all.append({"owner": str(uid), "slug": s["slug"], "title": s["title"]})
     game["phase"] = "VETO"
-    game["pool"] = pool
+    game["pool_all"] = pool_all
     game["current"] = None
-    if not pool:
+    if not pool_all:
         send_message(mode, chat_id, "Nobody had any films to put forward — no winner tonight.")
         clear_game(chat_id)
         return
-    send_message(mode, chat_id,
-                 f"🗳 Veto round! {len(pool)} films in the pool, one veto each. "
-                 "Vote 🚫 Veto within 90s to knock a pick out.")
+    if _filter_active(game["filter"]):
+        eligible, unknown = _eligible_pool(chat_id, game)
+        if not eligible:
+            # Empty pool — never silently unfilter; offer to relax.
+            game["awaiting_relax"] = True
+            game["relax_deadline"] = _now_epoch() + 60
+            put_game(game)
+            send_message(mode, chat_id,
+                         f"Nothing matches all of that ({_describe_filter(game['filter'])}). "
+                         "Reply 'play without filters', or tell me one to drop "
+                         "(e.g. 'drop the year limit').")
+            return
+        game["pool"] = eligible
+        note = f"🗳 Veto round! {len(eligible)} films fit ({_describe_filter(game['filter'])}), one veto each."
+        if unknown:
+            note += f"\n(Kept despite unknown genre/length: {', '.join(unknown[:5])}.)"
+    else:
+        game["pool"] = list(pool_all)
+        note = (f"🗳 Veto round! {len(pool_all)} films in the pool, one veto each. "
+                "Vote 🚫 Veto within 90s to knock a pick out.")
+    send_message(mode, chat_id, note)
     _present_candidate(mode, chat_id, game)
     put_game(game)
+
+
+def _relax_and_resume(mode, chat_id, game, text):
+    """Handle a reply to the empty-pool offer: relax a constraint or go unfiltered."""
+    t = (text or "").strip().lower()
+    f = game["filter"]
+    if any(k in t for k in ("without filter", "no filter", "unfilter", "play anyway",
+                            "just play", "all of them", "forget", "ignore them", "anything")):
+        game["filter"] = _empty_filter()
+    elif "year" in t or "old" in t or "new" in t:
+        f["min_year"] = f["max_year"] = None
+    elif any(k in t for k in ("runtime", "length", "hour", "minute", " min")):
+        f["max_runtime_min"] = f["min_runtime_min"] = None
+    elif "genre" in t or f["exclude_genres"] or f["include_genres"]:
+        f["exclude_genres"] = []
+        f["include_genres"] = []
+    else:
+        send_message(mode, chat_id, "Say 'play without filters', or name one to drop "
+                                    "(year, length, or genre).")
+        return
+    game["awaiting_relax"] = False
+    put_game(game)
+    _begin_veto(mode, chat_id, game)  # rebuild + re-filter (or unfiltered)
+
+
+def _relax_backstop(mode, chat_id, game):
+    """If no relax answer arrives in time, play unfiltered and say so."""
+    if game and game.get("awaiting_relax"):
+        if _now_epoch() >= (game.get("relax_deadline") or 0):
+            game["awaiting_relax"] = False
+            game["filter"] = _empty_filter()
+            put_game(game)
+            send_message(mode, chat_id, "No reply — playing without filters.")
+            _begin_veto(mode, chat_id, game)
+            return True
+    return False
 
 
 def _present_candidate(mode, chat_id, game):
@@ -1236,6 +1484,8 @@ MOVIE_SYSTEM = (
     "'(silent)' and call no tools.\n"
     "SEED ('load/seed the starter libraries'): call seed_starter_libraries, report the "
     "per-name counts, and tell people to claim theirs by saying 'I'm <name>'.\n"
+    "START ('start movie night', 'Let's play!', 'Start the game!', or @mention): call "
+    "start_movie_night.\n"
     "ADD ('add X to my library', 'I want to see X'): immediately call add_to_library(X). "
     "The tool resolves the title to a SINGLE film via Letterboxd search (the most popular "
     "match). If a title has several versions (e.g. Dune 1984 vs 2021) it has ALREADY "
@@ -1320,7 +1570,23 @@ def on_message(mode, ev):
     text = (ev.get("text") or "").strip()
     remember_member(chat_id, uid, ev["user_name"], ev.get("username"))
     game = get_game(chat_id)
+    # Lazy deadline backstops (no scheduler): a later event past a deadline
+    # advances the corresponding window.
     if _veto_backstop(mode, chat_id, game):
+        return
+    if _relax_backstop(mode, chat_id, game):
+        return
+    if _constraints_backstop(mode, chat_id, game):
+        return
+    # Empty-pool relax reply (within the window).
+    if game and game.get("awaiting_relax"):
+        if text:
+            _relax_and_resume(mode, chat_id, game, text)
+        return
+    # Open constraints window: parse this reply into the filter / close on "go".
+    if game and game.get("phase") == "CONSTRAINTS" and game.get("constraints_open"):
+        if text:
+            _handle_constraints_message(mode, chat_id, game, text)
         return
     if not text or not AI_ENABLED:
         return
