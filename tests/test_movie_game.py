@@ -7,6 +7,7 @@ and the no-scheduler backstop — run without AWS or network.
 Run: python3 tests/test_movie_game.py
 """
 import copy
+import json
 import os
 import sys
 import types
@@ -101,8 +102,8 @@ def fake_send_poll(mode, chat_id, question, options, **kwargs):
 def fake_lookup(title):
     return {"found": True, "title": title, "slug": L._slugify(title),
             "year": "1950", "runtime_min": 120, "genres": ["Drama"],
-            "description": "A film.", "rating": 4.0, "rating_scale": 5,
-            "rating_source": "Letterboxd", "similar": ["Other Film"]}
+            "description": "A film.", "lb_rating": 4.0, "rt_rating": "88%",
+            "similar": ["Other Film"]}
 
 
 L.ddb_get = fake_get
@@ -157,7 +158,8 @@ def test_add_to_library_is_slug_keyed_with_metadata():
     _reset()
     item, info = L.add_to_library(CHAT, 1, "Rear Window")
     assert item["slug"] == "rear-window"
-    assert item["rating"] == "4.0"          # stored as string (DDB has no float)
+    assert item["lb_rating"] == "4.0"       # stored as string (DDB has no float)
+    assert item["rt_rating"] == "88%"
     assert item["owner_id"] == 1
     lib = L.get_library(CHAT, 1)
     assert len(lib) == 1 and lib[0]["title"] == "Rear Window"
@@ -292,6 +294,30 @@ def test_parse_update_kinds():
     assert pa["kind"] == "poll_answer" and pa["poll_id"] == "p1" and pa["chat_id"] is None
     pc = L.parse_update({"poll": {"id": "p1", "is_closed": True}})
     assert pc["kind"] == "poll" and pc["poll_is_closed"] is True
+
+
+def test_omdb_reads_rt_from_ratings_array():
+    # RT must come from the Ratings array, not tomatoMeter (often N/A).
+    payload = json.dumps({
+        "Response": "True", "Title": "Dune", "Year": "2021",
+        "Runtime": "155 min", "Genre": "Action, Adventure, Drama",
+        "Plot": "Paul Atreides leads a rebellion.",
+        "Ratings": [{"Source": "Internet Movie Database", "Value": "8.0/10"},
+                    {"Source": "Rotten Tomatoes", "Value": "83%"},
+                    {"Source": "Metacritic", "Value": "74/100"}],
+        "tomatoMeter": "N/A",
+    })
+    orig, L.OMDB_API_KEY = L._http_get, "testkey"
+    L._http_get = lambda url, timeout=12: payload
+    try:
+        r = L._omdb("Dune", 2021)
+    finally:
+        L._http_get = orig
+        L.OMDB_API_KEY = ""
+    assert r["rt_rating"] == "83%"
+    assert r["runtime_min"] == 155
+    assert r["genres"][0] == "Action"
+    assert r["description"].startswith("Paul")
 
 
 def test_letterboxd_resolves_via_search_and_scrapes():

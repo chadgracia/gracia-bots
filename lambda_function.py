@@ -41,9 +41,12 @@ DDB_TABLE = os.environ.get("DDB_TABLE", "GraciaBotData")
 # (add/list/draw still work).
 BEDROCK_MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-4-6").strip()
 AI_ENABLED = bool(BEDROCK_MODEL_ID)
-# TMDB is OPTIONAL: it supplies runtime/genres/synopsis/similar titles and is the
-# rating fallback. The headline rating comes from Letterboxd, which needs no key.
+# Resolution/overview is source-agnostic and NOT gated on any one provider.
+# TMDB (optional) supplies title/year/runtime/genres/synopsis/similar.
+# Ratings are separate and non-blocking: Letterboxd average (scraped, no key) is
+# primary; Rotten Tomatoes comes from OMDb's Ratings array (free key, OMDB_API_KEY).
 TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "").strip()
+OMDB_API_KEY = os.environ.get("OMDB_API_KEY", "").strip()
 
 _ddb = boto3.resource("dynamodb", region_name=REGION)
 _table = _ddb.Table(DDB_TABLE)
@@ -470,6 +473,48 @@ def _letterboxd(title):
             "genres": genres, "description": desc}
 
 
+def _runtime_to_min(s):
+    if not s or s == "N/A":
+        return None
+    m = re.search(r"(\d+)", s)
+    return int(m.group(1)) if m else None
+
+
+def _omdb(title, year=None):
+    """OMDb overview + Rotten Tomatoes (from the Ratings array, NOT tomatoMeter
+    fields which are often N/A). Returns a dict or None. Non-blocking."""
+    if not OMDB_API_KEY:
+        return None
+    params = {"apikey": OMDB_API_KEY, "type": "movie", "t": title.strip()}
+    if year:
+        params["y"] = str(year)[:4]
+    try:
+        data = json.loads(_http_get(
+            "https://www.omdbapi.com/?" + urllib.parse.urlencode(params), timeout=12))
+    except Exception as e:
+        log.warning("omdb request failed for %r: %s", title, e)
+        return None
+    if data.get("Response") != "True":
+        return None
+
+    def clean(x):
+        return None if x in (None, "", "N/A") else x
+
+    rt = None
+    for r in data.get("Ratings") or []:           # the Ratings array, deliberately
+        if r.get("Source") == "Rotten Tomatoes":
+            rt = clean(r.get("Value"))             # e.g. "83%"
+    genre = clean(data.get("Genre"))
+    return {
+        "title": clean(data.get("Title")),
+        "year": (clean(data.get("Year")) or "")[:4],
+        "runtime_min": _runtime_to_min(data.get("Runtime")),
+        "genres": [g.strip() for g in genre.split(",")] if genre else [],
+        "description": clean(data.get("Plot")),
+        "rt_rating": rt,
+    }
+
+
 def _tmdb_get(path, params):
     if not TMDB_API_KEY:
         raise RuntimeError("TMDB_API_KEY not set")
@@ -502,38 +547,63 @@ def lookup_film(title):
     rating, slug, and similar titles. Letterboxd is the rating source; TMDB is
     metadata + the rating fallback only. Returns {'found': False} when nothing.
     """
-    lb = _letterboxd(title)
-    meta = None
+    # --- Resolution + overview: source-agnostic, never gated on one provider. ---
+    lb = None
+    try:
+        lb = _letterboxd(title)        # popularity-ordered search; also the LB rating
+    except Exception as e:
+        log.warning("letterboxd lookup failed for %r: %s", title, e)
+    tmdb = None
     if TMDB_API_KEY:
         try:
-            meta = _tmdb_meta(title)
+            tmdb = _tmdb_meta(title)
         except Exception as e:
             log.warning("tmdb meta failed: %s", e)
-    if not lb and not meta:
-        log.info("lookup_film %r -> NOT FOUND", title)
-        return {"found": False, "query": title}
-    canonical = (lb or {}).get("title") or (meta or {}).get("title") or title
-    # Letterboxd is primary for metadata now; TMDB only fills gaps.
+    # Canonical resolution comes from a popularity-ordered source if available.
+    base = lb or tmdb
+    year_hint = (base or {}).get("year")
+    # --- Ratings: independent, non-blocking. RT is fetched for the SAME film
+    #     (year_hint) so we never show RT for a different version. ---
+    omdb = None
+    try:
+        omdb = _omdb(title, year_hint)
+    except Exception as e:
+        log.warning("omdb lookup failed for %r: %s", title, e)
+    base = base or omdb
+
+    if not base:
+        # Nothing resolved at all — still return a usable record so the add and
+        # the overview are never blocked; ratings are simply absent.
+        log.info("lookup_film %r -> NOT FOUND (adding bare title)", title)
+        return {"found": False, "title": title, "year": "", "slug": _slugify(title),
+                "runtime_min": None, "genres": [], "description": "", "similar": [],
+                "letterboxd_url": None, "lb_rating": None, "rt_rating": None}
+
+    sources = [base, lb, omdb, tmdb]
+
+    def pick(field):
+        for s in sources:
+            if s and s.get(field):
+                return s[field]
+        return None
+
+    canonical = pick("title") or title
+    year = pick("year") or ""
     out = {
         "found": True,
         "title": canonical,
-        "slug": (lb or {}).get("slug") or _slugify(canonical),
-        "year": (lb or {}).get("year") or (meta or {}).get("year") or "",
-        "runtime_min": (lb or {}).get("runtime_min") or (meta or {}).get("runtime_min"),
-        "genres": (lb or {}).get("genres") or (meta or {}).get("genres") or [],
-        "description": (lb or {}).get("description") or (meta or {}).get("description") or "",
-        "similar": (meta or {}).get("similar") or [],
+        "year": year,
+        "slug": (lb or {}).get("slug") or _slugify(f"{canonical} {year}".strip()),
+        "runtime_min": pick("runtime_min"),
+        "genres": pick("genres") or [],
+        "description": pick("description") or "",
+        "similar": (tmdb or {}).get("similar") or [],
         "letterboxd_url": (lb or {}).get("url"),
+        "lb_rating": (lb or {}).get("rating_5"),     # 0-5, or None
+        "rt_rating": (omdb or {}).get("rt_rating"),  # "83%", or None
     }
-    if lb and lb.get("rating_5") is not None:
-        out.update(rating=lb["rating_5"], rating_scale=5, rating_source="Letterboxd")
-    elif meta and meta.get("tmdb_rating_10") is not None:
-        out.update(rating=meta["tmdb_rating_10"], rating_scale=10,
-                   rating_source="TMDB (Letterboxd unavailable)")
-    else:
-        out.update(rating=None, rating_scale=None, rating_source=None)
-    log.info("lookup_film %r -> %s (%s) rating=%s/%s", title, out["title"],
-             out["year"], out.get("rating"), out.get("rating_scale"))
+    log.info("lookup_film %r -> %s (%s) LB=%s RT=%s", title, out["title"],
+             out["year"], out.get("lb_rating"), out.get("rt_rating"))
     return out
 
 
@@ -601,9 +671,9 @@ def add_to_library(chat_id, user_id, title):
         "runtime_min": info.get("runtime_min"),
         "genres": info.get("genres") or [],
         "description": info.get("description") or "",
-        "rating": (str(info["rating"]) if info.get("rating") is not None else None),
-        "rating_scale": info.get("rating_scale"),
-        "rating_source": info.get("rating_source"),
+        # ratings stored as strings (DDB resource rejects float); either may be None
+        "lb_rating": (str(info["lb_rating"]) if info.get("lb_rating") is not None else None),
+        "rt_rating": info.get("rt_rating"),
         "added_at": _now_iso(), "watched": False,
     }
     ddb_put(item)
@@ -757,12 +827,15 @@ def _add_player(game, user_id):
 
 # ---- presentation --------------------------------------------------------- #
 def _item_rating_phrase(item):
-    r = item.get("rating")
-    if r in (None, "", "None"):
-        return ""
-    src = item.get("rating_source") or "Letterboxd"
-    src = "Letterboxd" if str(src).startswith("Letterboxd") else "TMDB"
-    return f"{src} {r}/{item.get('rating_scale') or 5}"
+    """Whatever ratings we have, shown together; empty string if none."""
+    parts = []
+    lb = item.get("lb_rating")
+    if lb not in (None, "", "None"):
+        parts.append(f"{lb}/5 Letterboxd")
+    rt = item.get("rt_rating")
+    if rt not in (None, "", "N/A"):
+        parts.append(f"{rt} RT")
+    return " · ".join(parts)
 
 
 def _film_card(item):
@@ -1084,7 +1157,7 @@ def winner_note(title, year):
 # --------------------------------------------------------------------------- #
 MOVIE_TOOLS = [
     {"toolSpec": {"name": "lookup_film",
-                  "description": "Look up a film's Letterboxd rating (0-5), year, runtime, genres, one-line description and similar titles.",
+                  "description": "Look up a film: year, runtime, genres, one-line synopsis, plus ratings (lb_rating 0-5 from Letterboxd, rt_rating like '83%' from Rotten Tomatoes). Any rating may be null.",
                   "inputSchema": {"json": {"type": "object",
                                            "properties": {"title": {"type": "string"}},
                                            "required": ["title"]}}}},
@@ -1121,11 +1194,12 @@ MOVIE_SYSTEM = (
     "match). If a title has several versions (e.g. Dune 1984 vs 2021) it has ALREADY "
     "picked the prominent/recent one — do NOT ask which; just state the one you saved so "
     "it's correctable, e.g. 'Added Dune (2021) — say \"the 1984 one\" if you meant that.' "
-    "Then give a one-line synopsis plus the rating as 'X/5 on Letterboxd' (only say "
-    "'/10 on TMDB' if rating_source mentions TMDB), runtime, and genre, and confirm it's "
-    "saved to their library.\n"
-    "LOOK UP ('what's X rated', 'tell me about X'): call lookup_film and answer with the "
-    "rating + a one-line synopsis; offer to add it.\n"
+    "Then give a one-line synopsis, the runtime and genre, and whatever ratings came back: "
+    "Letterboxd as 'lb_rating/5 on Letterboxd' and/or Rotten Tomatoes as 'rt_rating on "
+    "Rotten Tomatoes'. Confirm it's saved. The overview and the add do NOT depend on "
+    "ratings — if lb_rating and/or rt_rating are null, simply omit them and proceed.\n"
+    "LOOK UP ('what's X rated', 'tell me about X'): call lookup_film and answer with a "
+    "one-line synopsis + whatever ratings are present; offer to add it.\n"
     "NEVER mention a 'database' or internal storage, and NEVER invent ratings or details "
     "— use only the tool's fields and omit any that are missing. Ask a clarifying "
     "question ONLY when the tool returns resolved/found = false (no reasonable match at "
@@ -1142,9 +1216,9 @@ def _dispatch_tool(name, tool_input, ctx):
         return {"added": True, "resolved": info.get("found", False),
                 "title": item["title"], "year": item.get("year"),
                 "runtime_min": item.get("runtime_min"), "genres": item.get("genres"),
-                "rating": info.get("rating"), "rating_scale": info.get("rating_scale"),
-                "rating_source": info.get("rating_source"),
-                "description": info.get("description"), "similar": info.get("similar")}
+                "description": info.get("description"),
+                "lb_rating": info.get("lb_rating"), "rt_rating": info.get("rt_rating"),
+                "similar": info.get("similar")}
     if name == "remove_from_library":
         removed = remove_from_library(chat_id, uid, tool_input["title"])
         return {"removed": removed}
