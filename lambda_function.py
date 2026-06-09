@@ -763,6 +763,46 @@ def claim_library(chat_id, name, user_id):
     return {"status": "ok", "moved": moved}
 
 
+# --- Embedded starter libraries -------------------------------------------- #
+# Bundled here (not the unshipped tools/seed_libraries.json) so the group can
+# seed from inside the chat with no AWS CLI/chat_id. Load via the
+# seed_starter_libraries tool; people then claim with "I'm <name>".
+_STARTER_LIBRARIES = json.loads(
+    '{\n"libraries": {\n"Chad": [\n{\n"title": "Red River",\n"year": 1948\n},\n{\n"title": "Barry Lyndon",\n"year": 1975\n},\n{\n"title": "Tokyo Story",\n"year": 1953,\n"note": "Previously vetoed (by Chad himself)"\n},\n{\n"title": "Scenes from a Marriage",\n"year": 1973\n},\n{\n"title": "Where Is the Friend\'s House?",\n"year": 1987\n},\n{\n"title": "All About Eve",\n"year": 1950\n},\n{\n"title": "Rear Window",\n"year": 1954\n},\n{\n"title": "Brief Encounter",\n"year": 1945\n},\n{\n"title": "Mirror",\n"year": 1975\n},\n{\n"title": "Fail Safe",\n"year": 1964\n},\n{\n"title": "Ace in the Hole",\n"year": 1951\n},\n{\n"title": "Winter Light",\n"year": 1963\n},\n{\n"title": "The Third Man",\n"year": 1949\n},\n{\n"title": "Moonlight",\n"year": 2016\n},\n{\n"title": "The Cook, the Thief, His Wife & Her Lover",\n"year": 1989\n},\n{\n"title": "All the President\'s Men",\n"year": 1976\n},\n{\n"title": "Touch of Evil",\n"year": 1958\n},\n{\n"title": "Synecdoche, New York",\n"year": 2008\n},\n{\n"title": "The Virgin Spring",\n"year": 1960\n},\n{\n"title": "Hiroshima Mon Amour",\n"year": 1959\n},\n{\n"title": "Brokeback Mountain",\n"year": 2005\n},\n{\n"title": "Midnight Cowboy",\n"year": 1969\n},\n{\n"title": "Icarus",\n"year": 2017\n},\n{\n"title": "7 Up",\n"year": 1964\n},\n{\n"title": "Brother\'s Keeper",\n"year": 1992\n},\n{\n"title": "Man on Wire",\n"year": 2008\n},\n{\n"title": "Salesman",\n"year": 1969\n},\n{\n"title": "The Overnighters",\n"year": 2014\n},\n{\n"title": "Won\'t You Be My Neighbor?",\n"year": 2018\n},\n{\n"title": "Cameraperson",\n"year": 2016\n},\n{\n"title": "Grizzly Man",\n"year": 2005\n},\n{\n"title": "When We Were Kings",\n"year": 1996\n},\n{\n"title": "Hoop Dreams",\n"year": 1994\n},\n{\n"title": "The Thin Blue Line",\n"year": 1988\n},\n{\n"title": "To Be and to Have",\n"year": 2002\n},\n{\n"title": "The King of Kong",\n"year": 2007\n},\n{\n"title": "Stop Making Sense",\n"year": 1984\n},\n{\n"title": "Koyaanisqatsi",\n"year": 1982\n},\n{\n"title": "Senna",\n"year": 2010\n},\n{\n"title": "L\'eclisse",\n"year": 1962\n}\n],\n"Alberto": [\n{\n"title": "The Shop Around the Corner",\n"year": 1940\n},\n{\n"title": "The Good, the Bad and the Ugly",\n"year": 1966\n},\n{\n"title": "Unforgiven",\n"year": 1992,\n"note": "Won session 1"\n},\n{\n"title": "Once Upon a Time in Hollywood",\n"year": 2019\n},\n{\n"title": "Spartacus",\n"year": 1960\n},\n{\n"title": "The War Wagon",\n"year": 1967\n},\n{\n"title": "Meet John Doe",\n"year": 1941\n},\n{\n"title": "Druk (Another Round)",\n"year": 2020\n}\n],\n"Asa": [\n{\n"title": "Buena Vista Social Club",\n"year": 1999\n},\n{\n"title": "The American Friend",\n"year": 1977,\n"note": "Previously vetoed by Asa"\n},\n{\n"title": "Kings of the Road",\n"year": 1976,\n"note": "Previously vetoed by Alberto"\n},\n{\n"title": "Woman in the Dunes",\n"year": 1964\n},\n{\n"title": "Red Sorghum",\n"year": 1988\n},\n{\n"title": "Poetry",\n"year": 2010\n}\n],\n"Anya": [\n{\n"title": "Perfect Days",\n"year": 2023\n},\n{\n"title": "Natural Born Killers",\n"year": 1994\n},\n{\n"title": "The Night Porter",\n"year": 1974,\n"note": "Italian: Il Portiere di Notte"\n}\n],\n"Khimka": [\n{\n"title": "Nowhere",\n"year": 1997\n},\n{\n"title": "Ritual",\n"year": 2000\n},\n{\n"title": "Lost Highway",\n"year": 1997\n}\n]\n}\n}'
+)["libraries"]
+
+
+def seed_starter_libraries(chat_id):
+    """Write the embedded starter libraries into this chat under seed:<name>
+    placeholders. Idempotent: skips a name already seeded or already claimed.
+    Returns {name: films_written}."""
+    written = {}
+    existing_items = ddb_query(_pk("movie", chat_id))
+    for name, films in _STARTER_LIBRARIES.items():
+        if not films:
+            continue
+        key = name.strip().lower()
+        if ddb_get(_pk("movie", chat_id), f"seedclaim#{key}"):
+            continue  # already claimed by someone
+        owner = _seed_owner(name)
+        prefix = f"lib#{owner}#"
+        if any(str(i.get("SK", "")).startswith(prefix) for i in existing_items):
+            continue  # already seeded
+        n = 0
+        for f in films:
+            slug = _slugify(f["title"])
+            note = (f.get("note") or "").lower()
+            ddb_put({"PK": _pk("movie", chat_id), "SK": f"lib#{owner}#{slug}",
+                     "slug": slug, "owner_id": owner, "seed_name": name.strip(),
+                     "title": f["title"], "year": str(f.get("year") or ""),
+                     "genres": [], "description": "", "lb_rating": None,
+                     "rt_rating": None, "added_at": _now_iso(),
+                     "watched": "won" in note})
+            n += 1
+        written[name] = n
+    return written
+
+
 # --------------------------------------------------------------------------- #
 # Game state machine: IDLE -> JOINING -> SELECTING -> VETO -> DONE.
 # All randomness (3-per-player draw, pool pick), thumb/lock tracking, veto
@@ -1182,13 +1222,19 @@ MOVIE_TOOLS = [
     {"toolSpec": {"name": "start_movie_night",
                   "description": "Start a movie-night game in this chat (posts the Join/Start card).",
                   "inputSchema": {"json": {"type": "object", "properties": {}}}}},
+    {"toolSpec": {"name": "seed_starter_libraries",
+                  "description": "Load the bundled starter libraries (Chad, Alberto, Asa, Anya, …) into this chat so people can claim them. Use when asked to 'load/seed the starter libraries'.",
+                  "inputSchema": {"json": {"type": "object", "properties": {}}}}},
 ]
 
 MOVIE_SYSTEM = (
     "You are SirWatchalot, a film-night helper in a Telegram group. Privacy is OFF so "
     "you see every message, but ONLY act on clear film intent: add/remove/list a "
-    "personal library, look up a film, claim a seeded library ('I'm Chad'), or start "
-    "movie night. For anything else, reply with exactly '(silent)' and call no tools.\n"
+    "personal library, look up a film, claim a seeded library ('I'm Chad'), load the "
+    "starter libraries, or start movie night. For anything else, reply with exactly "
+    "'(silent)' and call no tools.\n"
+    "SEED ('load/seed the starter libraries'): call seed_starter_libraries, report the "
+    "per-name counts, and tell people to claim theirs by saying 'I'm <name>'.\n"
     "ADD ('add X to my library', 'I want to see X'): immediately call add_to_library(X). "
     "The tool resolves the title to a SINGLE film via Letterboxd search (the most popular "
     "match). If a title has several versions (e.g. Dune 1984 vs 2021) it has ALREADY "
@@ -1233,6 +1279,9 @@ def _dispatch_tool(name, tool_input, ctx):
     if name == "start_movie_night":
         start_game(mode, chat_id, uid)
         return {"started": True}
+    if name == "seed_starter_libraries":
+        written = seed_starter_libraries(chat_id)
+        return {"seeded": written, "names": list(_STARTER_LIBRARIES.keys())}
     return {"error": f"unknown tool {name}"}
 
 
