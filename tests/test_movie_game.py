@@ -296,6 +296,20 @@ def test_parse_update_kinds():
     assert pc["kind"] == "poll" and pc["poll_is_closed"] is True
 
 
+def test_seed_starter_libraries_then_claim():
+    _reset()
+    written = L.seed_starter_libraries(CHAT)
+    assert written.get("Chad") == 40 and written.get("Asa") == 6
+    assert "chad" in L.list_seed_names(CHAT)
+    assert L.seed_starter_libraries(CHAT) == {}      # idempotent — nothing re-written
+    res = L.claim_library(CHAT, "Chad", 1)           # link to a real user
+    assert res["status"] == "ok" and res["moved"] == 40
+    assert len(L.get_library(CHAT, 1)) == 40
+    assert "chad" not in L.list_seed_names(CHAT)      # claimed, no longer a seed
+    L.seed_starter_libraries(CHAT)                    # re-seed skips the claimed name
+    assert "chad" not in L.list_seed_names(CHAT)
+
+
 def test_omdb_reads_rt_from_ratings_array():
     # RT must come from the Ratings array, not tomatoMeter (often N/A).
     payload = json.dumps({
