@@ -304,6 +304,52 @@ def test_selection_is_sequential_one_player_at_a_time():
     assert L.get_game(CHAT)["phase"] == "VETO"
 
 
+def test_is_stale():
+    assert L._is_stale("2000-01-01T00:00:00+00:00") is True   # earlier day / long ago
+    assert L._is_stale(None) is True
+    assert L._is_stale(L._now_iso()) is False
+
+
+def test_new_day_expiry_starts_clean():
+    _reset()
+    L.add_to_library(CHAT, 1, "Film A")
+    L.start_game(MODE, CHAT, 1)
+    g = L.get_game(CHAT)
+    s1 = g["session_id"]
+    g["last_activity_at"] = g["created_at"] = "2000-01-01T00:00:00+00:00"  # yesterday-ish
+    fake_put(g)                                   # write WITHOUT bumping last_activity
+    assert L._game_is_ongoing(CHAT, L.get_game(CHAT)) is False  # auto-abandons + clears
+    assert L.get_game(CHAT) is None
+    L.start_game(MODE, CHAT, 1)                   # new day -> clean start
+    assert L.get_game(CHAT)["session_id"] != s1
+
+
+def test_force_new_supersedes_active_game():
+    _reset()
+    L.add_to_library(CHAT, 1, "Film A")
+    L.start_game(MODE, CHAT, 1)
+    s1 = L.get_game(CHAT)["session_id"]
+    assert L.get_game(CHAT)["status"] == "collecting"
+    SENT.clear()
+    L.start_game(MODE, CHAT, 1, force_new=True)   # explicit new game -> supersede, no argument
+    assert L.get_game(CHAT)["session_id"] != s1
+    assert not any("already going" in t.lower() for t, _ in SENT)
+
+
+def test_soft_prompt_once_then_restarts():
+    _reset()
+    L.add_to_library(CHAT, 1, "Film A")
+    L.start_game(MODE, CHAT, 1)
+    s1 = L.get_game(CHAT)["session_id"]
+    SENT.clear()
+    L.start_game(MODE, CHAT, 1)                   # ambiguous nudge while live -> prompt once
+    assert L.get_game(CHAT)["session_id"] == s1
+    assert L.get_game(CHAT)["soft_prompted"] is True
+    assert sum("Join" in t for t, _ in SENT) == 1
+    L.start_game(MODE, CHAT, 1)                   # pushed again -> just restart, no repeat line
+    assert L.get_game(CHAT)["session_id"] != s1
+
+
 def test_parse_update_kinds():
     assert L.parse_update({"message": {"chat": {"id": 5}, "from": {"id": 9},
                                        "text": "hi"}})["kind"] == "message"

@@ -22,7 +22,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import boto3
@@ -902,6 +902,7 @@ def get_game(chat_id):
 
 
 def put_game(game):
+    game["last_activity_at"] = _now_iso()   # bump on every persisted interaction
     ddb_put(game)
     return game
 
@@ -910,18 +911,71 @@ def clear_game(chat_id):
     ddb_delete(_pk("movie", chat_id), "game#current")
 
 
+# ---- lifecycle: status, staleness, new-day expiry ------------------------- #
+# A game is "ongoing" only while non-terminal AND fresh. Status flows
+# collecting -> confirming -> picking -> done (+ abandoned). A started-but-never-
+# finished game must never wedge the group: a new Kyiv calendar day, or ~6h idle,
+# auto-abandons it so the next "let's play" starts clean.
+_TERMINAL_STATUS = {"done", "abandoned"}
+_IDLE_ABANDON_SEC = 6 * 3600
+try:
+    from zoneinfo import ZoneInfo
+    _KYIV = ZoneInfo("Europe/Kyiv")            # same tz as the morning poll
+except Exception:                              # no tzdata on the runtime — approx
+    _KYIV = timezone(timedelta(hours=2))
+
+
+def _is_stale(last_iso):
+    """True if the timestamp is on an earlier Kyiv day, or > ~6h ago."""
+    if not last_iso:
+        return True
+    try:
+        last = datetime.fromisoformat(last_iso)
+    except ValueError:
+        return True
+    now = datetime.now(timezone.utc)
+    if (now - last).total_seconds() > _IDLE_ABANDON_SEC:
+        return True
+    try:
+        return last.astimezone(_KYIV).date() < now.astimezone(_KYIV).date()
+    except Exception:
+        return False
+
+
+def _abandon_game(chat_id, game):
+    if not game:
+        return
+    game["status"] = "abandoned"
+    ddb_put(game)            # record the terminal status, then free the slot
+    clear_game(chat_id)
+
+
+def _game_is_ongoing(chat_id, game):
+    """Non-stale, non-terminal game? Auto-abandons (and clears) a stale one."""
+    if not game or game.get("status") in _TERMINAL_STATUS:
+        return False
+    if _is_stale(game.get("last_activity_at") or game.get("started_at")
+                 or game.get("created_at")):
+        _abandon_game(chat_id, game)
+        return False
+    return True
+
+
 def _empty_filter():
     return {"exclude_genres": [], "include_genres": [], "max_runtime_min": None,
             "min_runtime_min": None, "min_year": None, "max_year": None}
 
 
 def new_game(chat_id, initiator_id):
+    now = _now_iso()
     return {
         "PK": _pk("movie", chat_id), "SK": "game#current",
         "session_id": str(uuid.uuid4()), "phase": "JOINING",
+        "status": "collecting",          # lifecycle: collecting/confirming/picking/done/abandoned
         "players": [], "initiator": int(initiator_id) if initiator_id else None,
         "vetoes_remaining": {},
         "join_message_id": None,
+        "soft_prompted": False,          # have we already nudged "there's a game going"?
         "selection": {},   # {uid: {slots:[{slug,title,state}], shown:[slug], locked}}
         "cards": {},       # {message_id: {uid, slot}}
         "filter": _empty_filter(),   # Phase 1.5 constraints (AND across people)
@@ -932,7 +986,7 @@ def new_game(chat_id, initiator_id):
         "pool_all": [],    # full locked pool (kept for relax re-filtering)
         "pool": [],        # [{owner, slug, title}] eligible after the filter
         "current": None,   # {film, poll_id, poll_message_id, presented_at, resolved}
-        "created_at": _now_iso(),
+        "created_at": now, "started_at": now, "last_activity_at": now,
     }
 
 
@@ -1028,10 +1082,19 @@ def _join_text(chat_id, game):
 
 
 # ---- start / roster ------------------------------------------------------- #
-def start_game(mode, chat_id, initiator_id):
-    if get_game(chat_id):
-        send_message(mode, chat_id, "A movie night's already going. Tap 🎬 Join on the card above.")
-        return
+def start_game(mode, chat_id, initiator_id, force_new=False):
+    game = get_game(chat_id)
+    if _game_is_ongoing(chat_id, game):
+        # A real, same-day game is live (stale ones were just auto-abandoned).
+        if not force_new and not game.get("soft_prompted"):
+            game["soft_prompted"] = True
+            put_game(game)
+            send_message(mode, chat_id,
+                         "🎬 There's a movie night going — tap 🎬 Join on the card above, "
+                         "or say \"start a new game\" to scrap it and begin fresh.")
+            return
+        # force_new, or they've pushed back after the one nudge -> end it and restart.
+        _abandon_game(chat_id, game)
     game = new_game(chat_id, initiator_id)
     _add_player(game, initiator_id)
     resp = send_message(mode, chat_id, _join_text(chat_id, game),
@@ -1223,6 +1286,7 @@ def _parse_confirm_tokens(text):
 
 def _begin_selection(mode, chat_id, game):
     game["phase"] = "SELECTING"
+    game["status"] = "confirming"
     game["selection"] = {}
     game["sel_order"] = [int(p) for p in game["players"]]
     game["sel_idx"] = 0
@@ -1450,6 +1514,7 @@ def _begin_veto(mode, chat_id, game):
         for s in sel.get("slots", []):
             pool_all.append({"owner": str(uid), "slug": s["slug"], "title": s["title"]})
     game["phase"] = "VETO"
+    game["status"] = "picking"
     game["pool_all"] = pool_all
     game["current"] = None
     if not pool_all:
@@ -1607,6 +1672,7 @@ def _veto_backstop(mode, chat_id, game):
 def _declare_winner(mode, chat_id, game, film):
     cur = game.get("current") or {}
     cur["resolved"] = True
+    game["status"] = "done"   # completion recorded immediately (history written below)
     owner, slug = int(film["owner"]), film["slug"]
     item = get_film(chat_id, owner, slug)
     title = (item or {}).get("title") or film["title"]
@@ -1691,7 +1757,11 @@ MOVIE_TOOLS = [
                                            "properties": {"name": {"type": "string"}},
                                            "required": ["name"]}}}},
     {"toolSpec": {"name": "start_movie_night",
-                  "description": "Start a movie-night game in this chat (posts the Join/Start card).",
+                  "description": "Start a movie-night game (posts the Join/Start card). Set force_new=true when the user explicitly wants a NEW game ('start a new game', 'new game', 'start over') or insists there's no game / to restart — that scraps any current game and begins fresh.",
+                  "inputSchema": {"json": {"type": "object",
+                                           "properties": {"force_new": {"type": "boolean"}}}}}},
+    {"toolSpec": {"name": "cancel_game",
+                  "description": "Cancel/end the current movie-night game in this chat.",
                   "inputSchema": {"json": {"type": "object", "properties": {}}}}},
     {"toolSpec": {"name": "seed_starter_libraries",
                   "description": "Load the bundled starter libraries (Chad, Alberto, Asa, Anya, …) into this chat so people can claim them. Use when asked to 'load/seed the starter libraries'.",
@@ -1707,7 +1777,11 @@ MOVIE_SYSTEM = (
     "SEED ('load/seed the starter libraries'): call seed_starter_libraries, report the "
     "per-name counts, and tell people to claim theirs by saying 'I'm <name>'.\n"
     "START ('start movie night', 'Let's play!', 'Start the game!', or @mention): call "
-    "start_movie_night and add NO text of your own (the bot posts the Join card itself).\n"
+    "start_movie_night and add NO text of your own (the bot posts the Join card itself). "
+    "If the user explicitly wants a NEW game ('start a new game', 'new game', 'start over') "
+    "or pushes back that there's no game / to just restart, call it with force_new=true. "
+    "To cancel, call cancel_game. NEVER tell someone a game is 'already going' yourself — the "
+    "tool decides; just do what they asked and don't repeat yourself.\n"
     "ADD ('add X to my library', 'I want to see X'): immediately call add_to_library with "
     "title, and year as a SEPARATE argument if the user gave one (never put the year in "
     "title). The resolver picks one film; if it resolved (resolved=true) just confirm what "
@@ -1793,9 +1867,18 @@ def _dispatch_tool(name, tool_input, ctx):
             remember_member(chat_id, uid, ctx.get("user_name"), ctx.get("username"))
         return res
     if name == "start_movie_night":
-        start_game(mode, chat_id, uid)
-        ctx["suppress_reply"] = True   # the Join card is the only message; no LLM echo
+        start_game(mode, chat_id, uid, force_new=bool(tool_input.get("force_new")))
+        ctx["suppress_reply"] = True   # the bot posts its own card/prompt; no LLM echo
         return {"started": True}
+    if name == "cancel_game":
+        g = get_game(chat_id)
+        if g and g.get("status") not in _TERMINAL_STATUS:
+            _abandon_game(chat_id, g)
+            send_message(mode, chat_id, "Movie night cancelled.")
+        else:
+            send_message(mode, chat_id, "No movie night is running.")
+        ctx["suppress_reply"] = True
+        return {"cancelled": True}
     if name == "seed_starter_libraries":
         written = seed_starter_libraries(chat_id)
         return {"seeded": written, "names": list(_STARTER_LIBRARIES.keys())}

@@ -97,6 +97,23 @@ Command names below are proposals — rename freely. The mechanics matter, not t
 - **Decision needed:** is the roster (a) explicit `/join` only, or (b) auto = every known member with
   a library? I recommend explicit `/join` so veto counts stay bounded and predictable.
 
+### Game lifecycle & new-day expiry (CURRENT)
+The `game#current` record carries a `status`: **collecting → confirming → picking → done**, plus
+**abandoned**. Only a non-terminal, *fresh* status counts as "ongoing":
+- `started_at` / `last_activity_at` are stamped on the record; `put_game` bumps `last_activity_at`
+  on every persisted interaction. The Winner sets `status=done` (and a `history#{session}` row is
+  written) so completion is recorded for the morning poll.
+- **Auto-expiry:** before answering "is a game ongoing?", a non-terminal game whose
+  `last_activity_at` is on an earlier **Europe/Kyiv** calendar day — or simply > ~6h idle — is
+  marked `abandoned` and cleared. So a fresh Kyiv day always starts clean, and a stalled game never
+  wedges the group (`_is_stale` / `_game_is_ongoing` / `_abandon_game`).
+- **Start intent obeys, never argues:** the LLM routes start-ish messages. "start a new game" /
+  "new game" / "start over" (or a correction like "there's no game, start one") call
+  `start_movie_night(force_new=true)` → end any current game and start fresh. A bare "let's play"
+  while a real same-day game is live gets **one** "there's a game going — join, or start fresh?"
+  nudge; pushing again just restarts. The bot never repeats the same "already going" line, and
+  `cancel_game` ends a game on request.
+
 ### Phase 1.5: Constraints (optional)
 Once the player list is settled, ask once: "Any constraints tonight? Length, genre, or
 year range — or just say go." Wait up to 60 seconds.
