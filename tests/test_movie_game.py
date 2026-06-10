@@ -454,6 +454,13 @@ def test_unanimous_fine_finalizes_without_clock():
     assert len(hist) == 1
 
 
+def test_token_regex_catches_truncation():
+    assert L._TOKEN_RE.match("8846476802:AAEGfNsuU8hTTcM31ZiNJSmygDBmoaBVzTk")
+    assert not L._TOKEN_RE.match(":AAEGfNsuU8hTTcM31ZiNJSmygDBmoaBVzTk")   # lost bot-id
+    assert not L._TOKEN_RE.match("8846476802AAEGfNsuU8hTTcM31ZiNJSmygDB")  # lost colon
+    assert not L._TOKEN_RE.match("123:short")                              # too short
+
+
 def test_omdb_reads_rt_from_ratings_array():
     # RT must come from the Ratings array, not tomatoMeter (often N/A).
     payload = json.dumps({

@@ -214,12 +214,48 @@ def _tg_request(token, method, payload):
         return {"ok": False, "description": str(e)}
 
 
+# A Telegram bot token is "<bot-id digits>:<35-ish url-safe chars>". We validate
+# this at load so a truncated value (e.g. leading bot-id digits lost on a bad
+# paste) fails loudly in the logs instead of silently 404ing every send.
+_TOKEN_RE = re.compile(r"^\d{6,}:[A-Za-z0-9_-]{30,}$")
+_token_cache = {}
+_healthchecked = set()
+
+
 def _token_for(mode):
+    """Bot token from the <MODE>_BOT_TOKEN env var. Cached per cold start and
+    format-validated so a truncated value (lost bot-id digits) fails loudly."""
+    if mode in _token_cache:
+        return _token_cache[mode]
     cfg = _mode_config()[mode]
     token = os.environ.get(cfg["token_env"], "").strip()
     if not token:
         raise RuntimeError(f"missing env {cfg['token_env']} for mode {mode}")
+    if not _TOKEN_RE.match(token):
+        log.error("BOT TOKEN for %s looks MALFORMED (len=%d, starts %r) — Telegram will "
+                  "404 every send. Expected '<digits>:<35+ url-safe chars>'.",
+                  mode, len(token), token[:4])
+    _token_cache[mode] = token
     return token
+
+
+def verify_token(mode):
+    """getMe healthcheck — once per cold start per mode; logs the resolved bot on
+    success, loudly on failure (a bad/truncated token is then obvious in logs)."""
+    if mode in _healthchecked:
+        return
+    _healthchecked.add(mode)
+    try:
+        resp = _tg_request(_token_for(mode), "getMe", {})
+    except Exception as e:
+        log.error("healthcheck %s: could not load token: %s", mode, e)
+        return
+    if resp.get("ok"):
+        u = resp.get("result") or {}
+        log.info("healthcheck %s: getMe ok -> @%s (id %s)", mode, u.get("username"), u.get("id"))
+    else:
+        log.error("healthcheck %s: getMe FAILED -> %s — token bad or truncated.",
+                  mode, resp.get("description"))
 
 
 def send_message(mode, chat_id, text, **kwargs):
@@ -1921,6 +1957,10 @@ def lambda_handler(event, context):
     if not expected or provided != expected:
         log.warning("secret mismatch for mode %s", mode)
         return {"statusCode": 403, "body": "forbidden"}
+
+    # Once-per-cold-start getMe healthcheck: a bad/truncated token shows up loudly
+    # in the logs instead of silently 404ing every send.
+    verify_token(mode)
 
     try:
         update = _load_body(event)
