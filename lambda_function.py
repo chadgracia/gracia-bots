@@ -1129,7 +1129,9 @@ def on_callback(mode, ev):
             return
         _begin_constraints(mode, chat_id, game)
         return
-    # (selection is reply-driven now — no per-card buttons)
+    if data in ("sp_play", "sp_add") and game.get("phase") == "SELECTING":
+        _handle_short_pool_callback(mode, chat_id, game, uid, data)
+        return
 
 
 # ---- constraints (Phase 1.5, optional) ------------------------------------ #
@@ -1361,28 +1363,145 @@ def _current_selecting_uid(game):
     return order[idx] if idx < len(order) else None
 
 
+def _filter_reason(item, f):
+    """Why a film fails tonight's filter (mirrors _passes_filter order), or None if
+    it qualifies. Unknown metadata qualifies (kept), same as _passes_filter."""
+    genres = [g.lower() for g in (item.get("genres") or [])]
+    rt = item.get("runtime_min")
+    try:
+        year = int(str(item.get("year") or "")[:4])
+    except ValueError:
+        year = None
+    if f["min_year"] is not None and year is not None and year < f["min_year"]:
+        return f"it's from {year}, before tonight's {f['min_year']} cutoff"
+    if f["max_year"] is not None and year is not None and year > f["max_year"]:
+        return f"it's from {year}, after tonight's {f['max_year']} cutoff"
+    if f["exclude_genres"] and genres:
+        bad = next((g for g in genres if g in f["exclude_genres"]), None)
+        if bad:
+            return f"it's {bad}, and tonight excludes {'/'.join(f['exclude_genres'])}"
+    if f["include_genres"] and genres and not any(g in f["include_genres"] for g in genres):
+        return f"tonight is {'/'.join(f['include_genres'])} only"
+    if f["max_runtime_min"] is not None and rt is not None and rt > f["max_runtime_min"]:
+        return f"it's ~{rt} min, over tonight's {f['max_runtime_min']}-min limit"
+    if f["min_runtime_min"] is not None and rt is not None and rt < f["min_runtime_min"]:
+        return f"it's ~{rt} min, under tonight's {f['min_runtime_min']}-min minimum"
+    return None
+
+
+def _short_pool_keyboard(n):
+    play = f"▶️ Play with these ({n})" if n else "🙅 Sit this round out"
+    return {"inline_keyboard": [[{"text": play, "callback_data": "sp_play"}],
+                                [{"text": "➕ Add a film", "callback_data": "sp_add"}]]}
+
+
+def _post_short_pool(mode, chat_id, game, uid):
+    """Tell the player the filter trimmed them below 3 and offer buttons. Buttons,
+    not emoji, to avoid the parse fragility (mentions / skin-tone modifiers)."""
+    sel = game["selection"][str(uid)]
+    sel["awaiting_add"] = False          # require a fresh "Add a film" tap to re-arm
+    n = len(sel["slots"])
+    who = mention_for(chat_id, uid)
+    desc = _describe_filter(game["filter"]) or "tonight's filter"
+    if n:
+        lst = ", ".join(f"{i + 1}) {s['title']}" for i, s in enumerate(sel["slots"]))
+        text = (f"{who} — tonight's filter is {desc}, and only these qualify from your "
+                f"library: {lst}. Play with these, or add another that fits?")
+    else:
+        text = (f"{who} — nothing in your library fits tonight's filter ({desc}). "
+                "Add one that fits, or sit this round out (you keep your veto).")
+    resp = send_message(mode, chat_id, text, reply_markup=_short_pool_keyboard(n))
+    game["sel_msg_id"] = (resp.get("result") or {}).get("message_id")
+    put_game(game)
+
+
+def _handle_short_pool_callback(mode, chat_id, game, uid, data):
+    if int(uid) != int(_current_selecting_uid(game) or -1):
+        return                            # not this player's turn
+    sel = game["selection"].get(str(uid))
+    if not sel or sel.get("locked"):
+        return
+    who = mention_for(chat_id, uid)
+    if data == "sp_play":
+        sel["locked"] = True
+        sel["awaiting_add"] = False
+        send_message(mode, chat_id,
+                     f"Locked in {who}'s picks ✅" if sel["slots"]
+                     else f"{who} is sitting this one out — veto still counts.")
+        put_game(game)
+        _advance_player(mode, chat_id, game)
+    elif data == "sp_add":
+        sel["awaiting_add"] = True
+        put_game(game)
+        desc = _describe_filter(game["filter"]) or "tonight's filter"
+        send_message(mode, chat_id, f"{who}, send a film title that fits {desc}.")
+
+
+def _handle_short_pool_add(mode, chat_id, game, uid, text):
+    """A title typed during the add loop: resolve, add to the LIBRARY for real,
+    then gate tonight's eligibility on the filter (deterministic) and explain."""
+    sel = game["selection"].get(str(uid))
+    if not sel:
+        return
+    title = text.strip()
+    info = lookup_film_cached(title)
+    if not info.get("found"):
+        send_message(mode, chat_id, f"Couldn't find “{title}” — try another title, "
+                                    "or tap Play with these.")
+        return
+    slug = info.get("slug") or _slugify(info.get("title") or title)
+    existed = get_film(chat_id, uid, slug) is not None
+    item, _ = add_to_library(chat_id, uid, info["title"], info.get("year"))   # real entry
+    name, who = item["title"], mention_for(chat_id, uid)
+    reason = _filter_reason(item, game["filter"])
+    if reason is None:
+        if not any(s["slug"] == slug for s in sel["slots"]):
+            sel["slots"].append({"slug": slug, "title": name})
+        if slug not in sel["shown"]:
+            sel["shown"].append(slug)
+        verb = "already had" if existed else "added"
+        if len(sel["slots"]) >= 3:
+            sel["locked"] = True
+            sel["awaiting_add"] = False
+            put_game(game)
+            send_message(mode, chat_id, f"{verb} “{name}” — that fits ✅. {who}'s three are set!")
+            _advance_player(mode, chat_id, game)
+            return
+        send_message(mode, chat_id, f"{verb} “{name}” — that fits ✅.")
+        _post_short_pool(mode, chat_id, game, uid)
+    else:
+        send_message(mode, chat_id, f"Added “{name}” to your library, but {reason} — "
+                                    "it can't play tonight.")
+        _post_short_pool(mode, chat_id, game, uid)
+
+
 def _ask_player(mode, chat_id, game):
     """Ask ONE player (the current one) to keep/swap their 3 drawn films in a
-    single message; they reply with three emojis in order."""
+    single message; they reply with three emojis in order. If the filter trims
+    them below 3, offer the short-pool buttons instead of a silent short deal."""
     uid = _current_selecting_uid(game)
     if uid is None:
         _begin_veto(mode, chat_id, game)
         return
     picks = _draw_eligible(chat_id, uid, game, 3, set())
     sel = {"slots": [{"slug": f["slug"], "title": f["title"]} for f in picks],
-           "shown": [f["slug"] for f in picks], "locked": False}
+           "shown": [f["slug"] for f in picks], "locked": False, "awaiting_add": False}
     game["selection"][str(uid)] = sel
+    if len(picks) >= 3:
+        _post_player_slate(mode, chat_id, game, uid)
+        put_game(game)
+        return
+    if _filter_active(game["filter"]):
+        # the filter (not a tiny library) trimmed them below 3 — short-pool prompt
+        sel["short_pool"] = True
+        _post_short_pool(mode, chat_id, game, uid)   # persists the game
+        return
     if not picks:
-        lib_total = len([x for x in get_library(chat_id, uid) if not x.get("watched")])
-        if lib_total and _filter_active(game["filter"]):
-            send_message(mode, chat_id, f"{mention_for(chat_id, uid)} has no films matching "
-                                        "tonight's filter — skipping.")
-        else:
-            send_message(mode, chat_id, f"{mention_for(chat_id, uid)} has no films to add — skipping.")
+        send_message(mode, chat_id, f"{mention_for(chat_id, uid)} has no films to add — skipping.")
         sel["locked"] = True
         _advance_player(mode, chat_id, game)
         return
-    _post_player_slate(mode, chat_id, game, uid)
+    _post_player_slate(mode, chat_id, game, uid)   # no filter, small library: deal what's there
     put_game(game)
 
 
@@ -2045,11 +2164,15 @@ def on_message(mode, ev):
         if text:
             _handle_constraints_message(mode, chat_id, game, text)
         return
-    # Selection: only the CURRENT player's keep/swap reply matters; ignore others.
+    # Selection: only the CURRENT player's reply matters; ignore others.
     if game and game.get("phase") == "SELECTING":
         cur = _current_selecting_uid(game)
         if cur is not None and uid is not None and int(uid) == int(cur) and text:
-            _handle_selection_reply(mode, chat_id, game, int(uid), text)
+            sel = game["selection"].get(str(cur), {})
+            if sel.get("awaiting_add"):
+                _handle_short_pool_add(mode, chat_id, game, int(cur), text)
+            else:
+                _handle_selection_reply(mode, chat_id, game, int(cur), text)
         return
     if not text:
         return

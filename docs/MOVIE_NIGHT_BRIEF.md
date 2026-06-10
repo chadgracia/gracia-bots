@@ -160,6 +160,24 @@ The implemented flow (supersedes the per-card/"post all cards" sketch below):
 *(Historical sketch — no longer accurate: the bot posts one card per film with 👍/👎 reactions and
 "posts all cards before waiting." Replaced by the sequential single-message flow above.)*
 
+**Short-pool prompt (when the constraint filter leaves a player < 3).** Instead of silently
+dealing fewer films, if a player's *filtered* eligible set is < 3 the bot names the active filter
+in plain words, lists what qualifies, and offers **inline buttons** (callbacks, not emoji — to
+dodge the emoji-parse fragility): **[▶️ Play with these (N)] [➕ Add a film]** (0 eligible → **[🙅 Sit
+this round out] [➕ Add a film]**, since a player can still participate with their veto).
+- *Play with these* → lock the available films (or sit out, if none) and advance.
+- *Add a film* → "send a film title that fits"; the player's next message is resolved via the
+  TMDB resolver and **added to their library for real** (persists beyond tonight, attributed to
+  them). Then a deterministic filter check (`_filter_reason`, comparing resolved genre/runtime/year
+  to the locked constraints — never the LLM's judgment):
+  - **passes** → added to tonight's eligible set; "added — that fits ✅"; re-show the buttons with
+    the new count. Reaching 3 locks the player and proceeds.
+  - **fails** → still kept in the library, but the bot says *specifically why* it can't play
+    tonight (e.g. "it's ~139 min, over tonight's 130-min limit") and re-shows the buttons.
+  Duplicate titles aren't double-added. Consistent with the rest of the game, this waits on a
+  button tap — no auto-advance on silence. (`_post_short_pool` / `_handle_short_pool_callback` /
+  `_handle_short_pool_add`.)
+
 ### Phase 4 — Lock
 - `/lock` (host) or once everyone has confirmed: drop all `👎` films, optionally backfill from
   libraries to keep ~3 each, build `pool`, post the final list, ask for `go`.
