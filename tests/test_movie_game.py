@@ -350,6 +350,44 @@ def test_soft_prompt_once_then_restarts():
     assert L.get_game(CHAT)["session_id"] != s1
 
 
+def test_rating_poll_post_vote_change_retract():
+    _reset()
+    res = L._post_rating_poll(MODE, CHAT, "Star Wars", "1977", film_id=11)
+    pid, sid = res["poll_id"], res["session_id"]
+    rp = L.get_rating_poll(pid)
+    assert rp and rp["chat_id"] == CHAT and rp["film_title"] == "Star Wars" and rp["year"] == "1977"
+    pk = L._pk(MODE, CHAT)
+    # user 1 taps ⭐⭐⭐⭐ (option index 3 -> 4 stars)
+    L.on_poll_answer(MODE, poll_answer(1, pid, [3]))
+    r = STORE[(pk, f"rating#{sid}#1")]
+    assert r["stars"] == 4 and r["film_title"] == "Star Wars" and r["user_id"] == 1
+    # change vote to ⭐⭐ (index 1 -> 2 stars) — last write wins
+    L.on_poll_answer(MODE, poll_answer(1, pid, [1]))
+    assert STORE[(pk, f"rating#{sid}#1")]["stars"] == 2
+    # retract -> rating removed
+    L.on_poll_answer(MODE, poll_answer(1, pid, []))
+    assert (pk, f"rating#{sid}#1") not in STORE
+
+
+def test_poll_film_tool_resolves_and_registers():
+    _reset()
+    ctx = {"chat_id": CHAT, "user_id": 1, "user_name": "U1", "mode": MODE, "suppress_reply": False}
+    out = L._dispatch_tool("poll_film", {"title": "Star Wars"}, ctx)
+    assert out["polled"] and out["title"] == "Star Wars"
+    polls = [v for (p, _s), v in STORE.items() if p == "ratingpoll"]
+    assert len(polls) == 1 and polls[0]["film_title"] == "Star Wars"
+
+
+def test_rating_vote_does_not_disturb_veto_poll():
+    # a veto-phase poll vote still routes to the veto logic (no ratingpoll item)
+    game = _two_player_game_to_veto()
+    pid = game["current"]["poll_id"]
+    assert L.get_rating_poll(pid) is None
+    L.handle_movie(MODE, poll_answer(1, pid, [0]))   # veto
+    assert L.get_game(CHAT)["current"]["film"]["slug"] != game["current"]["film"]["slug"] \
+        or L.get_game(CHAT)["vetoes_remaining"]["1"] == 0
+
+
 def test_parse_update_kinds():
     assert L.parse_update({"message": {"chat": {"id": 5}, "from": {"id": 9},
                                        "text": "hi"}})["kind"] == "message"

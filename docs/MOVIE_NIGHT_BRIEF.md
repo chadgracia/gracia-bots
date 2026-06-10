@@ -182,6 +182,22 @@ The implemented flow (supersedes the per-card/"post all cards" sketch below):
   trivia, legacy — never plot/endings). The LLM may write this note; it must not pick the winner.
 - Write `history#{session_id}` (winner, date, participants, empty ratings). Clear `game#current`.
 
+### Rating polls (native, non-anonymous 5★) — CURRENT
+Used both on-demand and (later) for the morning-after poll. All deterministic — no LLM.
+- **On-demand:** "poll Star Wars" / "let's rate Dune" → `poll_film` tool resolves the film (shows
+  the year) and posts the poll. In addition to any auto morning-after poll.
+- **Poll:** `sendPoll(question="Rate {Title} ({year})", options=["⭐","⭐⭐","⭐⭐⭐","⭐⭐⭐⭐","⭐⭐⭐⭐⭐"],
+  is_anonymous=False, type="regular", allows_multiple_answers=False)`. **`is_anonymous=False` is
+  mandatory** — anonymous polls give only aggregate counts, no per-user data. Stars = `option_id + 1`.
+- **Lookup item** (poll_answer has no chat_id): `PK="ratingpoll", SK="{poll_id}"` →
+  `{chat_id, session_id, film_id, film_title, year, participant_user_ids}`.
+- **Per-user rating:** `PK="movie#{chat_id}", SK="rating#{session_id}#{user_id}"` →
+  `{user_id, name, film_id, film_title, year, stars, rated_at}`. `poll_answer` upserts (last write
+  wins); an empty `option_ids` (retraction) deletes the row. On-demand polls use a synthetic
+  `session_id = "adhoc-{poll_id}"`.
+- **Webhook:** `allowed_updates` MUST include `poll_answer` (it replaces the default set, so list
+  every type the bot needs) — otherwise votes never arrive. Re-run `tools/setup_webhooks.py set`.
+
 ---
 
 ## 4. Telegram / Lambda hard requirements (this is where the old setup failed)
