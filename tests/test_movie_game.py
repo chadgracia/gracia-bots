@@ -196,13 +196,10 @@ def _two_player_game_to_veto():
     L.start_game(MODE, CHAT, 1)             # initiator 1 auto-joins
     L.handle_movie(MODE, cb(2, "join"))     # player 2 joins
     L.handle_movie(MODE, cb(1, "start"))    # -> CONSTRAINTS window
-    L.handle_movie(MODE, message(1, "go"))  # no constraints -> SELECTING
-    game = L.get_game(CHAT)
-    assert game["phase"] == "SELECTING"
-    for uid in (1, 2):
-        for mid in cards_for(game, uid):
-            L.handle_movie(MODE, reaction(uid, mid, "👍"))
-            game = L.get_game(CHAT)
+    L.handle_movie(MODE, message(1, "go"))  # no constraints -> SELECTING (asks player 1)
+    assert L.get_game(CHAT)["phase"] == "SELECTING"
+    L.handle_movie(MODE, message(1, "👍"))  # player 1 keeps (1 film) -> next player
+    L.handle_movie(MODE, message(2, "👍"))  # player 2 keeps -> VETO
     return L.get_game(CHAT)
 
 
@@ -263,23 +260,48 @@ def test_backstop_resolves_after_90s_on_any_update():
     assert L.get_game(CHAT) is None           # winner declared, game cleared
 
 
-def test_thumbs_down_replaces_card():
+def test_thumbs_down_swaps_a_slot_and_reasks():
     _reset()
     for t in ["A", "B", "C", "D"]:
         L.add_to_library(CHAT, 1, t)
     L.start_game(MODE, CHAT, 1)
     L.handle_movie(MODE, cb(1, "start"))
-    L.handle_movie(MODE, message(1, "go"))   # close constraints -> SELECTING
-    game = L.get_game(CHAT)
-    sel = game["selection"]["1"]
-    assert len(sel["slots"]) == 3 and len(sel["shown"]) == 3
-    mid = cards_for(game, 1)[0]
-    slot0_before = sel["slots"][0]["slug"]
-    L.handle_movie(MODE, reaction(1, mid, "👎"))
+    L.handle_movie(MODE, message(1, "go"))      # -> SELECTING, player 1 asked
     sel = L.get_game(CHAT)["selection"]["1"]
-    assert len(sel["shown"]) == 4
+    assert len(sel["slots"]) == 3 and len(sel["shown"]) == 3
+    slot0_before = sel["slots"][0]["slug"]
+    L.handle_movie(MODE, message(1, "👎👍👍"))  # swap slot 1, keep the rest
+    sel = L.get_game(CHAT)["selection"]["1"]
+    assert len(sel["shown"]) == 4               # a 4th film was drawn in
     assert sel["slots"][0]["slug"] != slot0_before
-    assert sel["slots"][0]["state"] == "pending"
+    assert L.get_game(CHAT)["phase"] == "SELECTING"   # re-asked, not locked yet
+    L.handle_movie(MODE, message(1, "👍👍👍"))  # now keep all -> locks
+    assert L.get_game(CHAT)["selection"]["1"]["locked"] is True
+
+
+def test_selection_is_sequential_one_player_at_a_time():
+    _reset()
+    for t in ["A1", "A2", "A3", "A4"]:
+        L.add_to_library(CHAT, 1, t)
+    for t in ["B1", "B2", "B3", "B4"]:
+        L.add_to_library(CHAT, 2, t)
+    L.start_game(MODE, CHAT, 1)
+    L.handle_movie(MODE, cb(2, "join"))
+    L.handle_movie(MODE, cb(1, "start"))
+    L.handle_movie(MODE, message(1, "go"))           # -> SELECTING, player 1 first
+    g = L.get_game(CHAT)
+    assert g["sel_idx"] == 0 and L._current_selecting_uid(g) == 1
+    # a reply from player 2 (not their turn yet) is ignored
+    L.handle_movie(MODE, message(2, "👍👍👍"))
+    g = L.get_game(CHAT)
+    assert g["sel_idx"] == 0 and not g["selection"].get("2", {}).get("locked")
+    # player 1 keeps -> advance to player 2
+    L.handle_movie(MODE, message(1, "👍👍👍"))
+    g = L.get_game(CHAT)
+    assert g["selection"]["1"]["locked"] and L._current_selecting_uid(g) == 2
+    # player 2 keeps -> VETO
+    L.handle_movie(MODE, message(2, "👍👍👍"))
+    assert L.get_game(CHAT)["phase"] == "VETO"
 
 
 def test_parse_update_kinds():
