@@ -1605,7 +1605,66 @@ def _present_candidate(mode, chat_id, game):
         put_poll_map(poll_id, chat_id, cand)
 
 
+# ---- rating polls (on-demand "poll <film>" + future morning-after) -------- #
+# A native, NON-ANONYMOUS 5★ poll. is_anonymous=False is mandatory — anonymous
+# polls give only aggregate counts, no per-user data. Stars = option_id + 1.
+# Votes resolve via a global ratingpoll#{poll_id} lookup (poll_answer carries no
+# chat_id) and are saved per (session, user) so recommendations can read them.
+_STAR_OPTIONS = ["⭐", "⭐⭐", "⭐⭐⭐", "⭐⭐⭐⭐", "⭐⭐⭐⭐⭐"]
+
+
+def get_rating_poll(poll_id):
+    return ddb_get("ratingpoll", str(poll_id)) if poll_id else None
+
+
+def _post_rating_poll(mode, chat_id, title, year, film_id=None,
+                      session_id=None, participant_ids=None):
+    """Post a 5★ rating poll for a film; register the lookup so votes resolve."""
+    yr = str(year or "")
+    label = f"{title} ({yr})" if yr else title
+    pings = " ".join(mention_for(chat_id, p) for p in (participant_ids or []))
+    if pings:
+        send_message(mode, chat_id, f"{pings} — how was {label}? Rate it below:")
+    resp = send_poll(mode, chat_id, f"Rate {label}", _STAR_OPTIONS,
+                     is_anonymous=False, allows_multiple_answers=False, type="regular")
+    result = resp.get("result") or {}
+    poll_id = (result.get("poll") or {}).get("id")
+    if not poll_id:
+        log.error("rating poll for %r failed: %s", label, resp.get("description"))
+        return {}
+    sid = session_id or f"adhoc-{poll_id}"
+    ddb_put({"PK": "ratingpoll", "SK": str(poll_id), "chat_id": int(chat_id),
+             "session_id": sid, "film_id": film_id, "film_title": title,
+             "year": yr, "participant_user_ids": [int(p) for p in (participant_ids or [])],
+             "posted_at": _now_iso()})
+    return {"poll_id": poll_id, "message_id": result.get("message_id"), "session_id": sid}
+
+
+def _handle_rating_vote(mode, rp, ev):
+    """A vote on a rating poll: upsert (last write wins) or, on retraction, delete."""
+    uid = ev.get("user_id")
+    if uid is None:
+        return
+    pk = _pk("movie", rp["chat_id"])
+    sk = f"rating#{rp['session_id']}#{uid}"
+    opts = ev.get("poll_option_ids") or []
+    if not opts:                       # vote retracted
+        ddb_delete(pk, sk)
+        return
+    stars = int(opts[0]) + 1           # option index 0..4 -> 1..5 stars
+    ddb_put({"PK": pk, "SK": sk, "user_id": int(uid), "name": ev.get("user_name"),
+             "username": ev.get("username"), "film_id": rp.get("film_id"),
+             "film_title": rp.get("film_title"), "year": rp.get("year"),
+             "stars": stars, "rated_at": _now_iso()})
+
+
 def on_poll_answer(mode, ev):
+    # Rating poll? (on-demand "poll <film>", or the morning-after poll.) Resolve by
+    # poll_id and record the per-user stars — this is not a game/veto vote.
+    rp = get_rating_poll(ev.get("poll_id"))
+    if rp:
+        _handle_rating_vote(mode, rp, ev)
+        return
     chat_id = ev["chat_id"]
     game = get_game(chat_id)
     if not game or game.get("phase") != "VETO":
@@ -1763,6 +1822,12 @@ MOVIE_TOOLS = [
     {"toolSpec": {"name": "cancel_game",
                   "description": "Cancel/end the current movie-night game in this chat.",
                   "inputSchema": {"json": {"type": "object", "properties": {}}}}},
+    {"toolSpec": {"name": "poll_film",
+                  "description": "Post a 5★ rating poll so the group can rate a film, e.g. 'poll Star Wars' / 'let's rate Dune'. Resolves the film (shows the year) and logs each person's stars. Pass year separately if the user gives one.",
+                  "inputSchema": {"json": {"type": "object",
+                                           "properties": {"title": {"type": "string"},
+                                                          "year": {"type": "integer"}},
+                                           "required": ["title"]}}}},
     {"toolSpec": {"name": "seed_starter_libraries",
                   "description": "Load the bundled starter libraries (Chad, Alberto, Asa, Anya, …) into this chat so people can claim them. Use when asked to 'load/seed the starter libraries'.",
                   "inputSchema": {"json": {"type": "object", "properties": {}}}}},
@@ -1790,6 +1855,8 @@ MOVIE_SYSTEM = (
     "add_director. NEVER ask which version unless resolved=false.\n"
     "LOOK UP ('what's X rated', 'tell me about X'): call lookup_film and answer with the "
     "rating + a one-line synopsis; offer to add it.\n"
+    "POLL ('poll <film>', 'let's rate <film>', 'poll Star Wars'): call poll_film with the "
+    "title (year separately if given). The bot posts a 5★ poll and logs the votes.\n"
     "CONFIRM: if you just offered a film and the user says yes/add it, call add_to_library "
     "for it.\n"
     "NEVER mention a 'database' or internal storage, and NEVER invent ratings or details "
@@ -1879,6 +1946,12 @@ def _dispatch_tool(name, tool_input, ctx):
             send_message(mode, chat_id, "No movie night is running.")
         ctx["suppress_reply"] = True
         return {"cancelled": True}
+    if name == "poll_film":
+        info = lookup_film_cached(tool_input["title"], tool_input.get("year"))
+        title = info.get("title") or tool_input["title"]
+        _post_rating_poll(mode, chat_id, title, info.get("year"), film_id=info.get("tmdb_id"))
+        ctx["suppress_reply"] = True   # the poll itself is the output
+        return {"polled": True, "title": title, "year": info.get("year")}
     if name == "seed_starter_libraries":
         written = seed_starter_libraries(chat_id)
         return {"seeded": written, "names": list(_STARTER_LIBRARIES.keys())}
@@ -2101,9 +2174,10 @@ def lambda_handler(event, context):
         ev = parse_update(update)
         chat_id = ev.get("chat_id")
 
-        # poll / poll_answer updates carry no chat — resolve via the global poll map.
-        if chat_id is None and ev.get("poll_id"):
-            ref = get_poll_map(ev["poll_id"]) if mode == "movie" else None
+        # poll / poll_answer updates carry no chat — resolve via the veto poll map
+        # or the rating-poll lookup.
+        if chat_id is None and ev.get("poll_id") and mode == "movie":
+            ref = get_poll_map(ev["poll_id"]) or get_rating_poll(ev["poll_id"])
             if ref:
                 chat_id = ref.get("chat_id")
         if chat_id is None:
