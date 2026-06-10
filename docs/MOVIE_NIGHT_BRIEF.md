@@ -124,18 +124,24 @@ silent the window doesn't advance until someone speaks; the host can always say 
   The seed data has "previously vetoed" notes, so this is a real choice. I'd exclude watched and
   allow (not exclude) previously vetoed. Confirm.
 
-### Phase 3 — Confirmation
-- For each participant, the bot posts **one card** with their 3 films, each enriched via
-  `lookup_film` (Letterboxd rating + TMDB metadata, per the existing tool contract). Post all cards
-  before waiting. @mention the player on their card.
-- The player **replies to their own card** (privacy mode delivers replies to the bot) to keep/swap:
-  - Keep all: reply `/confirm`, or `👍`, or just don't change anything before lock.
-  - Swap: `/swap <n>` (replace film n with another `random.sample` from their library not already
-    shown), or reply with one emoji per film in order (`👍`/`👎`, `✅`/`❌`, `y`/`n`) — parsed **in
-    code**, deterministically, left to right. Count mismatch → ask them to resubmit.
-- Store each card's `message_id` in `message_index` so the reply router knows whose card it is.
-- Mentioning people: prefer `@username`; if a user has no username, use a `text_mention` entity with
-  their `user_id` so the ping still works.
+### Phase 3 — Confirmation (sequential, one person at a time — CURRENT design)
+The implemented flow (supersedes the per-card/"post all cards" sketch below):
+- The bot confirms **one player at a time**, in roster order (`sel_order` / `sel_idx` on the
+  session). It does **not** post everyone's cards at once.
+- For the current player it sends **a single message** listing their drawn films (each with the
+  Phase-2 metadata — title, year, genre, runtime, ★ rating) and the framing line: *"I picked these
+  three from your library — are these what you want to share with the group tonight, or should we
+  swap some?"*
+- The player replies with **emojis in order, one per film** — `👍` keep / `👎` swap — parsed **in
+  code** (`_parse_confirm_tokens`, deterministic). A single `👍` (or `yes`) keeps all.
+  - Any `👎` → that slot is swapped for another **eligible** film (`_draw_eligible`, filter-aware)
+    and the updated slate is re-posted to the same player.
+  - All `👍` → that player is **locked** and the bot moves to the next person.
+  - Wrong number of marks → ask them to resend N marks.
+- When every player is locked → Phase 4/5 (veto). Mentioning prefers `@username`.
+
+*(Historical sketch — no longer accurate: the bot posts one card per film with 👍/👎 reactions and
+"posts all cards before waiting." Replaced by the sequential single-message flow above.)*
 
 ### Phase 4 — Lock
 - `/lock` (host) or once everyone has confirmed: drop all `👎` films, optionally backfill from

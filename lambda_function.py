@@ -1066,9 +1066,7 @@ def on_callback(mode, ev):
             return
         _begin_constraints(mode, chat_id, game)
         return
-    if data in ("up", "down") and game["phase"] == "SELECTING":
-        _handle_thumb(mode, chat_id, game, uid, mid, up=(data == "up"))
-        return
+    # (selection is reply-driven now — no per-card buttons)
 
 
 # ---- constraints (Phase 1.5, optional) ------------------------------------ #
@@ -1200,18 +1198,40 @@ def _constraints_backstop(mode, chat_id, game):
 
 
 # ---- selection ------------------------------------------------------------ #
+_KEEP_TOKENS = {"👍", "✅", "👌", "y", "yes", "keep", "ok"}
+_SWAP_TOKENS = {"👎", "❌", "n", "no", "swap", "drop"}
+
+
+def _parse_confirm_tokens(text):
+    """'👍 👎 👍' / '👍👎👍' / 'y n y' -> ([True,False,True], keep_all). keep_all is
+    True for a single affirmative ('👍'/'yes'), meaning keep everything. Unknown
+    tokens are ignored; parsing is deterministic (code, not the LLM)."""
+    t = (text or "").strip().lower()
+    parts = t.split()
+    if len(parts) <= 1 and t and not t.isascii():
+        parts = list(t)            # a run of emoji with no spaces, e.g. 👍👎👍
+    toks = []
+    for p in parts:
+        p = p.strip(".,!")
+        if p in _KEEP_TOKENS:
+            toks.append(True)
+        elif p in _SWAP_TOKENS:
+            toks.append(False)
+    keep_all = len(toks) == 1 and toks[0] is True
+    return toks, keep_all
+
+
 def _begin_selection(mode, chat_id, game):
     game["phase"] = "SELECTING"
     game["selection"] = {}
-    game["cards"] = {}
+    game["sel_order"] = [int(p) for p in game["players"]]
+    game["sel_idx"] = 0
+    game["sel_msg_id"] = None
     put_game(game)
     send_message(mode, chat_id,
-                 "🎲 Drawing 3 films from each player's library. "
-                 "React 👍 to keep a card or 👎 to swap it. Three 👍 locks you in.")
-    for uid in list(game["players"]):
-        _start_player_selection(mode, chat_id, game, uid)
-    put_game(game)
-    _maybe_finish_selection(mode, chat_id, game)
+                 "🎬 Building tonight's slate — one person at a time. I'll show each of "
+                 "you three films from your library to keep or swap.")
+    _ask_player(mode, chat_id, game)
 
 
 def _enrich_item(chat_id, item):
@@ -1271,69 +1291,98 @@ def _draw_eligible(chat_id, uid, game, n, exclude_slugs):
     return chosen
 
 
-def _start_player_selection(mode, chat_id, game, uid):
-    sel = {"slots": [], "shown": [], "locked": False}
-    game["selection"][str(uid)] = sel
+def _current_selecting_uid(game):
+    order = game.get("sel_order") or []
+    idx = game.get("sel_idx", 0)
+    return order[idx] if idx < len(order) else None
+
+
+def _ask_player(mode, chat_id, game):
+    """Ask ONE player (the current one) to keep/swap their 3 drawn films in a
+    single message; they reply with three emojis in order."""
+    uid = _current_selecting_uid(game)
+    if uid is None:
+        _begin_veto(mode, chat_id, game)
+        return
     picks = _draw_eligible(chat_id, uid, game, 3, set())
-    lib_total = len([x for x in get_library(chat_id, uid) if not x.get("watched")])
-    for f in picks:
-        sel["shown"].append(f["slug"])
-        slot = len(sel["slots"])
-        sel["slots"].append({"slug": f["slug"], "title": f["title"], "state": "pending"})
-        _post_selection_card(mode, chat_id, game, uid, slot)
+    sel = {"slots": [{"slug": f["slug"], "title": f["title"]} for f in picks],
+           "shown": [f["slug"] for f in picks], "locked": False}
+    game["selection"][str(uid)] = sel
     if not picks:
-        sel["locked"] = True  # nothing to contribute (empty lib, or none fit the filter)
+        lib_total = len([x for x in get_library(chat_id, uid) if not x.get("watched")])
         if lib_total and _filter_active(game["filter"]):
-            send_message(mode, chat_id,
-                         f"{mention_for(chat_id, uid)} has no films matching tonight's filter.")
-    elif len(picks) < 3 and _filter_active(game["filter"]):
-        send_message(mode, chat_id,
-                     f"(Only {len(picks)} of {mention_for(chat_id, uid)}'s films fit the filter.)")
-
-
-def _post_selection_card(mode, chat_id, game, uid, slot):
-    sel = game["selection"][str(uid)]
-    item = get_film(chat_id, uid, sel["slots"][slot]["slug"])
-    text = f"{mention_for(chat_id, uid)} — pick {slot + 1}:\n\n{_film_card(item)}"
-    resp = send_message(mode, chat_id, text, reply_markup=_thumb_keyboard())
-    mid = (resp.get("result") or {}).get("message_id")
-    if mid is not None:
-        game["cards"][str(mid)] = {"uid": str(uid), "slot": slot}
-
-
-def _handle_thumb(mode, chat_id, game, uid, message_id, up):
-    card = game["cards"].get(str(message_id))
-    if not card or str(uid) != str(card["uid"]):
-        return  # only the card's owner controls it
-    sel = game["selection"][card["uid"]]
-    slot = card["slot"]
-    if up:
-        sel["slots"][slot]["state"] = "locked"
-        if sel["slots"] and all(s["state"] == "locked" for s in sel["slots"]):
-            sel["locked"] = True
-        put_game(game)
-        _maybe_finish_selection(mode, chat_id, game)
+            send_message(mode, chat_id, f"{mention_for(chat_id, uid)} has no films matching "
+                                        "tonight's filter — skipping.")
+        else:
+            send_message(mode, chat_id, f"{mention_for(chat_id, uid)} has no films to add — skipping.")
+        sel["locked"] = True
+        _advance_player(mode, chat_id, game)
         return
-    # thumbs-down: swap for another unshown ELIGIBLE film from THIS library
-    repl = _draw_eligible(chat_id, int(card["uid"]), game, 1, set(sel["shown"]))
-    if not repl:
-        send_message(mode, chat_id,
-                     f"{mention_for(chat_id, int(card['uid']))}, no more eligible films to "
-                     "swap in — react 👍 to keep this one.")
-        return
-    nf = repl[0]
-    sel["shown"].append(nf["slug"])
-    sel["slots"][slot] = {"slug": nf["slug"], "title": nf["title"], "state": "pending"}
-    del game["cards"][str(message_id)]
-    _post_selection_card(mode, chat_id, game, int(card["uid"]), slot)
+    _post_player_slate(mode, chat_id, game, uid)
     put_game(game)
 
 
-def _maybe_finish_selection(mode, chat_id, game):
-    if not game["players"]:
+def _post_player_slate(mode, chat_id, game, uid):
+    sel = game["selection"][str(uid)]
+    n = len(sel["slots"])
+    lines = []
+    for i, slot in enumerate(sel["slots"], 1):
+        item = get_film(chat_id, uid, slot["slug"])
+        lines.append(f"{i}. {_film_card(item) if item else slot['title']}")
+    text = (f"🎬 {mention_for(chat_id, uid)} — I picked these {n} from your library. "
+            "Are these what you want to share with the group tonight, or should we swap "
+            "some?\n\n" + "\n\n".join(lines) +
+            f"\n\nReply with {n} emoji in order — 👍 keep / 👎 swap (e.g. {'👍' * n}).")
+    resp = send_message(mode, chat_id, text)
+    game["sel_msg_id"] = (resp.get("result") or {}).get("message_id")
+
+
+def _advance_player(mode, chat_id, game):
+    game["sel_idx"] = game.get("sel_idx", 0) + 1
+    put_game(game)
+    _ask_player(mode, chat_id, game)
+
+
+def _handle_selection_reply(mode, chat_id, game, uid, text):
+    """The current player's keep/swap reply. All 👍 (or a single 👍) locks them and
+    moves to the next person; any 👎 swaps that slot for another eligible film and
+    re-asks the same person."""
+    sel = game["selection"].get(str(uid))
+    if not sel or sel.get("locked"):
         return
-    if all(game["selection"].get(str(p), {}).get("locked") for p in game["players"]):
-        _begin_veto(mode, chat_id, game)
+    toks, keep_all = _parse_confirm_tokens(text)
+    n = len(sel["slots"])
+    if keep_all or (toks and len(toks) == n and all(toks)):
+        sel["locked"] = True
+        put_game(game)
+        send_message(mode, chat_id, f"Locked in {mention_for(chat_id, uid)}'s picks ✅")
+        _advance_player(mode, chat_id, game)
+        return
+    if not toks:
+        return  # not a keep/swap reply — ignore ambient chatter during this phase
+    if len(toks) != n:
+        send_message(mode, chat_id,
+                     f"Send {n} marks in order — 👍 keep / 👎 swap (e.g. {'👍' * n}).")
+        return
+    swapped = 0
+    for i, keep in enumerate(toks):
+        if keep:
+            continue
+        repl = _draw_eligible(chat_id, uid, game, 1, set(sel["shown"]))
+        if not repl:
+            continue
+        nf = repl[0]
+        sel["slots"][i] = {"slug": nf["slug"], "title": nf["title"]}
+        sel["shown"].append(nf["slug"])
+        swapped += 1
+    put_game(game)
+    if swapped == 0:
+        send_message(mode, chat_id,
+                     f"{mention_for(chat_id, uid)}, nothing left to swap in — "
+                     f"reply {'👍' * n} to keep these.")
+        return
+    _post_player_slate(mode, chat_id, game, uid)
+    put_game(game)
 
 
 # ---- veto ----------------------------------------------------------------- #
@@ -1395,9 +1444,11 @@ def _eligible_pool(chat_id, game):
 def _begin_veto(mode, chat_id, game):
     pool_all = []
     for uid in game["players"]:
-        for s in game["selection"].get(str(uid), {}).get("slots", []):
-            if s["state"] == "locked":
-                pool_all.append({"owner": str(uid), "slug": s["slug"], "title": s["title"]})
+        sel = game["selection"].get(str(uid), {})
+        if not sel.get("locked"):
+            continue
+        for s in sel.get("slots", []):
+            pool_all.append({"owner": str(uid), "slug": s["slug"], "title": s["title"]})
     game["phase"] = "VETO"
     game["pool_all"] = pool_all
     game["current"] = None
@@ -1838,6 +1889,12 @@ def on_message(mode, ev):
         if text:
             _handle_constraints_message(mode, chat_id, game, text)
         return
+    # Selection: only the CURRENT player's keep/swap reply matters; ignore others.
+    if game and game.get("phase") == "SELECTING":
+        cur = _current_selecting_uid(game)
+        if cur is not None and uid is not None and int(uid) == int(cur) and text:
+            _handle_selection_reply(mode, chat_id, game, int(uid), text)
+        return
     if not text:
         return
     # Confirm -> save: a bare affirmative binds to the pending film (deterministic,
@@ -1882,19 +1939,8 @@ def handle_movie(mode, ev):
 
 
 def _on_reaction(mode, ev):
-    chat_id, uid = ev["chat_id"], ev.get("user_id")
-    game = get_game(chat_id)
-    if not game:
-        return
-    if _veto_backstop(mode, chat_id, game):
-        return
-    if game.get("phase") != "SELECTING":
-        return
-    emojis = ev.get("reactions") or []
-    if "👎" in emojis:
-        _handle_thumb(mode, chat_id, game, uid, ev.get("message_id"), up=False)
-    elif "👍" in emojis:
-        _handle_thumb(mode, chat_id, game, uid, ev.get("message_id"), up=True)
+    # Selection is reply-driven now; reactions only nudge the veto backstop.
+    _veto_backstop(mode, ev["chat_id"], get_game(ev["chat_id"]))
 
 
 # --------------------------------------------------------------------------- #
