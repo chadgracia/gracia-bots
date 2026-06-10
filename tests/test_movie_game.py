@@ -388,6 +388,77 @@ def test_rating_vote_does_not_disturb_veto_poll():
         or L.get_game(CHAT)["vetoes_remaining"]["1"] == 0
 
 
+def _short_pool_setup(genres):
+    """Player 1, filter 'no horror', a library of films with the given genres
+    (1980, 100min). Returns the game after _ask_player runs."""
+    _reset()
+    pk = L._pk(MODE, CHAT)
+    for i, g in enumerate(genres):
+        slug = f"f{i}"
+        STORE[(pk, f"lib#1#{slug}")] = {"PK": pk, "SK": f"lib#1#{slug}", "slug": slug,
+            "owner_id": 1, "title": f"Film{i}", "year": "1980", "genres": [g],
+            "runtime_min": 100, "watched": False}
+    game = L.new_game(CHAT, 1)
+    L._add_player(game, 1)
+    game["phase"] = "SELECTING"
+    game["status"] = "confirming"
+    game["sel_order"] = [1]
+    game["sel_idx"] = 0
+    game["selection"] = {}
+    game["filter"]["exclude_genres"] = ["horror"]
+    L.put_game(game)
+    L._ask_player(MODE, CHAT, game)
+    return L.get_game(CHAT)
+
+
+def test_short_pool_prompts_with_buttons_and_play_advances():
+    g = _short_pool_setup(["drama", "drama", "horror"])   # 2 qualify, horror trimmed
+    sel = g["selection"]["1"]
+    assert sel.get("short_pool") and not sel["locked"] and len(sel["slots"]) == 2
+    assert any("qualify" in t.lower() and "no horror" in t.lower() for t, _ in SENT)
+    L.handle_movie(MODE, cb(1, "sp_play"))                # accept the 2
+    assert L.get_game(CHAT)["phase"] == "VETO"            # 1 player locked -> veto
+
+
+def test_short_pool_add_qualifying_reaches_three():
+    _short_pool_setup(["drama", "drama", "horror"])
+    L.handle_movie(MODE, cb(1, "sp_add"))
+    assert L.get_game(CHAT)["selection"]["1"]["awaiting_add"] is True
+    L.handle_movie(MODE, message(1, "New Drama"))         # fake_lookup -> Drama, fits
+    g = L.get_game(CHAT)
+    assert g["phase"] == "VETO"                           # reached 3 -> locked + advanced
+    assert any(f["title"] == "New Drama" for f in L.get_library(CHAT, 1))   # persisted
+
+
+def test_short_pool_add_nonqualifying_persists_and_flags():
+    _short_pool_setup(["drama", "drama", "horror"])
+    L.handle_movie(MODE, cb(1, "sp_add"))
+    orig = L.lookup_film_cached
+    L.lookup_film_cached = lambda t, y=None: {
+        "found": True, "title": t, "slug": L._slugify(t), "year": "1980",
+        "genres": ["Horror"], "runtime_min": 100, "rating": 4.0, "rating_scale": 10,
+        "rt_rating": None, "tmdb_id": 2, "alts": []}
+    try:
+        L.handle_movie(MODE, message(1, "Scary Movie"))
+    finally:
+        L.lookup_film_cached = orig
+    g = L.get_game(CHAT)
+    sel = g["selection"]["1"]
+    assert g["phase"] == "SELECTING"                      # still this player
+    assert len(sel["slots"]) == 2 and sel["awaiting_add"] is False
+    assert any(f["title"] == "Scary Movie" for f in L.get_library(CHAT, 1))  # kept in library
+    assert any("horror" in t.lower() and "can't play" in t.lower() for t, _ in SENT)
+
+
+def test_short_pool_zero_eligible_can_sit_out():
+    g = _short_pool_setup(["horror", "horror"])           # nothing qualifies
+    sel = g["selection"]["1"]
+    assert sel.get("short_pool") and len(sel["slots"]) == 0
+    assert any("sit this round out" in t.lower() for t, _ in SENT)
+    L.handle_movie(MODE, cb(1, "sp_play"))                # sit out -> empty pool -> no winner
+    assert L.get_game(CHAT) is None
+
+
 def test_parse_update_kinds():
     assert L.parse_update({"message": {"chat": {"id": 5}, "from": {"id": 9},
                                        "text": "hi"}})["kind"] == "message"
