@@ -200,6 +200,26 @@ this round out] [➕ Add a film]**, since a player can still participate with th
   trivia, legacy — never plot/endings). The LLM may write this note; it must not pick the winner.
 - Write `history#{session_id}` (winner, date, participants, empty ratings). Clear `game#current`.
 
+### Library identity — one owner model, one resolver (CURRENT)
+Libraries are owned by an **owner_key**, never a display-name string, so the show-library and
+in-game-draw read paths can't diverge or mislabel:
+- **owner_key** = the owner's real Telegram **user_id** once they've claimed, else `seed:<key>`
+  for a seeded-but-unclaimed person (`key` = canonical slug, e.g. `asa`). Films live at
+  `lib#{owner_key}#{slug}`.
+- **One resolver** — `resolve_owner(chat_id, identifier)` → `(owner_key, canonical_name)` or
+  `(None, None)`. A user_id resolves to its own films; a name/@handle resolves via the alias map
+  (`_SEED_ALIASES`, e.g. Daria→dasha, @AsaFoxColorist→asa) + the `seedclaim#{key}` binding. It
+  **never falls back to the caller**. BOTH the draw and the show-library command then fetch with
+  the same `get_library(chat_id, owner_key)`.
+- **Show-library:** the LLM extracts the target name; code resolves it. Resolved → that owner's
+  films labeled with the resolved `canonical_name`; unresolved → "I don't know who X is yet"
+  (never the caller's library, never the requested label on someone else's data).
+- **Claim binds the user_id:** "I'm Asa" / "I'm Daria" → `claim_library` moves the seeded films to
+  the speaker's user_id and writes `seedclaim#{key} = {claimed_by, seed_name}`. One user_id per
+  name — a different claimant is refused ("already claimed"), not silently overwritten. After the
+  claim, both the name and that user_id resolve to the same library.
+- Aliases/handles are strings for lookup only; the durable binding is always the user_id.
+
 ### Rating polls (native, non-anonymous 5★) — CURRENT
 Used both on-demand and (later) for the morning-after poll. All deterministic — no LLM.
 - **On-demand:** "poll Star Wars" / "let's rate Dune" → `poll_film` tool resolves the film (shows

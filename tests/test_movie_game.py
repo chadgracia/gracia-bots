@@ -459,6 +459,63 @@ def test_short_pool_zero_eligible_can_sit_out():
     assert L.get_game(CHAT) is None
 
 
+def _seed_named(name, titles):
+    pk = L._pk(MODE, CHAT)
+    okey = f"seed:{name.lower()}"
+    for t in titles:
+        slug = L._slugify(t)
+        STORE[(pk, f"lib#{okey}#{slug}")] = {"PK": pk, "SK": f"lib#{okey}#{slug}",
+            "slug": slug, "owner_id": okey, "seed_name": name, "title": t,
+            "year": "1980", "watched": False}
+
+
+def _ctx(uid=1):
+    return {"chat_id": CHAT, "user_id": uid, "user_name": f"U{uid}", "mode": MODE,
+            "suppress_reply": False}
+
+
+def test_show_other_library_resolves_and_unknown_fails():
+    _reset()
+    _seed_named("Asa", ["A1", "A2", "A3", "A4", "A5", "A6"])
+    ok, canon = L.resolve_owner(CHAT, "Asa")
+    assert ok == "seed:asa" and canon == "Asa" and len(L.get_library(CHAT, ok)) == 6
+    out = L._dispatch_tool("list_library", {"whose": "Asa"}, _ctx())
+    assert out["resolved"] and out["owner"] == "Asa" and len(out["films"]) == 6
+    out2 = L._dispatch_tool("list_library", {"whose": "Ghost"}, _ctx())
+    assert out2["resolved"] is False and "films" not in out2
+
+
+def test_show_library_never_falls_back_to_caller():
+    _reset()
+    L.add_to_library(CHAT, 1, "Chad's Own Film")     # caller has a library
+    out = L._dispatch_tool("list_library", {"whose": "Asa"}, _ctx(1))   # Asa unknown
+    assert out["resolved"] is False and "films" not in out   # NOT the caller's library
+
+
+def test_dasha_daria_resolve_to_same_owner():
+    _reset()
+    _seed_named("Dasha", ["D1", "D2"])
+    a, _ = L.resolve_owner(CHAT, "Dasha")
+    b, _ = L.resolve_owner(CHAT, "Daria")
+    assert a == b == "seed:dasha"
+
+
+def test_claim_binds_uid_draw_and_show_agree():
+    _reset()
+    _seed_named("Asa", ["A1", "A2", "A3", "A4", "A5", "A6"])
+    assert L.claim_library(CHAT, "Asa", 7) == {"status": "ok", "moved": 6}
+    # name and user_id both resolve to the same owner
+    by_name, canon = L.resolve_owner(CHAT, "Asa")
+    by_uid, _ = L.resolve_owner(CHAT, 7)
+    assert by_name == "7" and by_uid == "7" and canon == "Asa"
+    # the draw's fetch (get_library by user_id) and the show fetch are identical
+    draw = {f["slug"] for f in L.get_library(CHAT, 7)}
+    show = {f["slug"] for f in L.get_library(CHAT, by_name)}
+    assert draw == show and len(draw) == 6
+    # a second user can't silently steal the name
+    assert L.claim_library(CHAT, "Asa", 8)["status"] == "taken"
+
+
 def test_parse_update_kinds():
     assert L.parse_update({"message": {"chat": {"id": 5}, "from": {"id": 9},
                                        "text": "hi"}})["kind"] == "message"
