@@ -203,6 +203,53 @@ def _two_player_game_to_veto():
     return L.get_game(CHAT)
 
 
+def _veto_setup(players, pool):
+    """Construct a game straight in the VETO phase. players: [uid] (each gets 1
+    veto). pool: [(owner_uid, slug, title)]. Presents the first candidate."""
+    _reset()
+    game = L.new_game(CHAT, players[0])
+    for p in players:
+        L._add_player(game, p)
+    game["phase"] = "VETO"
+    game["status"] = "picking"
+    entries = [{"owner": str(o), "slug": s, "title": t} for o, s, t in pool]
+    game["pool_all"] = list(entries)
+    game["pool"] = list(entries)
+    L.put_game(game)
+    if not L._present_candidate(MODE, CHAT, game):   # persist unless it short-circuited
+        L.put_game(game)
+    return L.get_game(CHAT)
+
+
+def test_owner_blocked_then_nonowner_veto_consumes_and_repicks():
+    game = _veto_setup([1, 2, 3], [(1, "a", "A"), (2, "b", "B"), (3, "c", "C")])
+    cur = game["current"]
+    owner, poll, slug = int(cur["film"]["owner"]), cur["poll_id"], cur["film"]["slug"]
+    # Fix 2: the owner voting Veto is ignored, veto not consumed, pick stands
+    L.handle_movie(MODE, poll_answer(owner, poll, [0]))
+    g = L.get_game(CHAT)
+    assert g["current"]["poll_id"] == poll and g["vetoes_remaining"][str(owner)] == 1
+    # Fix 1: a non-owner with a veto -> pick vetoed, their veto consumed, re-pick
+    voter = next(p for p in (1, 2, 3) if p != owner)
+    L.handle_movie(MODE, poll_answer(voter, poll, [0]))
+    g = L.get_game(CHAT)
+    assert g["vetoes_remaining"][str(voter)] == 0
+    assert g["current"]["poll_id"] != poll and g["current"]["film"]["slug"] != slug
+    # that voter is now spent -> a second veto from them is ignored
+    poll2 = g["current"]["poll_id"]
+    L.handle_movie(MODE, poll_answer(voter, poll2, [0]))
+    g2 = L.get_game(CHAT)
+    assert g2.get("current") and g2["current"]["poll_id"] == poll2
+    assert g2["vetoes_remaining"][str(voter)] == 0
+
+
+def test_no_eligible_vetoer_wins_immediately():
+    # solo player can't veto their own pick -> nobody can veto -> instant winner
+    _veto_setup([1], [(1, "a", "A")])
+    assert L.get_game(CHAT) is None
+    assert [v for (_p, s), v in STORE.items() if s.startswith("history#")]
+
+
 def test_full_game_to_winner_via_poll_close():
     game = _two_player_game_to_veto()
     assert game["phase"] == "VETO"
@@ -219,37 +266,30 @@ def test_full_game_to_winner_via_poll_close():
     assert L.get_film(CHAT, w["winner_owner_id"], w["winner_slug"])["watched"] is True
 
 
-def test_veto_consumes_repicks_and_blocks_second_veto():
-    game = _two_player_game_to_veto()
+def test_veto_consumes_and_repicks():
+    # 3 films so a re-pick still has a live poll (covered deeper in
+    # test_owner_blocked_then_nonowner_veto_consumes_and_repicks)
+    game = _veto_setup([1, 2, 3], [(1, "a", "A"), (2, "b", "B"), (3, "c", "C")])
     cur = game["current"]
-    first_poll = cur["poll_id"]
-    first_film = cur["film"]["slug"]
-    # player 1 votes Veto (option 0)
-    L.handle_movie(MODE, poll_answer(1, first_poll, [0]))
-    game = L.get_game(CHAT)
-    assert game["vetoes_remaining"]["1"] == 0
-    assert first_poll in [p for p in POLLS_STOPPED] or True  # stopPoll called
-    new = game["current"]
-    assert new["poll_id"] != first_poll
-    assert new["film"]["slug"] != first_film
-    # player 1 has no veto left -> second veto ignored
-    L.handle_movie(MODE, poll_answer(1, new["poll_id"], [0]))
-    game = L.get_game(CHAT)
-    assert game["current"]["poll_id"] == new["poll_id"]   # unchanged
-    # auto-close the survivor -> winner
-    L.handle_movie(MODE, poll_closed(new["poll_id"]))
-    assert L.get_game(CHAT) is None
+    owner, first_poll, first_film = int(cur["film"]["owner"]), cur["poll_id"], cur["film"]["slug"]
+    voter = next(p for p in (1, 2, 3) if p != owner)
+    L.handle_movie(MODE, poll_answer(voter, first_poll, [0]))
+    g = L.get_game(CHAT)
+    assert g["vetoes_remaining"][str(voter)] == 0
+    assert g["current"]["poll_id"] != first_poll and g["current"]["film"]["slug"] != first_film
 
 
 def test_stale_poll_close_is_ignored():
-    game = _two_player_game_to_veto()
+    game = _veto_setup([1, 2, 3], [(1, "a", "A"), (2, "b", "B"), (3, "c", "C")])
     cur = game["current"]
-    first_poll = cur["poll_id"]
-    L.handle_movie(MODE, poll_answer(1, first_poll, [0]))   # veto -> moves on
+    owner, first_poll = int(cur["film"]["owner"]), cur["poll_id"]
+    voter = next(p for p in (1, 2, 3) if p != owner)
+    L.handle_movie(MODE, poll_answer(voter, first_poll, [0]))   # valid veto -> re-pick
+    assert L.get_game(CHAT)["current"]["poll_id"] != first_poll
     # the vetoed poll's own auto-close arrives late: must NOT declare a winner
     L.handle_movie(MODE, poll_closed(first_poll))
-    assert L.get_game(CHAT) is not None
-    assert L.get_game(CHAT)["phase"] == "VETO"
+    g = L.get_game(CHAT)
+    assert g is not None and g["phase"] == "VETO"
 
 
 def test_backstop_resolves_after_90s_on_any_update():
@@ -275,8 +315,8 @@ def test_thumbs_down_swaps_a_slot_and_reasks():
     assert len(sel["shown"]) == 4               # a 4th film was drawn in
     assert sel["slots"][0]["slug"] != slot0_before
     assert L.get_game(CHAT)["phase"] == "SELECTING"   # re-asked, not locked yet
-    L.handle_movie(MODE, message(1, "👍👍👍"))  # now keep all -> locks
-    assert L.get_game(CHAT)["selection"]["1"]["locked"] is True
+    L.handle_movie(MODE, message(1, "👍👍👍"))  # keep all -> locks -> solo veto -> winner
+    assert L.get_game(CHAT) is None
 
 
 def test_selection_is_sequential_one_player_at_a_time():
@@ -379,13 +419,14 @@ def test_poll_film_tool_resolves_and_registers():
 
 
 def test_rating_vote_does_not_disturb_veto_poll():
-    # a veto-phase poll vote still routes to the veto logic (no ratingpoll item)
-    game = _two_player_game_to_veto()
+    # a veto-phase poll vote routes to the veto logic (not the rating handler)
+    game = _veto_setup([1, 2, 3], [(1, "a", "A"), (2, "b", "B"), (3, "c", "C")])
     pid = game["current"]["poll_id"]
     assert L.get_rating_poll(pid) is None
-    L.handle_movie(MODE, poll_answer(1, pid, [0]))   # veto
-    assert L.get_game(CHAT)["current"]["film"]["slug"] != game["current"]["film"]["slug"] \
-        or L.get_game(CHAT)["vetoes_remaining"]["1"] == 0
+    owner = int(game["current"]["film"]["owner"])
+    voter = next(p for p in (1, 2, 3) if p != owner)
+    L.handle_movie(MODE, poll_answer(voter, pid, [0]))
+    assert L.get_game(CHAT)["vetoes_remaining"][str(voter)] == 0
 
 
 def _short_pool_setup(genres):
@@ -417,7 +458,7 @@ def test_short_pool_prompts_with_buttons_and_play_advances():
     assert sel.get("short_pool") and not sel["locked"] and len(sel["slots"]) == 2
     assert any("qualify" in t.lower() and "no horror" in t.lower() for t, _ in SENT)
     L.handle_movie(MODE, cb(1, "sp_play"))                # accept the 2
-    assert L.get_game(CHAT)["phase"] == "VETO"            # 1 player locked -> veto
+    assert L.get_game(CHAT) is None   # solo: the locked pick can't be self-vetoed -> it wins
 
 
 def test_short_pool_add_qualifying_reaches_three():
@@ -425,8 +466,7 @@ def test_short_pool_add_qualifying_reaches_three():
     L.handle_movie(MODE, cb(1, "sp_add"))
     assert L.get_game(CHAT)["selection"]["1"]["awaiting_add"] is True
     L.handle_movie(MODE, message(1, "New Drama"))         # fake_lookup -> Drama, fits
-    g = L.get_game(CHAT)
-    assert g["phase"] == "VETO"                           # reached 3 -> locked + advanced
+    assert L.get_game(CHAT) is None   # reached 3 -> locked -> solo veto -> winner
     assert any(f["title"] == "New Drama" for f in L.get_library(CHAT, 1))   # persisted
 
 
@@ -596,9 +636,10 @@ def test_over_constrained_offers_relax_then_unfilter():
     g = L.get_game(CHAT)
     assert g["awaiting_relax"] is True and g.get("current") is None   # no silent unfilter
     L.handle_movie(MODE, message(1, "play without filters"))
-    g = L.get_game(CHAT)
-    assert g["awaiting_relax"] is False
-    assert g["current"]["film"]["slug"] == "dra"      # now eligible, presented
+    # unfiltered -> dra eligible; solo player can't veto own pick -> it wins
+    assert L.get_game(CHAT) is None
+    hist = [v for (_p, s), v in STORE.items() if s.startswith("history#")]
+    assert hist and hist[0]["winner_slug"] == "dra"
 
 
 def test_constraints_window_parses_three_people_then_go_closes():

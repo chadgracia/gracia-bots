@@ -183,17 +183,23 @@ this round out] [➕ Add a film]**, since a player can still participate with th
   libraries to keep ~3 each, build `pool`, post the final list, ask for `go`.
 - "go" must be a command or a reply to the lock message (`/go` or reply `go`/`👍`), not ambient text.
 
-### Phase 5 — The pick + veto
-- Code does `random.choice(pool)` (**not** the LLM). Announce the pick with a full info card.
-- Veto must be explicit: `/veto`, or a **reply** to the pick message with `veto`/`❌`. On veto:
-  confirm it, decrement `vetoes_left` for that user, mark "out of vetoes," remove the film, re-pick.
-  Reject a second veto from the same user ("you already played your veto").
-- **No 60-second wait.** Lambda has no long-running process. Two options:
-  - (recommended) the pick stands until someone vetoes or someone confirms with `/watch` (or reply
-    `✅`). Clean, no scheduler, and explicit in a group.
-  - (alternative) schedule a one-off EventBridge callback ~60s out that re-invokes the Lambda to
-    finalize if no veto landed. More moving parts; only do this if you specifically want the timer.
-- Pool exhausted: `random.choice` from the vetoed pile, no more vetoes, finalize.
+### Phase 5 — The pick + veto (CURRENT: non-anonymous poll, two hard rules)
+- Code does `random.choice(pool)` (**not** the LLM) and posts a full info card + a non-anonymous
+  Telegram poll **["🚫 Veto", "👍 Fine by me"]** (`open_period=90`). You can't restrict who taps a
+  poll option, but because it's non-anonymous the bot knows exactly who cast each "Veto" and
+  decides which ones **count** — both rules enforced at `poll_answer` resolution, all in code:
+  - **One veto per player per game.** `vetoes_remaining[uid]` starts at 1. A "Veto" counts only
+    if that voter still has one; a valid veto consumes it (→ 0), drops the pick, and re-picks. A
+    "Veto" from a spent player is ignored (told once: "you've already used your veto tonight").
+  - **No vetoing your own pick.** A "Veto" from the candidate's `owner` never counts — they
+    already approved it in confirmation. Ignored (told once: "that's your own pick").
+- **Resolution timing:** the **first valid** veto re-picks immediately; **everyone** voting "Fine
+  by me" wins immediately; otherwise the 90s poll auto-closes (lazy backstop, no scheduler) and
+  the un-vetoed pick wins.
+- **Vetoes run out:** when no player can validly veto the current candidate (everyone else is
+  spent, and the owner can't veto their own), it's declared the winner immediately — no poll. So a
+  solo game's pick simply wins. (`vetoes_remaining` / owner check / `_present_candidate`
+  short-circuit / `on_poll_answer`.)
 
 ### Phase 6 — Winner
 - Announce winner with a full info card **plus a spoiler-free context note** (production facts,

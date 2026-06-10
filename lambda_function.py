@@ -1699,8 +1699,8 @@ def _begin_veto(mode, chat_id, game):
         note = (f"🗳 Veto round! {len(pool_all)} films in the pool, one veto each. "
                 "Vote 🚫 Veto within 90s to knock a pick out.")
     send_message(mode, chat_id, note)
-    _present_candidate(mode, chat_id, game)
-    put_game(game)
+    if not _present_candidate(mode, chat_id, game):   # may short-circuit to a winner
+        put_game(game)
 
 
 def _relax_and_resume(mode, chat_id, game, text):
@@ -1740,15 +1740,27 @@ def _relax_backstop(mode, chat_id, game):
 
 
 def _present_candidate(mode, chat_id, game):
+    """Draw and present the next candidate. Returns True if it RESOLVED the game
+    (winner declared / pool empty -> cleared) so callers skip put_game; False if a
+    veto poll is now open and the caller should persist."""
     pool = game["pool"]
     if not pool:
         send_message(mode, chat_id, "Pool's empty — no winner.")
         clear_game(chat_id)
-        return
+        return True
     cand = random.choice(pool)        # random pick, in code
     pool.remove(cand)
     item = get_film(chat_id, int(cand["owner"]), cand["slug"])
     send_message(mode, chat_id, f"🎲 Candidate:\n\n{_film_card(item) if item else cand['title']}")
+    # Can this pick even be vetoed? Only a NON-owner with a veto left can. If nobody
+    # qualifies, it wins now (spec: vetoes run out -> the next pick is the winner;
+    # you can't veto your own pick).
+    can_veto = any(int(game["vetoes_remaining"].get(str(p), 0)) > 0
+                   for p in game["players"] if str(p) != str(cand["owner"]))
+    if not can_veto:
+        send_message(mode, chat_id, "No vetoes left to play — this one's locked in. 🍿")
+        _declare_winner(mode, chat_id, game, cand)
+        return True
     resp = send_poll(mode, chat_id, "Veto this pick?", ["🚫 Veto", "👍 Fine by me"],
                      is_anonymous=False, open_period=90)
     result = resp.get("result") or {}
@@ -1756,10 +1768,11 @@ def _present_candidate(mode, chat_id, game):
     game["current"] = {
         "film": cand, "poll_id": poll_id,
         "poll_message_id": result.get("message_id"),
-        "presented_at": _now_epoch(), "resolved": False,
+        "presented_at": _now_epoch(), "resolved": False, "notified": [],
     }
     if poll_id:
         put_poll_map(poll_id, chat_id, cand)
+    return False
 
 
 # ---- rating polls (on-demand "poll <film>" + future morning-after) -------- #
@@ -1845,9 +1858,25 @@ def on_poll_answer(mode, ev):
             else:
                 put_game(game)
         return
+    notified = cur.setdefault("notified", [])
+
+    def _notify_once(text):
+        if uid not in notified:
+            notified.append(uid)
+            put_game(game)
+            send_message(mode, chat_id, text)
+
+    # Fix 2: you can't veto your own pick — you already approved it in confirmation.
+    if uid == str(cur["film"].get("owner")):
+        _notify_once(f"{mention_for(chat_id, ev.get('user_id'))}, that's your own pick — "
+                     "can't veto it 🙂")
+        return
+    # Fix 1: one veto per player per game. A spent player's veto doesn't count.
     if game["vetoes_remaining"].get(uid, 0) <= 0:
-        return  # no veto left — ignore
-    game["vetoes_remaining"][uid] -= 1
+        _notify_once(f"{mention_for(chat_id, ev.get('user_id'))}, you've already used your "
+                     "veto tonight.")
+        return
+    game["vetoes_remaining"][uid] -= 1          # consume this player's one veto
     cur["resolved"] = True
     if cur.get("poll_message_id"):
         stop_poll(mode, chat_id, cur["poll_message_id"])
@@ -1856,8 +1885,8 @@ def on_poll_answer(mode, ev):
     send_message(mode, chat_id,
                  f"🚫 {mention_for(chat_id, ev.get('user_id'))} vetoed "
                  f"“{cur['film']['title']}”. Next pick…")
-    _present_candidate(mode, chat_id, game)
-    put_game(game)
+    if not _present_candidate(mode, chat_id, game):   # may short-circuit to a winner
+        put_game(game)
 
 
 def on_poll(mode, ev):
