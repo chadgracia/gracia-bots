@@ -795,8 +795,9 @@ _SEED_ALIASES = {
     "daria": "dasha", "dariuozy": "dasha", "dash": "dasha",
     "al": "alberto", "berto": "alberto",
     "anya": "anya", "anna": "anya",
-    "asa": "asa", "khimka": "khimka", "maryna": "maryna", "marina": "maryna",
-    "chad": "chad",
+    "asa": "asa", "asafoxcolorist": "asa",
+    "khimka": "khimka", "maryna": "maryna", "marina": "maryna",
+    "chad": "chad", "chad_gracia": "chad",
 }
 
 
@@ -845,6 +846,43 @@ def claim_library(chat_id, name, user_id):
              "claimed_by": int(user_id), "seed_name": name.strip(),
              "claimed_at": _now_iso()})
     return {"status": "ok", "moved": moved}
+
+
+def _canonical_for_user(chat_id, uid):
+    """The display name a user_id owns (via a claim), else their member name."""
+    for i in ddb_query(_pk("movie", chat_id)):
+        if (str(i.get("SK", "")).startswith("seedclaim#")
+                and str(i.get("claimed_by")) == str(uid)):
+            return i.get("seed_name") or str(i["SK"]).split("#", 1)[1].title()
+    m = get_member(chat_id, uid)
+    return (m or {}).get("display_name")
+
+
+def resolve_owner(chat_id, identifier):
+    """The ONE resolver every read path uses. Maps a Telegram user_id or a
+    name/handle to (owner_key, canonical_name), or (None, None) if unknown.
+    owner_key feeds get_library — a real user_id once claimed, else 'seed:<key>'.
+    It NEVER falls back to the caller (that was the mis-attribution bug)."""
+    if identifier is None or identifier == "":
+        return None, None
+    uid = None
+    if isinstance(identifier, int):
+        uid = identifier
+    elif isinstance(identifier, str) and identifier.lstrip("-").isdigit():
+        uid = int(identifier)
+    if uid is not None:                       # a Telegram user_id owns its own films
+        return str(uid), _canonical_for_user(chat_id, uid)
+    pk = _pk("movie", chat_id)
+    key = _canonical_seed_name(str(identifier))   # name/@handle -> canonical slug (alias map)
+    marker = ddb_get(pk, f"seedclaim#{key}")
+    disp = ((marker or {}).get("seed_name")
+            or next((k for k in _STARTER_LIBRARIES if k.lower() == key), None)
+            or key.title())
+    if marker and marker.get("claimed_by") is not None:    # claimed -> their user_id
+        return str(marker["claimed_by"]), disp
+    if any(str(i.get("SK", "")).startswith(f"lib#seed:{key}#") for i in ddb_query(pk)):
+        return f"seed:{key}", disp                          # seeded but unclaimed
+    return None, None                                       # genuinely unknown
 
 
 # --- Embedded starter libraries -------------------------------------------- #
@@ -1927,8 +1965,9 @@ MOVIE_TOOLS = [
                                            "properties": {"title": {"type": "string"}},
                                            "required": ["title"]}}}},
     {"toolSpec": {"name": "list_library",
-                  "description": "List the films in the SENDER's library.",
-                  "inputSchema": {"json": {"type": "object", "properties": {}}}}},
+                  "description": "List films in someone's library. Pass whose=<name> to view another person (e.g. 'Asa'); omit for the sender's own. If the person is unknown the result has resolved=false — then DO NOT show anyone else's films.",
+                  "inputSchema": {"json": {"type": "object",
+                                           "properties": {"whose": {"type": "string"}}}}}},
     {"toolSpec": {"name": "claim_library",
                   "description": "Link a seeded starter library (by person's name, e.g. 'Chad') to the sender.",
                   "inputSchema": {"json": {"type": "object",
@@ -1974,6 +2013,10 @@ MOVIE_SYSTEM = (
     "add_director. NEVER ask which version unless resolved=false.\n"
     "LOOK UP ('what's X rated', 'tell me about X'): call lookup_film and answer with the "
     "rating + a one-line synopsis; offer to add it.\n"
+    "LIBRARY ('show my library', \"what's in Asa's library\"): call list_library — whose=<name> "
+    "for another person, or omit for the sender's own. Label the list with the returned 'owner' "
+    "ONLY. If resolved=false, say plainly you don't know who that is yet (they haven't claimed a "
+    "library) — NEVER show someone else's films under the requested name.\n"
     "POLL ('poll <film>', 'let's rate <film>', 'poll Star Wars'): call poll_film with the "
     "title (year separately if given). The bot posts a 5★ poll and logs the votes.\n"
     "CONFIRM: if you just offered a film and the user says yes/add it, call add_to_library "
@@ -2045,8 +2088,17 @@ def _dispatch_tool(name, tool_input, ctx):
         removed = remove_from_library(chat_id, uid, tool_input["title"])
         return {"removed": removed}
     if name == "list_library":
-        return {"films": [{"title": f["title"], "year": f.get("year")}
-                          for f in get_library(chat_id, uid)]}
+        whose = (tool_input or {}).get("whose")
+        if whose:                                  # another person, by name/handle
+            owner_key, canon = resolve_owner(chat_id, whose)
+            if not owner_key:
+                return {"resolved": False, "whose": whose}   # fail loud — no fallback
+            return {"resolved": True, "owner": canon or whose,
+                    "films": [{"title": f["title"], "year": f.get("year")}
+                              for f in get_library(chat_id, owner_key)]}
+        return {"resolved": True, "owner": "your",  # the caller's own (their user_id)
+                "films": [{"title": f["title"], "year": f.get("year")}
+                          for f in get_library(chat_id, str(uid))]}
     if name == "claim_library":
         res = claim_library(chat_id, tool_input["name"], uid)
         if res.get("status") == "ok":
