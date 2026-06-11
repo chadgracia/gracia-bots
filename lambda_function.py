@@ -954,7 +954,84 @@ def clear_game(chat_id):
     ddb_delete(_pk("movie", chat_id), "game#current")
 
 
-# ---- lifecycle: status, staleness, new-day expiry ------------------------- #
+# ---- short-term conversation window --------------------------------------- #
+# A rolling per-chat transcript so the LLM can resolve referents across messages
+# ("is IT the highest rated" / "the poll you just did"). It holds recent human
+# turns AND the bot's own salient outputs (poll posted, winner, wildcard pitched),
+# each tagged with a speaker name (it's a group — the model must know who said
+# what). Trimmed by count and age to cap token cost.
+_CONVO_MAX_TURNS = 20
+_CONVO_MAX_AGE_SEC = 3 * 3600
+_CONVO_TEXT_CAP = 600          # clip any single turn so one paste can't blow the budget
+
+
+def _convo_load(chat_id):
+    rec = ddb_get(_pk("movie", chat_id), "convo#log") or {}
+    return rec.get("turns") or []
+
+
+def _convo_append(chat_id, role, speaker, text):
+    """Append one turn and persist, trimmed to the last N turns / last few hours."""
+    text = (text or "").strip()
+    if not text:
+        return
+    now = _now_epoch()
+    turns = _convo_load(chat_id)
+    turns.append({"role": role, "speaker": speaker or "",
+                  "text": text[:_CONVO_TEXT_CAP], "ts": now})
+    turns = [t for t in turns if now - int(t.get("ts") or 0) <= _CONVO_MAX_AGE_SEC]
+    turns = turns[-_CONVO_MAX_TURNS:]
+    ddb_put({"PK": _pk("movie", chat_id), "SK": "convo#log",
+             "turns": turns, "updated_at": _now_iso()})
+
+
+def _convo_note(chat_id, text):
+    """Record one of the bot's own salient actions (assistant turn) so later
+    references like 'the poll you just did' / 'the film you suggested' resolve."""
+    _convo_append(chat_id, "assistant", "SirWatchAlot", text)
+
+
+def _convo_messages(turns):
+    """Turn the stored window into Bedrock messages, prefixing human turns with the
+    speaker's name and collapsing consecutive same-role turns so roles strictly
+    alternate (Anthropic models reject consecutive user/assistant messages)."""
+    msgs = []
+    for t in turns:
+        role = "assistant" if t.get("role") == "assistant" else "user"
+        text = t.get("text", "")
+        if role == "user":
+            text = f"{t.get('speaker') or 'Someone'}: {text}"
+        if msgs and msgs[-1]["role"] == role:
+            msgs[-1]["content"][0]["text"] += "\n" + text
+        else:
+            msgs.append({"role": role, "content": [{"text": text}]})
+    return msgs
+
+
+# ---- past-picks history (queryable) --------------------------------------- #
+def get_history(chat_id, limit=10):
+    """Past movie-night winners for this chat, most recent first: title, year, date,
+    who played, and the pool that night. Backs the get_history tool + the wildcard
+    novelty filter (never re-suggest a past winner)."""
+    rows = [h for h in ddb_query(_pk("movie", chat_id))
+            if str(h.get("SK", "")).startswith("history#")]
+    rows.sort(key=lambda h: h.get("watched_date") or "", reverse=True)
+    out = []
+    for h in rows[:max(1, int(limit or 10))]:
+        out.append({"title": h.get("winner_title"),
+                    "year": h.get("winner_year") or "",
+                    "date": (h.get("watched_date") or "")[:10],
+                    "participants": h.get("participants") or [],
+                    "pool": [e.get("title") for e in (h.get("pool") or []) if e.get("title")]})
+    return out
+
+
+def _past_winner_slugs(chat_id):
+    return {h.get("winner_slug") for h in ddb_query(_pk("movie", chat_id))
+            if str(h.get("SK", "")).startswith("history#") and h.get("winner_slug")}
+
+
+
 # A game is "ongoing" only while non-terminal AND fresh. Status flows
 # collecting -> confirming -> picking -> done (+ abandoned). A started-but-never-
 # finished game must never wedge the group: a new Kyiv calendar day, or ~6h idle,
@@ -1834,7 +1911,9 @@ def _build_wildcard(chat_id, game):
     players = game["players"]
     pool_slugs = {e["slug"] for e in _locked_pool_entries(game)}
     owned = _player_library_slugs(chat_id, players)
-    blocked = pool_slugs | _wildcard_log(chat_id) | owned   # novelty filter, all tiers
+    # novelty filter (all tiers): not in tonight's pool, not already suggested here,
+    # not in any player's library, and never a past winner of this chat.
+    blocked = pool_slugs | _wildcard_log(chat_id) | owned | _past_winner_slugs(chat_id)
 
     def verify(title, year, reason, tier):
         info = lookup_film_cached(title, year)
@@ -1919,6 +1998,7 @@ def _offer_wildcard(mode, chat_id, game):
     game["wildcard_deadline"] = _now_epoch() + _WILDCARD_WINDOW
     resp = _post_wildcard_pitch(mode, chat_id, item, sugg)
     game["wildcard_msg_id"] = (resp or {}).get("result", {}).get("message_id")
+    _convo_note(chat_id, f"(suggested {item['title']} as a wildcard 'for the hat')")
     put_game(game)
 
 
@@ -2071,6 +2151,7 @@ def _present_candidate(mode, chat_id, game):
     }
     if poll_id:
         put_poll_map(poll_id, chat_id, cand)
+    _convo_note(chat_id, f"(posted a veto poll for the candidate {cand.get('title')})")
     return False
 
 
@@ -2304,9 +2385,10 @@ def _declare_winner(mode, chat_id, game, film):
     ddb_put({
         "PK": _pk("movie", chat_id), "SK": f"history#{game['session_id']}",
         "session_id": game["session_id"], "winner_title": title,
-        "winner_slug": slug, "winner_owner_id": owner,
+        "winner_slug": slug, "winner_owner_id": owner, "winner_year": str(year or ""),
         "watched_date": _now_iso(),
-        "participants": [int(p) for p in game["players"]], "ratings": {},
+        "participants": [int(p) for p in game["players"]],
+        "pool": game.get("pool_all") or [], "ratings": {},
     })
     if cur.get("poll_id"):
         del_poll_map(cur["poll_id"])
@@ -2320,6 +2402,8 @@ def _declare_winner(mode, chat_id, game, film):
         text += f"\n\n{disclaimer}"
     text += "\n\nEnjoy! 🎬"
     send_message(mode, chat_id, text)
+    yr = f" ({year})" if year else ""
+    _convo_note(chat_id, f"(announced tonight's winner: {title}{yr})")
     clear_game(chat_id)
 
 
@@ -2443,6 +2527,10 @@ MOVIE_TOOLS = [
                   "inputSchema": {"json": {"type": "object",
                                            "properties": {"whose": {"type": "string"},
                                                           "film_title": {"type": "string"}}}}}},
+    {"toolSpec": {"name": "get_history",
+                  "description": "Past movie-night WINNERS for this chat, most recent first — each with title, year, date, who played, and the pool that night. Call this whenever someone asks what you've watched, last week's/last time's winner, how many nights you've had, or makes a claim about a pattern ('we always pick X', 'do we ever watch comedies'). Answer ONLY from what it returns; never claim you keep no log.",
+                  "inputSchema": {"json": {"type": "object",
+                                           "properties": {"limit": {"type": "integer"}}}}}},
 ]
 
 MOVIE_SYSTEM = (
@@ -2505,6 +2593,14 @@ MOVIE_SYSTEM = (
     "voters); 'what did <Name> rate' → whose='<Name>'. When several ratings come back, report "
     "each voter and their stars and give the average. If it returns nothing, say plainly you "
     "don't have a rating logged for that — don't guess, and never deny a poll happened.\n"
+    "- MEMORY: the recent conversation is given to you with each speaker's name, so follow "
+    "references across messages — 'is it the highest rated', 'that one', 'the poll you just "
+    "did', 'the film you suggested' point at what was named moments ago; resolve them from the "
+    "thread, and keep track of who said what.\n"
+    "- PAST NIGHTS: you DO keep a log of every movie-night winner. When asked what you've "
+    "watched, last time's / last week's winner, how many nights you've had, or any claim about "
+    "a pattern ('we always pick X', 'do we ever watch anything funny'), call get_history and "
+    "answer only from it — never say you keep no record.\n"
     "- Starting movie night: just start it; don't announce it yourself (the game posts its "
     "own card). If someone wants a FRESH game ('new game', 'start over', 'restart it') start "
     "it anew. Never lecture that a game is 'already going' — quietly do what they asked.\n"
@@ -2557,10 +2653,22 @@ _AFFIRM_PHRASES = {"add it", "add that", "do it", "go for it", "go ahead",
                    "save it", "keep it", "add it please", "yes do it"}
 
 
+_SILENCE_WORDS = {"silent", "silence", "noreply", "noresponse", "nothing",
+                  "none", "nocomment", "pass", "skip", "ignore", "staysilent"}
+
+
 def _is_placeholder_reply(text):
-    """True if the whole reply is just a parenthetical stage-direction ('(silent)',
-    '(no reply).', '(...)') — never something to actually post to the group."""
-    return bool(re.fullmatch(r"\(.*?\)[.!?\s]*", (text or "").strip()))
+    """True if the whole reply is just a 'stay quiet' stage-direction and must never
+    reach the group — '(silent)', '(no reply).', '[silence]', or a markdown-wrapped
+    variant like '*(silent)*' / '_silent_' (the model sometimes adds asterisks, which
+    Telegram leaks). Real replies that merely contain parentheses are left alone."""
+    t = (text or "").strip()
+    if not t:
+        return True
+    core = t.strip("*_~`\"' \t").strip()             # peel markdown/quote wrappers first
+    if re.fullmatch(r"[\(\[\{].*?[\)\]\}][.!?\s]*", core):   # a bare bracketed direction
+        return True
+    return re.sub(r"[^a-z]", "", core.lower()) in _SILENCE_WORDS   # or a lone silence word
 
 
 def _is_affirmative(text):
@@ -2666,6 +2774,9 @@ def _dispatch_tool(name, tool_input, ctx):
         if ratings and len({_norm_title(r["film"]) for r in ratings}) == 1:
             out["average"] = round(sum(float(r["stars"]) for r in ratings) / len(ratings), 1)
         return out
+    if name == "get_history":
+        hist = get_history(chat_id, (tool_input or {}).get("limit") or 10)
+        return {"count": len(hist), "history": hist}
     return {"error": f"unknown tool {name}"}
 
 
@@ -2739,9 +2850,16 @@ def recommend_films(chat_id, owner_key, owner_label):
             "candidates": candidates}
 
 
-def converse(system_prompt, user_text, ctx, tools=MOVIE_TOOLS, max_turns=6):
-    """Run the Bedrock tool-use loop; return the model's final text."""
-    messages = [{"role": "user", "content": [{"text": user_text}]}]
+def converse(system_prompt, user_text, ctx, tools=MOVIE_TOOLS, max_turns=6, prior=None):
+    """Run the Bedrock tool-use loop; return the model's final text. `prior` is the
+    rolling conversation window (alternating messages) prepended for context; the
+    current user turn is merged onto it so roles stay strictly alternating."""
+    messages = list(prior or [])
+    cur = {"role": "user", "content": [{"text": user_text}]}
+    if messages and messages[-1]["role"] == "user":
+        messages[-1]["content"].extend(cur["content"])
+    else:
+        messages.append(cur)
     for _ in range(max_turns):
         resp = _bedrock.converse(
             modelId=BEDROCK_MODEL_ID, system=[{"text": system_prompt}],
@@ -2828,15 +2946,22 @@ def on_message(mode, ev):
         return
     ctx = {"chat_id": chat_id, "user_id": uid, "user_name": ev["user_name"],
            "username": ev.get("username"), "mode": mode, "suppress_reply": False}
+    speaker = ev.get("user_name") or "Someone"
+    prior = _convo_messages(_convo_load(chat_id))   # rolling window for referents
     try:
-        reply = converse(MOVIE_SYSTEM, text, ctx)
+        reply = converse(MOVIE_SYSTEM, f"{speaker}: {text}", ctx, prior=prior)
     except Exception as e:
         log.error("bedrock movie failed: %s", e)
         return
     reply = (reply or "").strip()
+    # Record this exchange in the window. Always log what the human said; log the
+    # bot's reply only when it actually spoke (a suppressed/placeholder turn is silence).
+    _convo_append(chat_id, "user", speaker, text)
+    spoke = bool(reply) and not ctx.get("suppress_reply") and not _is_placeholder_reply(reply)
     # Stay quiet via suppress_reply; the placeholder guard is a backstop so a bare
-    # parenthetical ("(silent)", "(no reply).", "(...)") never leaks to the group.
-    if reply and not ctx.get("suppress_reply") and not _is_placeholder_reply(reply):
+    # parenthetical ("(silent)", "*(silent)*", "(no reply).") never leaks to the group.
+    if spoke:
+        _convo_note(chat_id, reply)
         send_message(mode, chat_id, reply)
 
 

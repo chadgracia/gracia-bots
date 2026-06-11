@@ -302,12 +302,90 @@ def test_poll_close_decides_from_roster_not_raw_counts():
 
 
 def test_placeholder_reply_guard_suppresses_parentheticals():
-    assert L._is_placeholder_reply("(silent)")
-    assert L._is_placeholder_reply("(silent).")
-    assert L._is_placeholder_reply("(no reply)")
-    assert L._is_placeholder_reply("(...)")
-    assert not L._is_placeholder_reply("Add it? (yes/no)")
-    assert not L._is_placeholder_reply("Sure, adding Dune (1984).")
+    # bare / punctuated / markdown-wrapped / bracketed / lone-word silence -> suppressed
+    for s in ["(silent)", "(silent).", "(no reply)", "(...)", "*(silent)*", "_silent_",
+              "[silence]", "  silent  ", "Silent.", "(stay silent)"]:
+        assert L._is_placeholder_reply(s), s
+    # real replies (even ones that merely contain parentheses) -> sent
+    for s in ["Add it? (yes/no)", "Sure, adding Dune (1984).", "Tokyo Story it is."]:
+        assert not L._is_placeholder_reply(s), s
+
+
+# ---- Task 2A: short-term conversation window ------------------------------ #
+def test_convo_window_append_load_and_speaker_messages():
+    _reset()
+    L._convo_append(CHAT, "user", "Chad", "Let's watch Tokyo Story")
+    L._convo_note(CHAT, "(posted a veto poll for the candidate Tokyo Story)")
+    L._convo_append(CHAT, "user", "Asa", "is it the highest rated?")
+    turns = L._convo_load(CHAT)
+    assert [t["speaker"] for t in turns] == ["Chad", "SirWatchAlot", "Asa"]
+    msgs = L._convo_messages(turns)
+    assert [m["role"] for m in msgs] == ["user", "assistant", "user"]   # strict alternation
+    assert "Chad: Let's watch Tokyo Story" in msgs[0]["content"][0]["text"]
+    assert "Asa: is it the highest rated?" in msgs[2]["content"][0]["text"]
+
+
+def test_convo_window_trims_to_max_turns():
+    _reset()
+    for i in range(L._CONVO_MAX_TURNS + 8):
+        L._convo_append(CHAT, "user", f"U{i}", f"msg {i}")
+    turns = L._convo_load(CHAT)
+    assert len(turns) == L._CONVO_MAX_TURNS
+    assert turns[-1]["text"] == f"msg {L._CONVO_MAX_TURNS + 7}"        # newest kept
+
+
+def test_convo_window_drops_stale_turns_by_age():
+    _reset()
+    L._convo_append(CHAT, "user", "Old", "ancient")
+    NOW[0] += L._CONVO_MAX_AGE_SEC + 10
+    L._convo_append(CHAT, "user", "New", "fresh")
+    assert [t["speaker"] for t in L._convo_load(CHAT)] == ["New"]
+
+
+def test_convo_messages_collapses_consecutive_same_role():
+    msgs = L._convo_messages([
+        {"role": "user", "speaker": "Chad", "text": "one"},
+        {"role": "user", "speaker": "Asa", "text": "two"},
+        {"role": "assistant", "speaker": "SirWatchAlot", "text": "ok"},
+    ])
+    assert [m["role"] for m in msgs] == ["user", "assistant"]
+    assert "Chad: one" in msgs[0]["content"][0]["text"]
+    assert "Asa: two" in msgs[0]["content"][0]["text"]
+
+
+# ---- Task 2B: past-picks history ------------------------------------------ #
+def test_history_written_with_year_pool_and_queryable_tool():
+    game = _two_player_game_to_veto()                 # 2-film pool, in VETO
+    NOW[0] += L._VETO_WINDOW + 1                       # window lapses
+    L.handle_movie(MODE, message(2, "go on then"))     # backstop -> winner
+    assert L.get_game(CHAT) is None
+    hist = L.get_history(CHAT, 10)
+    assert len(hist) == 1
+    h = hist[0]
+    assert h["title"] in ("Film A", "Film B")
+    assert h["year"] == "1950"                         # fake_lookup default year
+    assert set(h["participants"]) == {1, 2}
+    assert "Film A" in h["pool"] and "Film B" in h["pool"]
+    out = L._dispatch_tool("get_history", {"limit": 5}, _ctx(1))   # the tool surfaces it
+    assert out["count"] == 1 and out["history"][0]["title"] == h["title"]
+    assert any("winner" in t["text"].lower() for t in L._convo_load(CHAT))  # salient note
+
+
+def test_wildcard_excludes_past_winner():
+    _reset()
+    L.ddb_put({"PK": L._pk(MODE, CHAT), "SK": "history#prev",
+               "winner_title": "Tokyo Story", "winner_slug": L._slugify("Tokyo Story"),
+               "watched_date": "2026-01-01T00:00:00+00:00"})
+    game = L.new_game(CHAT, 1)
+    L._add_player(game, 1)
+    L._add_player(game, 2)
+    game["selection"] = {
+        "1": {"locked": True, "slots": [{"slug": "film-a", "title": "Film A"}]},
+        "2": {"locked": True, "slots": [{"slug": "film-b", "title": "Film B"}]},
+    }
+    sugg = L._build_wildcard(CHAT, game)
+    assert sugg["slug"] != L._slugify("Tokyo Story")   # past winner excluded
+    assert sugg["slug"] == L._slugify("Yi Yi")
 
 
 def test_no_eligible_vetoer_wins_immediately():

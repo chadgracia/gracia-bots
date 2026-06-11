@@ -64,8 +64,17 @@ reuse that principle.
   `{ session_id, phase, participants:[user_id], selections:{user_id:[film_uuid]},
   message_index:{ message_id: {kind, user_id, film_uuids} }, pool:[film_uuid],
   vetoes_left:{user_id:int}, picked:film_uuid, status }`.
-- **History**: `SK = "history#{session_id}"` → `{ winner, watched_date, participants,
-  ratings:{}, poll_message_id }`. Ratings filled later by the morning poll.
+- **History**: `SK = "history#{session_id}"` → `{ winner_title, winner_year, winner_slug,
+  winner_owner_id, watched_date, participants:[user_id], pool:[{owner,slug,title}], ratings:{} }`.
+  Ratings filled later by the morning poll. Written by `_declare_winner`; read by `get_history`
+  (the agent's past-picks tool) and by the wildcard novelty filter (never re-suggest a past winner).
+- **Conversation window**: `SK = "convo#log"` → `{ turns:[{role, speaker, text, ts}], updated_at }`.
+  A rolling short-term transcript (last ~20 turns / ~3h, each turn clipped) holding recent human
+  messages AND the bot's salient outputs (poll posted, winner announced, wildcard pitched). Loaded
+  on every LLM-answered message and passed to `converse` as prior turns **with speaker names** (it's
+  a group — the model must know who said what), so referents like "is *it* the highest rated" or
+  "the poll you just did" resolve across messages. `_convo_messages` collapses consecutive same-role
+  turns so roles strictly alternate (Anthropic requirement). Caps token cost.
 
 `message_index` is the routing table: when an incoming update is a reply, look up
 `reply_to_message.message_id` here to know which player/film(s)/phase the reply belongs to. This is
@@ -187,8 +196,9 @@ non-participant's data). Code: `_offer_wildcard` → `_build_wildcard` → conse
 
 - **Novelty filter (all tiers):** the wildcard must be a film they DON'T already have. Every
   candidate is rejected if its slug is in tonight's locked pool, in the per-chat `wildcardlog`
-  (**never suggested twice across games**), **or in ANY current player's library**
-  (`_player_library_slugs`). The whole point is a discovery.
+  (**never suggested twice across games**), in ANY current player's library
+  (`_player_library_slugs`), **or among this chat's past winners** (`_past_winner_slugs`). The
+  whole point is a discovery.
 - **Suggestion ladder** (`_build_wildcard`), strongest first; it ALWAYS yields something:
   1. **Taste rhyme** (`_wildcard_via_llm`) — the **default whenever any player has library/rating
      data**. Builds the case from what these players LOVE (their saved films + ≥4★ ratings),
