@@ -284,6 +284,37 @@ Same philosophy as salary mode (model parses/communicates; code decides):
 - `lookup_film` stays isolated: Letterboxd for the rating, TMDB (`TMDB_API_KEY`) for everything else,
   swappable later.
 
+### The conversational layer is an AGENT, not a command bot (CURRENT)
+
+`MOVIE_SYSTEM` + `converse()` run a Bedrock tool-use loop. The model is framed as a warm,
+well-read film-night companion that reads plain human language (typos, slang, half-sentences,
+several requests in one line), works out the intent, and **calls tools silently** — then speaks
+to the group in its own voice. It is explicitly told to **never** list "commands", never tell
+people the magic words to type, never refuse something its tools cover, and never paste a raw or
+truncated API synopsis.
+
+- **Capabilities are exposed as TOOLS** (`MOVIE_TOOLS`), dispatched by `_dispatch_tool`:
+  `lookup_film`, `add_to_library`, `add_director`, `remove_from_library`, `list_library`,
+  `claim_library`, `start_movie_night`, `cancel_game`, `poll_film`, `seed_starter_libraries`,
+  and `recommend_films`. The loop supports **multiple tool calls per turn**, so a real compound
+  request ("add Rear Window and drop Mirror") is handled in one turn. The model is told a title
+  is ONE thing even when it contains "and" — "add Harold and Maude" (or typo'd "Harold and Mod")
+  is a single film; only genuine multi-requests split.
+- **`recommend_films`** gathers the asker's (or `whose=<name>`'s) library plus TMDB
+  `/movie/{id}/recommendations` candidates (seeded from the `tmdb_id` stored on library items,
+  owned films filtered out) and returns `{library, candidates}` for the model to synthesize real
+  suggestions in voice. It picks nothing; there is no live web-search wired in — the model adds
+  its own film knowledge on top. Unknown person → `resolved:false` (never the caller's library).
+- **Identity:** `list_library` / `add_to_library` / `remove_from_library` / `recommend_films`
+  route through user-ID identity via `resolve_owner`; an unknown name fails loud (no silent
+  fallback to the caller — see §"Library identity").
+- **Film descriptions are model-written prose, never a pasted synopsis.** `_film_card` is the
+  exact factual one-liner only — `Title (year) · Genre · runtime · ★ rating` — with **no**
+  synopsis (those truncate mid-sentence). The candidate card adds a one-sentence, spoiler-free
+  `_film_blurb` and the winner adds `winner_note`; both are AI-gated (`AI_ENABLED`), so with AI
+  off they return `""` and the card degrades to the factual line.
+- Non-film group chatter → the model replies exactly `(silent)` and the handler sends nothing.
+
 ---
 
 ## 6. Attribution (simplified by going command-based)

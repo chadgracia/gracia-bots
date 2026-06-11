@@ -708,6 +708,54 @@ def test_resolver_passes_year_as_separate_param():
     assert r["rating_10"] == 7.6
 
 
+def test_film_card_has_no_synopsis_line():
+    # The card is the exact factual one-liner only — no pasted/truncated synopsis.
+    item = {"title": "Rear Window", "year": "1954", "genres": ["Mystery", "Thriller"],
+            "runtime_min": 112, "rating": "8.5", "rating_scale": 10,
+            "description": "A long synopsis that should never appear on the card."}
+    card = L._film_card(item)
+    assert "\n" not in card                          # single factual line
+    assert "synopsis" not in card.lower()
+    assert "Rear Window (1954)" in card and "★ 8.5/10" in card
+    assert "1h 52m" in card and "Mystery, Thriller" in card
+
+
+def test_film_blurb_silent_when_ai_off():
+    # AI gated off in tests -> no Bedrock call, empty string, card degrades cleanly.
+    assert L._film_blurb({"title": "Mirror", "year": "1975"}) == ""
+
+
+def test_recommend_films_returns_library_and_candidates():
+    _reset()
+    L.add_to_library(CHAT, 1, "Rear Window")     # fake_lookup gives tmdb_id=1
+    L.add_to_library(CHAT, 1, "Vertigo")
+
+    def fake_get(path, params):
+        if path.endswith("/recommendations"):
+            return {"results": [
+                {"title": "Notorious", "release_date": "1946-08-15"},
+                {"title": "Rear Window", "release_date": "1954-08-04"},  # dup, filtered
+            ]}
+        return {}
+
+    orig_get, orig_key = L._tmdb_get, L.TMDB_API_KEY
+    L._tmdb_get, L.TMDB_API_KEY = fake_get, "testkey"
+    try:
+        out = L._dispatch_tool("recommend_films", {}, _ctx(1))
+    finally:
+        L._tmdb_get, L.TMDB_API_KEY = orig_get, orig_key
+    assert out["resolved"] and out["owner"] == "your"
+    assert {f["title"] for f in out["library"]} == {"Rear Window", "Vertigo"}
+    titles = {c["title"] for c in out["candidates"]}
+    assert "Notorious" in titles and "Rear Window" not in titles   # no dup of owned film
+
+
+def test_recommend_films_unknown_person_fails_loud():
+    _reset()
+    out = L._dispatch_tool("recommend_films", {"whose": "Ghost"}, _ctx(1))
+    assert out["resolved"] is False and "candidates" not in out
+
+
 def test_confirm_saves_pending_film():
     _reset()
     L._set_pending(CHAT, 1, "One from the Heart", "1981")

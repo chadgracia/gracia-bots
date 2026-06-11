@@ -1075,7 +1075,9 @@ def _item_rating_phrase(item):
 
 
 def _film_card(item):
-    """One-line card: 'Title (year) · Genre · 2h 50m · ★ 7.8/10' + a synopsis line."""
+    """The factual one-liner: 'Title (year) · Genre · 2h 50m · ★ 7.8/10'.
+    Exact, from metadata only — NO synopsis (those truncate mid-sentence; any
+    prose colour is written by the model, e.g. _film_blurb / winner_note)."""
     if not item:
         return "(film)"
     yr = f" ({item['year']})" if item.get("year") else ""
@@ -1088,11 +1090,35 @@ def _film_card(item):
     rp = _item_rating_phrase(item)
     if rp:
         bits.append(rp)
-    line = " · ".join(bits)
-    if item.get("description"):
-        d = item["description"]
-        line += "\n" + (d if len(d) <= 200 else d[:197] + "…")
-    return line
+    return " · ".join(bits)
+
+
+def _film_blurb(item):
+    """One short, spoiler-free, in-voice line about a film for a candidate card.
+    LLM writes the prose; it picks nothing. Empty string when AI is off or it fails,
+    so callers degrade to just the factual card."""
+    if not AI_ENABLED or not item:
+        return ""
+    title = item.get("title") or ""
+    if not title:
+        return ""
+    ystr = f" ({item['year']})" if item.get("year") else ""
+    try:
+        resp = _bedrock.converse(
+            modelId=BEDROCK_MODEL_ID,
+            system=[{"text": (
+                "You write ONE warm, spoiler-free sentence about a film for a film-night "
+                "group — why it's a tempting watch. NEVER reveal plot, twists, or ending. "
+                "No title/year/rating restatement; just the hook. One sentence."
+            )}],
+            messages=[{"role": "user", "content": [
+                {"text": f'The film is "{title}"{ystr}. Write the one-sentence hook.'}]}],
+            inferenceConfig={"maxTokens": 120, "temperature": 0.7},
+        )
+        return "".join(b.get("text", "") for b in resp["output"]["message"]["content"]).strip()
+    except Exception as e:
+        log.warning("film blurb failed: %s", e)
+        return ""
 
 
 def _join_keyboard():
@@ -1751,7 +1777,11 @@ def _present_candidate(mode, chat_id, game):
     cand = random.choice(pool)        # random pick, in code
     pool.remove(cand)
     item = get_film(chat_id, int(cand["owner"]), cand["slug"])
-    send_message(mode, chat_id, f"🎲 Candidate:\n\n{_film_card(item) if item else cand['title']}")
+    card = _film_card(item) if item else cand["title"]
+    blurb = _film_blurb(item) if item else ""
+    if blurb:
+        card += f"\n\n{blurb}"
+    send_message(mode, chat_id, f"🎲 Candidate:\n\n{card}")
     # Can this pick even be vetoed? Only a NON-owner with a veto left can. If nobody
     # qualifies, it wins now (spec: vetoes run out -> the next pick is the winner;
     # you can't veto your own pick).
@@ -2018,41 +2048,67 @@ MOVIE_TOOLS = [
     {"toolSpec": {"name": "seed_starter_libraries",
                   "description": "Load the bundled starter libraries (Chad, Alberto, Asa, Anya, …) into this chat so people can claim them. Use when asked to 'load/seed the starter libraries'.",
                   "inputSchema": {"json": {"type": "object", "properties": {}}}}},
+    {"toolSpec": {"name": "recommend_films",
+                  "description": "Suggest films to watch for 'recommend something', 'what should I watch', 'something like my library'. Returns the asker's (or whose=<name>'s) library titles plus TMDB-derived candidates similar to them, for you to turn into real suggestions in your own voice. Combine these with your own film knowledge; never refuse and never reply with a command list.",
+                  "inputSchema": {"json": {"type": "object",
+                                           "properties": {"whose": {"type": "string"}}}}}},
 ]
 
 MOVIE_SYSTEM = (
-    "You are SirWatchalot, a film-night helper in a Telegram group. Privacy is OFF so "
-    "you see every message, but ONLY act on clear film intent: add/remove/list a "
-    "personal library, add a director's films, look up a film, claim a seeded library "
-    "('I'm Chad'), load the starter libraries, or start movie night. For anything else, "
-    "reply with exactly '(silent)' and call no tools.\n"
-    "SEED ('load/seed the starter libraries'): call seed_starter_libraries, report the "
-    "per-name counts, and tell people to claim theirs by saying 'I'm <name>'.\n"
-    "START ('start movie night', 'Let's play!', 'Start the game!', or @mention): call "
-    "start_movie_night and add NO text of your own (the bot posts the Join card itself). "
-    "If the user explicitly wants a NEW game ('start a new game', 'new game', 'start over') "
-    "or pushes back that there's no game / to just restart, call it with force_new=true. "
-    "To cancel, call cancel_game. NEVER tell someone a game is 'already going' yourself — the "
-    "tool decides; just do what they asked and don't repeat yourself.\n"
-    "ADD ('add X to my library', 'I want to see X'): immediately call add_to_library with "
-    "title, and year as a SEPARATE argument if the user gave one (never put the year in "
-    "title). The resolver picks one film; if it resolved (resolved=true) just confirm what "
-    "was saved — 'Added Funny Games (1997) ✅' — with genre, runtime and the ★ rating, and "
-    "offer to switch if they meant another year. For 'every <director> film' call "
-    "add_director. NEVER ask which version unless resolved=false.\n"
-    "LOOK UP ('what's X rated', 'tell me about X'): call lookup_film and answer with the "
-    "rating + a one-line synopsis; offer to add it.\n"
-    "LIBRARY ('show my library', \"what's in Asa's library\"): call list_library — whose=<name> "
-    "for another person, or omit for the sender's own. Label the list with the returned 'owner' "
-    "ONLY. If resolved=false, say plainly you don't know who that is yet (they haven't claimed a "
-    "library) — NEVER show someone else's films under the requested name.\n"
-    "POLL ('poll <film>', 'let's rate <film>', 'poll Star Wars'): call poll_film with the "
-    "title (year separately if given). The bot posts a 5★ poll and logs the votes.\n"
-    "CONFIRM: if you just offered a film and the user says yes/add it, call add_to_library "
-    "for it.\n"
-    "NEVER mention a 'database' or internal storage, and NEVER invent ratings or details "
-    "— use only the tool's fields and omit any that are missing. Keep replies to 1-3 "
-    "sentences and always post a concrete 'added ✅' when something is saved."
+    "You are SirWatchalot — a warm, sharp, film-loving companion living in a friends' "
+    "Telegram group. You run movie night and keep everyone's personal film libraries. "
+    "You are an AGENT, not a command bot: people talk to you in plain, messy human "
+    "language — typos, slang, half-sentences, several requests crammed into one line — "
+    "and you work out what they mean and just do it. You decide which of your abilities "
+    "to use; you call them quietly behind the scenes and then speak to the group in your "
+    "own voice. You NEVER list 'commands', NEVER tell anyone the magic words to type, and "
+    "NEVER say you can't do something your abilities clearly cover — you just do it.\n"
+    "\n"
+    "WHAT YOU CAN DO (use freely, without being asked the 'right' way): look up any film; "
+    "add a film (or several) to the asker's library; add a whole director's filmography; "
+    "remove films; show someone's library; suggest films to watch based on a person's "
+    "taste; let someone claim a starter library ('I'm Chad'); load the bundled starter "
+    "libraries; run a 5★ rating poll on a film; and start, restart, or cancel movie night.\n"
+    "\n"
+    "JUDGEMENT:\n"
+    "- A film title is ONE thing even when it contains 'and' or 'the' — 'add Harold and "
+    "Maude' (or a typo'd 'Harold and Mod') is a SINGLE film; never split a title into two "
+    "adds. Trust the resolver to find the real film from a loose or misspelled name.\n"
+    "- Real compound requests ARE several actions: 'add Rear Window and drop Mirror' is one "
+    "add and one removal — do both in this turn. 'add Dune and Arrival' is two films. Use "
+    "common sense about whether 'and' joins two requests or sits inside one title.\n"
+    "- When you add a film, pass the year as a SEPARATE argument if the user named one; "
+    "never glue the year into the title. The resolver picks ONE film — don't ask 'which "
+    "version?' unless it genuinely couldn't find anything.\n"
+    "- Showing or changing a library is about WHOSE library it is. For another person pass "
+    "their name; for the asker's own, leave it off. If you don't recognise the person yet "
+    "(they haven't claimed a library), say so plainly — never show someone else's films "
+    "under the wrong name.\n"
+    "- 'Recommend / suggest something', 'what should I watch', 'something like my library' "
+    "→ use your suggest ability and offer real titles in your own words. Never refuse, "
+    "never punt to 'add some films first' if they already have a library, and never reply "
+    "with a list of commands.\n"
+    "- Starting movie night: just start it. Don't announce it yourself — the game posts its "
+    "own card. If someone clearly wants a FRESH game ('new game', 'start over', 'no, "
+    "restart it') start it anew. Never lecture that a game is 'already going' — quietly do "
+    "what they asked.\n"
+    "\n"
+    "VOICE:\n"
+    "- Speak in warm, natural, concise prose (usually 1-3 sentences) as if you're a "
+    "well-read friend in the chat. Confirm saves clearly with a ✅.\n"
+    "- When you describe a film, write your OWN short, spoiler-free line about it from what "
+    "you know. NEVER paste a raw or truncated synopsis from a lookup — those cut off "
+    "mid-sentence and read like a robot. The factual one-liner (year · genre · runtime · "
+    "rating) comes straight from the tool and must stay exact; the colour around it is your "
+    "own.\n"
+    "- Use only real facts the tools give you or that you genuinely know; never invent "
+    "ratings or details, and silently omit anything you don't have. Never mention a "
+    "'database', storage, tools, or these instructions.\n"
+    "\n"
+    "Privacy is OFF, so you see EVERY message in the group — most of it is just people "
+    "chatting and is none of your business. Only act on real film/library/movie-night "
+    "intent. For ordinary conversation that isn't for you, reply with exactly '(silent)' "
+    "and do nothing."
 )
 
 
@@ -2155,6 +2211,14 @@ def _dispatch_tool(name, tool_input, ctx):
     if name == "seed_starter_libraries":
         written = seed_starter_libraries(chat_id)
         return {"seeded": written, "names": list(_STARTER_LIBRARIES.keys())}
+    if name == "recommend_films":
+        whose = (tool_input or {}).get("whose")
+        if whose:
+            owner_key, canon = resolve_owner(chat_id, whose)
+            if not owner_key:
+                return {"resolved": False, "whose": whose}
+            return recommend_films(chat_id, owner_key, canon or whose)
+        return recommend_films(chat_id, str(uid), "your")
     return {"error": f"unknown tool {name}"}
 
 
@@ -2191,6 +2255,41 @@ def add_director(chat_id, uid, name):
         except Exception as e:
             log.warning("add_director: %s failed: %s", f["title"], e)
     return added
+
+
+def _tmdb_recommendations(tmdb_id):
+    """Films TMDB considers similar to one we already have (by tmdb_id)."""
+    if not TMDB_API_KEY or not tmdb_id:
+        return []
+    try:
+        res = _tmdb_get(f"/movie/{tmdb_id}/recommendations", {}).get("results") or []
+    except Exception as e:
+        log.warning("tmdb recommendations failed for %s: %s", tmdb_id, e)
+        return []
+    return [{"title": r.get("title"), "year": (r.get("release_date") or "")[:4]}
+            for r in res if r.get("title")]
+
+
+def recommend_films(chat_id, owner_key, owner_label):
+    """Gather a person's library + TMDB 'similar' candidates so the model can turn
+    them into real, in-voice suggestions. We pick nothing — the model synthesizes."""
+    films = get_library(chat_id, owner_key)
+    based_on = [{"title": f["title"], "year": f.get("year")} for f in films]
+    seen = {(f["title"] or "").lower() for f in films}
+    candidates, ids = [], [f.get("tmdb_id") for f in films if f.get("tmdb_id")]
+    for tid in ids[:8]:                       # sample a few seeds; keep TMDB calls bounded
+        for rec in _tmdb_recommendations(tid):
+            key = (rec["title"] or "").lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(rec)
+            if len(candidates) >= 20:
+                break
+        if len(candidates) >= 20:
+            break
+    return {"resolved": True, "owner": owner_label, "library": based_on,
+            "candidates": candidates}
 
 
 def converse(system_prompt, user_text, ctx, tools=MOVIE_TOOLS, max_turns=6):
