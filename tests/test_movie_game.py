@@ -409,6 +409,51 @@ def test_rating_poll_post_vote_change_retract():
     assert (pk, f"rating#{sid}#1") not in STORE
 
 
+def _seed_rating(session, uid, name, film_title, year, stars, rated_at):
+    pk = L._pk(MODE, CHAT)
+    STORE[(pk, f"rating#{session}#{uid}")] = {
+        "PK": pk, "SK": f"rating#{session}#{uid}", "user_id": int(uid), "name": name,
+        "film_id": None, "film_title": film_title, "year": year, "stars": stars,
+        "rated_at": rated_at}
+
+
+def test_get_ratings_reads_back_asas_star_wars_vote():
+    _reset()
+    # Asa (uid 9) rated Star Wars 3★ in the poll we just did; another film/user too.
+    _seed_rating("adhoc-p1", 9, "Asa", "Star Wars", "1977", 3, "2026-06-11T01:00:00Z")
+    _seed_rating("adhoc-p2", 1, "Chad", "Mirror", "1975", 5, "2026-06-11T02:00:00Z")
+    # bare-title, case/space-insensitive match (NOT the "Star Wars (1977)" label)
+    rows = L.get_user_ratings(CHAT, user_id=9, film_title="  star   WARS ")
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["user"] == "Asa" and r["film"] == "Star Wars" and r["year"] == "1977"
+    assert r["stars"] == 3
+    # filtering by film alone finds it; the year-label form must NOT match
+    assert len(L.get_user_ratings(CHAT, film_title="Star Wars")) == 1
+    assert L.get_user_ratings(CHAT, film_title="Star Wars (1977)") == []
+
+
+def test_get_ratings_newest_first_and_user_filter():
+    _reset()
+    _seed_rating("adhoc-p1", 9, "Asa", "Dune", "2021", 4, "2026-06-10T10:00:00Z")
+    _seed_rating("adhoc-p2", 9, "Asa", "Dune", "2021", 2, "2026-06-11T10:00:00Z")
+    rows = L.get_user_ratings(CHAT, user_id=9)
+    assert [r["rated_at"] for r in rows] == ["2026-06-11T10:00:00Z", "2026-06-10T10:00:00Z"]
+    assert L.get_user_ratings(CHAT, user_id=1) == []   # nobody else rated
+
+
+def test_get_ratings_tool_defaults_to_asker():
+    _reset()
+    _seed_rating("adhoc-p1", 7, "Asa", "Star Wars", "1977", 3, "2026-06-11T01:00:00Z")
+    # the model asks "what was my rating in the poll we just did" — no user_id given,
+    # so the dispatch fills in the asker (uid 7).
+    out = L._dispatch_tool("get_ratings", {"film_title": "Star Wars"}, _ctx(7))
+    assert len(out["ratings"]) == 1 and out["ratings"][0]["stars"] == 3
+    # a different asker has nothing logged -> empty (model must not confabulate)
+    out2 = L._dispatch_tool("get_ratings", {"film_title": "Star Wars"}, _ctx(1))
+    assert out2["ratings"] == []
+
+
 def test_poll_film_tool_resolves_and_registers():
     _reset()
     ctx = {"chat_id": CHAT, "user_id": 1, "user_name": "U1", "mode": MODE, "suppress_reply": False}

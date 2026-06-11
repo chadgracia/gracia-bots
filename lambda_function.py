@@ -1863,6 +1863,33 @@ def _handle_rating_vote(mode, rp, ev):
              "stars": stars, "rated_at": _now_iso()})
 
 
+def _norm_title(s):
+    """Case/whitespace-insensitive key for matching a film's bare TITLE."""
+    return " ".join(str(s or "").lower().split())
+
+
+def get_user_ratings(chat_id, user_id=None, film_title=None):
+    """Read back the per-user star ratings written on poll votes (the rating#
+    items). Optional filters by user_id and/or film_title. Film matches the stored
+    bare TITLE attribute — the SK is session-keyed, not film-keyed — and is
+    case/whitespace-insensitive, so pass 'Star Wars', not the 'Star Wars (1977)'
+    poll label (the year lives in a separate field). Newest-first by rated_at."""
+    want = _norm_title(film_title) if film_title else None
+    out = []
+    for r in ddb_query(_pk("movie", chat_id)):
+        if not str(r.get("SK", "")).startswith("rating#"):
+            continue
+        if user_id is not None and int(r.get("user_id", -1)) != int(user_id):
+            continue
+        if want and _norm_title(r.get("film_title")) != want:
+            continue
+        out.append({"user": r.get("name"), "film": r.get("film_title"),
+                    "year": r.get("year"), "stars": r.get("stars"),
+                    "rated_at": r.get("rated_at")})
+    out.sort(key=lambda x: x.get("rated_at") or "", reverse=True)
+    return out
+
+
 def on_poll_answer(mode, ev):
     # Rating poll? (on-demand "poll <film>", or the morning-after poll.) Resolve by
     # poll_id and record the per-user stars — this is not a game/veto vote.
@@ -2063,6 +2090,11 @@ MOVIE_TOOLS = [
                   "description": "Suggest films to watch for 'recommend something', 'what should I watch', 'something like my library'. Returns the asker's (or whose=<name>'s) library titles plus TMDB-derived candidates similar to them, for you to turn into real suggestions in your own voice. Combine these with your own film knowledge; never refuse and never reply with a command list.",
                   "inputSchema": {"json": {"type": "object",
                                            "properties": {"whose": {"type": "string"}}}}}},
+    {"toolSpec": {"name": "get_ratings",
+                  "description": "Read back the star ratings people gave in rating polls. Filter by film_title (the bare title, e.g. 'Star Wars', NOT the 'Star Wars (1977)' poll label) and/or user_id. Omit user_id to mean the person asking — their own rating. Call this whenever someone asks what they or someone rated a film, about a score, or about 'the poll we just did'; answer ONLY from what it returns, never from memory.",
+                  "inputSchema": {"json": {"type": "object",
+                                           "properties": {"user_id": {"type": "integer"},
+                                                          "film_title": {"type": "string"}}}}}},
 ]
 
 MOVIE_SYSTEM = (
@@ -2118,6 +2150,10 @@ MOVIE_SYSTEM = (
     "- 'Recommend something', 'what should I watch', 'something like my shelf' → reach for "
     "real titles in your own words, with a point of view. Never refuse, and never punt to "
     "'add some films first' if they already have a shelf.\n"
+    "- RATINGS: when anyone asks what they (or someone) rated a film, or about 'the poll we "
+    "just did' or a score, you MUST call get_ratings (filter by user and/or film) and answer "
+    "from what it returns. Never answer from memory. If it returns nothing, say plainly you "
+    "don't have a rating logged — don't guess, and never deny a poll happened.\n"
     "- Starting movie night: just start it; don't announce it yourself (the game posts its "
     "own card). If someone wants a FRESH game ('new game', 'start over', 'restart it') start "
     "it anew. Never lecture that a game is 'already going' — quietly do what they asked.\n"
@@ -2253,6 +2289,12 @@ def _dispatch_tool(name, tool_input, ctx):
                 return {"resolved": False, "whose": whose}
             return recommend_films(chat_id, owner_key, canon or whose)
         return recommend_films(chat_id, str(uid), "your")
+    if name == "get_ratings":
+        u = (tool_input or {}).get("user_id")
+        if u is None:
+            u = uid   # default to the asker — "my rating" / "the poll we just did"
+        return {"ratings": get_user_ratings(chat_id, user_id=u,
+                                            film_title=(tool_input or {}).get("film_title"))}
     return {"error": f"unknown tool {name}"}
 
 
