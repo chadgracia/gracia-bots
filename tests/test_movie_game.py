@@ -442,16 +442,63 @@ def test_get_ratings_newest_first_and_user_filter():
     assert L.get_user_ratings(CHAT, user_id=1) == []   # nobody else rated
 
 
-def test_get_ratings_tool_defaults_to_asker():
+def _persona_two_voters():
+    """One Persona poll with TWO real votes via the live path: Chad(1)=5★, Asa(9)=4★."""
     _reset()
-    _seed_rating("adhoc-p1", 7, "Asa", "Star Wars", "1977", 3, "2026-06-11T01:00:00Z")
-    # the model asks "what was my rating in the poll we just did" — no user_id given,
-    # so the dispatch fills in the asker (uid 7).
-    out = L._dispatch_tool("get_ratings", {"film_title": "Star Wars"}, _ctx(7))
-    assert len(out["ratings"]) == 1 and out["ratings"][0]["stars"] == 3
-    # a different asker has nothing logged -> empty (model must not confabulate)
-    out2 = L._dispatch_tool("get_ratings", {"film_title": "Star Wars"}, _ctx(1))
-    assert out2["ratings"] == []
+    res = L._post_rating_poll(MODE, CHAT, "Persona", "1966", film_id=490)
+    pid, sid = res["poll_id"], res["session_id"]
+    L.on_poll_answer(MODE, poll_answer(1, pid, [4]))   # option 4 -> 5 stars
+    L.on_poll_answer(MODE, poll_answer(9, pid, [3]))   # option 3 -> 4 stars
+    pk = L._pk(MODE, CHAT)
+    # give the votes display names (handler stored "U1"/"U9")
+    for u, nm in ((1, "Chad"), (9, "Asa")):
+        row = STORE[(pk, f"rating#{sid}#{u}")]; row["name"] = nm; L.ddb_put(row)
+    return sid
+
+
+def test_get_ratings_everyone_returns_both_with_average():
+    _persona_two_voters()
+    # "how was Persona rated" -> omit whose -> ALL voters + the average (math in code)
+    out = L._dispatch_tool("get_ratings", {"film_title": "Persona"}, _ctx(1))
+    assert out["count"] == 2
+    assert {(r["user"], r["stars"]) for r in out["ratings"]} == {("Chad", 5), ("Asa", 4)}
+    assert out["average"] == 4.5
+    # explicit "everyone" behaves the same as omitting whose
+    out2 = L._dispatch_tool("get_ratings", {"whose": "everyone", "film_title": "Persona"}, _ctx(1))
+    assert out2["count"] == 2 and out2["average"] == 4.5
+
+
+def test_get_ratings_me_returns_only_asker():
+    _persona_two_voters()
+    # asker is Asa (uid 9): "what was my rating for Persona" -> whose='me' -> just Asa's 4★
+    out = L._dispatch_tool("get_ratings", {"whose": "me", "film_title": "Persona"}, _ctx(9))
+    assert out["count"] == 1 and out["ratings"][0]["user"] == "Asa"
+    assert out["ratings"][0]["stars"] == 4
+    # and for Chad as asker -> just his 5★
+    out2 = L._dispatch_tool("get_ratings", {"whose": "me", "film_title": "Persona"}, _ctx(1))
+    assert out2["count"] == 1 and out2["ratings"][0]["stars"] == 5
+
+
+def test_get_ratings_named_person_resolves_to_their_row():
+    sid = _persona_two_voters()
+    # claim the "Asa" starter name onto uid 9 so resolve_owner maps the name -> id
+    _seed_named("Asa", ["A1"])
+    assert L.claim_library(CHAT, "Asa", 9)["status"] == "ok"
+    # "what did Asa rate Persona" (asked by Chad) -> Asa's 4★ only
+    out = L._dispatch_tool("get_ratings", {"whose": "Asa", "film_title": "Persona"}, _ctx(1))
+    assert out["count"] == 1 and out["ratings"][0]["user"] == "Asa"
+    assert out["ratings"][0]["stars"] == 4
+    # an unknown person fails loud (model must not guess / leak someone else's)
+    out2 = L._dispatch_tool("get_ratings", {"whose": "Ghost", "film_title": "Persona"}, _ctx(1))
+    assert out2["resolved"] is False and "ratings" not in out2
+
+
+def test_get_ratings_no_asker_default_anymore():
+    # a user who never voted asking "how was Persona rated" still sees BOTH votes,
+    # not an empty/own-only result (the old asker-default bug).
+    _persona_two_voters()
+    out = L._dispatch_tool("get_ratings", {"film_title": "Persona"}, _ctx(42))
+    assert out["count"] == 2 and out["average"] == 4.5
 
 
 def test_poll_film_tool_resolves_and_registers():

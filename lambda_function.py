@@ -2091,9 +2091,9 @@ MOVIE_TOOLS = [
                   "inputSchema": {"json": {"type": "object",
                                            "properties": {"whose": {"type": "string"}}}}}},
     {"toolSpec": {"name": "get_ratings",
-                  "description": "Read back the star ratings people gave in rating polls. Filter by film_title (the bare title, e.g. 'Star Wars', NOT the 'Star Wars (1977)' poll label) and/or user_id. Omit user_id to mean the person asking — their own rating. Call this whenever someone asks what they or someone rated a film, about a score, or about 'the poll we just did'; answer ONLY from what it returns, never from memory.",
+                  "description": "Read back the star ratings people gave in rating polls. Pass film_title as the bare title (e.g. 'Persona', NOT the 'Persona (1966)' poll label). Set whose to control WHO: omit it (or 'everyone') for ALL voters of that film; 'me' for the person asking; or a person's name to read just theirs. Use this whenever someone asks what they or someone rated a film, how a film was rated, about a score, or 'the poll we just did'; answer ONLY from what it returns, never from memory.",
                   "inputSchema": {"json": {"type": "object",
-                                           "properties": {"user_id": {"type": "integer"},
+                                           "properties": {"whose": {"type": "string"},
                                                           "film_title": {"type": "string"}}}}}},
 ]
 
@@ -2150,10 +2150,13 @@ MOVIE_SYSTEM = (
     "- 'Recommend something', 'what should I watch', 'something like my shelf' → reach for "
     "real titles in your own words, with a point of view. Never refuse, and never punt to "
     "'add some films first' if they already have a shelf.\n"
-    "- RATINGS: when anyone asks what they (or someone) rated a film, or about 'the poll we "
-    "just did' or a score, you MUST call get_ratings (filter by user and/or film) and answer "
-    "from what it returns. Never answer from memory. If it returns nothing, say plainly you "
-    "don't have a rating logged — don't guess, and never deny a poll happened.\n"
+    "- RATINGS: when anyone asks what they or someone rated a film, how a film was rated, "
+    "about a score, or 'the poll we just did', you MUST call get_ratings and answer only from "
+    "what it returns — never from memory. Pick whose by the question: 'what did I rate / my "
+    "rating' → whose='me'; 'how was X rated / what did the group / everyone' → omit whose (ALL "
+    "voters); 'what did <Name> rate' → whose='<Name>'. When several ratings come back, report "
+    "each voter and their stars and give the average. If it returns nothing, say plainly you "
+    "don't have a rating logged for that — don't guess, and never deny a poll happened.\n"
     "- Starting movie night: just start it; don't announce it yourself (the game posts its "
     "own card). If someone wants a FRESH game ('new game', 'start over', 'restart it') start "
     "it anew. Never lecture that a game is 'already going' — quietly do what they asked.\n"
@@ -2290,11 +2293,25 @@ def _dispatch_tool(name, tool_input, ctx):
             return recommend_films(chat_id, owner_key, canon or whose)
         return recommend_films(chat_id, str(uid), "your")
     if name == "get_ratings":
-        u = (tool_input or {}).get("user_id")
-        if u is None:
-            u = uid   # default to the asker — "my rating" / "the poll we just did"
-        return {"ratings": get_user_ratings(chat_id, user_id=u,
-                                            film_title=(tool_input or {}).get("film_title"))}
+        whose = ((tool_input or {}).get("whose") or "").strip()
+        film = (tool_input or {}).get("film_title")
+        target = None                          # None => ALL voters (no user filter)
+        low = whose.lower()
+        if low in ("me", "myself", "i", "mine"):
+            target = uid                       # the asker — injected via ctx, never guessed
+        elif whose and low not in ("everyone", "all", "us", "group", "the group", "anyone"):
+            owner_key, _ = resolve_owner(chat_id, whose)   # a named person -> their user_id
+            if owner_key is None:
+                return {"resolved": False, "whose": whose}   # unknown person; don't guess
+            if not str(owner_key).lstrip("-").isdigit():
+                return {"whose": whose, "ratings": []}        # seeded/unclaimed => never voted
+            target = int(owner_key)
+        ratings = get_user_ratings(chat_id, user_id=target, film_title=film)
+        out = {"ratings": ratings, "count": len(ratings)}
+        # vote math is code, not the model: average only when the rows are one film
+        if ratings and len({_norm_title(r["film"]) for r in ratings}) == 1:
+            out["average"] = round(sum(float(r["stars"]) for r in ratings) / len(ratings), 1)
+        return out
     return {"error": f"unknown tool {name}"}
 
 
