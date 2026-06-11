@@ -189,10 +189,11 @@ this round out] [➕ Add a film]**, since a player can still participate with th
 
 ### Phase 3.5 — Wildcard "one for the hat" (CURRENT)
 
-Right after selections lock (end of Phase 3), **once per game** and only with **2+
-participants**, the bot offers ONE extra film for the hat, built **only from this game's
-participant user_ids** (`game["players"]` — everyone who joined, picks or not; never any
-non-participant's data). Code: `_offer_wildcard` → `_build_wildcard` → consent window.
+Right after selections lock (end of Phase 3), **once per game** and **as long as at least one
+human pick is in the pool** (a solo player with picks counts; a nobody-played / sat-out empty pool
+skips it), the bot offers ONE extra film for the hat, built **only from this game's participant
+user_ids** (`game["players"]` — everyone who joined, picks or not; never any non-participant's
+data). Code: `_offer_wildcard` → `_build_wildcard` → consent window.
 
 - **Novelty filter (all tiers):** the wildcard must be a film they DON'T already have. Every
   candidate is rejected if its slug is in tonight's locked pool, in the per-chat `wildcardlog`

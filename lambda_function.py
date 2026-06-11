@@ -1797,7 +1797,7 @@ def _locked_pool_entries(game):
 # silently. Otherwise it joins the pool as a normal candidate owned by sentinel 0
 # (the "house" — no real Telegram user is 0, so everyone may veto it) and is
 # drawn/vetoed like any other film. Suggestion ladder, strongest first; it
-# ALWAYS yields something. Offered only with 2+ players (the ladder is cross-player).
+# ALWAYS yields something. Offered for any game with 1+ players.
 _WILDCARD_OWNER = 0
 _WILDCARD_WINDOW = 90              # same beat as the veto window
 # Strong, globally-varied fallback for when the taste-rhyme / blind-spot / almanac
@@ -1978,8 +1978,11 @@ def _post_wildcard_pitch(mode, chat_id, item, sugg):
 
 
 def _offer_wildcard(mode, chat_id, game):
-    """End of Phase 3: offer one wildcard, once per game, 2+ players only."""
-    if game.get("wildcard_offered") or len([p for p in game.get("players") or []]) < 2:
+    """End of Phase 3: offer one wildcard 'for the hat', once per game, as long as at
+    least one human pick is in the pool. A solo player with picks counts (their own
+    loves are enough to build from); a nobody-played / sat-out empty pool skips it —
+    there's no 'mix' to add one to."""
+    if game.get("wildcard_offered") or not _locked_pool_entries(game):
         _begin_veto(mode, chat_id, game)
         return
     game["wildcard_offered"] = True
@@ -2067,7 +2070,7 @@ def _begin_veto(mode, chat_id, game):
     else:
         game["pool"] = list(pool_all)
         note = (f"🗳 Veto round! {len(pool_all)} films in the pool, one veto each. "
-                "Vote 🚫 Veto within 90s to knock a pick out.")
+                f"Vote 🚫 Veto within {_VETO_WINDOW}s to knock a pick out.")
     send_message(mode, chat_id, note)
     if not _present_candidate(mode, chat_id, game):   # may short-circuit to a winner
         put_game(game)

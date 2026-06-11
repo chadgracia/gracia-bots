@@ -460,7 +460,9 @@ def test_thumbs_down_swaps_a_slot_and_reasks():
     assert len(sel["shown"]) == 4               # a 4th film was drawn in
     assert sel["slots"][0]["slug"] != slot0_before
     assert L.get_game(CHAT)["phase"] == "SELECTING"   # re-asked, not locked yet
-    L.handle_movie(MODE, message(1, "👍👍👍"))  # keep all -> locks -> solo veto -> winner
+    L.handle_movie(MODE, message(1, "👍👍👍"))  # keep all -> locks -> wildcard offered
+    assert L.get_game(CHAT)["phase"] == "WILDCARD"
+    L.handle_movie(MODE, message(1, "pass"))    # decline -> solo veto -> winner
     assert L.get_game(CHAT) is None
 
 
@@ -572,15 +574,18 @@ def test_wildcard_declined_via_thumbsdown_reaction():
     assert wc_slug not in {e["slug"] for e in g["pool_all"]}
 
 
-def test_wildcard_not_offered_in_solo_game():
+def test_wildcard_offered_in_solo_game():
+    # A solo player's own loves are enough — the wildcard fires for a one-player game too.
     _reset()
     L.add_to_library(CHAT, 1, "Solo Film")
     L.start_game(MODE, CHAT, 1)
     L.handle_movie(MODE, cb(1, "start"))
     L.handle_movie(MODE, message(1, "go"))
-    L.handle_movie(MODE, message(1, "👍"))             # solo lock -> straight to winner
+    L.handle_movie(MODE, message(1, "👍"))             # solo lock -> wildcard offered
+    assert L.get_game(CHAT)["phase"] == "WILDCARD"
+    assert any("🎩" in t for t, _ in SENT)             # the pitch went out
+    L.handle_movie(MODE, message(1, "pass"))           # decline -> solo veto -> winner
     assert L.get_game(CHAT) is None
-    assert not any("🎩" in t for t, _ in SENT)         # no wildcard pitch for one player
 
 
 def test_wildcard_never_repeats_across_games():
@@ -809,8 +814,10 @@ def test_short_pool_prompts_with_buttons_and_play_advances():
     sel = g["selection"]["1"]
     assert sel.get("short_pool") and not sel["locked"] and len(sel["slots"]) == 2
     assert any("qualify" in t.lower() and "no horror" in t.lower() for t, _ in SENT)
-    L.handle_movie(MODE, cb(1, "sp_play"))                # accept the 2
-    assert L.get_game(CHAT) is None   # solo: the locked pick can't be self-vetoed -> it wins
+    L.handle_movie(MODE, cb(1, "sp_play"))                # accept the 2 -> wildcard offered
+    assert L.get_game(CHAT)["phase"] == "WILDCARD"
+    L.handle_movie(MODE, message(1, "pass"))              # decline -> solo veto -> winner
+    assert L.get_game(CHAT) is None
 
 
 def test_short_pool_add_qualifying_reaches_three():
@@ -818,7 +825,9 @@ def test_short_pool_add_qualifying_reaches_three():
     L.handle_movie(MODE, cb(1, "sp_add"))
     assert L.get_game(CHAT)["selection"]["1"]["awaiting_add"] is True
     L.handle_movie(MODE, message(1, "New Drama"))         # fake_lookup -> Drama, fits
-    assert L.get_game(CHAT) is None   # reached 3 -> locked -> solo veto -> winner
+    assert L.get_game(CHAT)["phase"] == "WILDCARD"        # reached 3 -> locked -> wildcard
+    L.handle_movie(MODE, message(1, "pass"))              # decline -> solo veto -> winner
+    assert L.get_game(CHAT) is None
     assert any(f["title"] == "New Drama" for f in L.get_library(CHAT, 1))   # persisted
 
 
