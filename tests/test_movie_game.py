@@ -438,8 +438,28 @@ def test_wildcard_offered_after_lock_builds_canonical():
     assert wc["slug"] == L._slugify("Tokyo Story")     # first canonical (AI off)
     assert wc["slug"] in L._wildcard_log(CHAT)         # logged so it's never repeated
     assert L.get_film(CHAT, 0, wc["slug"]) is not None  # stored as a house lib item
-    assert any("🎩" in t for t, _ in SENT)             # a permission pitch went out
+    pitch = next(t for t, _ in SENT if "🎩" in t)       # the permission pitch
+    assert "may I suggest one" in pitch                 # canonical lead (no fake taste claim)
+    assert "keep only human picks" in pitch             # consent question
     assert g["wildcard_offered"] is True
+
+
+def test_wildcard_novelty_excludes_a_players_library():
+    # A canonical pick already in a player's library (but NOT in tonight's pool) must
+    # be skipped on novelty grounds — the whole point is a film they don't have.
+    _reset()
+    L.add_to_library(CHAT, 1, "Tokyo Story")            # player 1 already owns the 1st canonical
+    game = L.new_game(CHAT, 1)
+    L._add_player(game, 1)
+    L._add_player(game, 2)
+    game["selection"] = {
+        "1": {"locked": True, "slots": [{"slug": "film-a", "title": "Film A"}]},
+        "2": {"locked": True, "slots": [{"slug": "film-b", "title": "Film B"}]},
+    }
+    sugg = L._build_wildcard(CHAT, game)
+    assert sugg is not None
+    assert sugg["slug"] != L._slugify("Tokyo Story")    # owned -> excluded
+    assert sugg["slug"] == L._slugify("Yi Yi")          # next canonical instead
 
 
 def test_wildcard_accept_via_backstop_joins_pool():

@@ -185,26 +185,34 @@ participants**, the bot offers ONE extra film for the hat, built **only from thi
 participant user_ids** (`game["players"]` — everyone who joined, picks or not; never any
 non-participant's data). Code: `_offer_wildcard` → `_build_wildcard` → consent window.
 
+- **Novelty filter (all tiers):** the wildcard must be a film they DON'T already have. Every
+  candidate is rejected if its slug is in tonight's locked pool, in the per-chat `wildcardlog`
+  (**never suggested twice across games**), **or in ANY current player's library**
+  (`_player_library_slugs`). The whole point is a discovery.
 - **Suggestion ladder** (`_build_wildcard`), strongest first; it ALWAYS yields something:
-  1. **Cross-player taste rhyme / shared blind spot** — `_wildcard_via_llm` gives the model a
-     participants-only digest (each player's library, their ≥4★ ratings, past winners they took
-     part in) and asks for ONE discovery, returning `{title, year, reason}` where the reason
-     **names the actual players**. AI-gated (off → skipped).
+  1. **Taste rhyme** (`_wildcard_via_llm`) — the **default whenever any player has library/rating
+     data**. Builds the case from what these players LOVE (their saved films + ≥4★ ratings),
+     returning `{title, year, reason}` where the reason **names the actual loved films** and is
+     written in the same warm film-essayist voice as the candidate/winner blurbs. **Never argues
+     from absence** ("not on X's shelf" is not a reason they'd like it). On a Bedrock error,
+     empty/unparseable reply, or a candidate rejected by the novelty filter, it **retries once**
+     before dropping down; each fall-through reason is logged. AI-gated (off → skipped).
   2. **Almanac** — `_film_almanac(date)`: today's film-history events turned into a real pick.
      **DEFERRED**: currently a stub returning `[]` (kept isolated + swappable; the
      boxofficeprophets / onthisday scrape will be wired and validated against the live pages in a
      follow-up). The ladder falls through it cleanly.
-  3. **Canonical fallback** (`_WILDCARD_CANON`) — a strong, globally-varied list; the first not in
-     tonight's pool and never suggested before, framed honestly ("no clever hook tonight, but…").
-- **Verify + dedupe (code):** every candidate is confirmed via `lookup_film`; rejected if it's in
-  tonight's locked pool or in the per-chat `wildcardlog` (so **the same film is never suggested
-  twice across games**). The chosen film is persisted as an **ownerless "house" library item under
-  sentinel owner `0`** (no real Telegram user is 0), so it rides the existing pick/veto/winner path
-  with zero special-casing.
-- **Pitch:** one message, SirWatchAlot voice, plain text, asking permission ("Mind if I add one to
-  the hat?") + the factual card. Tiers 1–2 lead with the player-naming reason; the canonical tier
-  with the honest framing.
-- **Consent (text/reaction window, lazy backstop — `_wildcard_backstop`, same 90s beat):** any
+  3. **Canonical fallback** (`_WILDCARD_CANON`) — a **true last resort** (logged as such): a strong,
+     globally-varied list, first entry passing the novelty filter, framed honestly with no taste claim.
+- **Verify (code):** every candidate is confirmed via `lookup_film` before use, then persisted as an
+  **ownerless "house" library item under sentinel owner `0`** (no real Telegram user is 0), so it
+  rides the existing pick/veto/winner path with zero special-casing.
+- **Pitch** (`_post_wildcard_pitch`): one plain-text message in SirWatchAlot voice (no markdown
+  asterisks — Telegram leaks them). Structure: header ("My Pick for the Night" / canonical: "Before
+  we start, may I suggest one?") → the **reason first**, from what players love (naming the films) →
+  the film + factual card → **one in-voice line on why the film itself matters** (via `_film_blurb`,
+  the same voice as the candidate card) → close: "Should we add it to the mix, or keep only human
+  picks in the hat tonight?".
+- **Consent (text/reaction window, lazy backstop — `_wildcard_backstop`, same beat):** any
   participant 👎 on the pitch, or a short "no/pass/nope/skip" (`_wildcard_dissent`), **drops it
   silently** and proceeds to the pick. A clear "yes" adds it now; otherwise the beat lapses and it's
   accepted. Accepted → `_begin_veto` folds it into `pool_all` as a **normal, drawable, vetoable**

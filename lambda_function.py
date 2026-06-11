@@ -1748,6 +1748,17 @@ def _wildcard_remember(chat_id, slug):
              "slugs": sorted(seen), "updated_at": _now_iso()})
 
 
+def _player_library_slugs(chat_id, players):
+    """Every slug already in ANY current player's library — the wildcard must be a
+    film they DON'T have, so these are excluded from every tier of the ladder."""
+    owned = set()
+    for p in players:
+        for f in get_library(chat_id, str(p)):
+            if f.get("slug"):
+                owned.add(f["slug"])
+    return owned
+
+
 def _film_almanac(date):
     """Today's film-history events -> [{title, year}] for the almanac tier.
     DEFERRED: a stub until the boxofficeprophets / onthisday scrape is wired and
@@ -1756,10 +1767,12 @@ def _film_almanac(date):
     return []
 
 
-def _wildcard_via_llm(chat_id, players, pool_slugs, seen_slugs):
-    """Tiers 1-2: a taste-rhyme or shared blind-spot pick across THESE players
-    only. The model proposes; code verifies + dedupes. None if AI is off or it
-    yields nothing usable."""
+def _wildcard_via_llm(chat_id, players):
+    """Tier 1: a taste-rhyme pick built from what THESE players LOVE (the films they
+    saved / rated highly), with the reason written in the same warm, film-essayist
+    voice as the candidate/winner blurbs. The model proposes a film + an in-voice
+    reason that NAMES the loved films driving it; code verifies + dedupes. Returns
+    {title, year, reason} or None (logging WHY: bedrock error vs empty/unparseable)."""
     if not AI_ENABLED:
         return None
     pset = {str(p) for p in players}
@@ -1770,7 +1783,7 @@ def _wildcard_via_llm(chat_id, players, pool_slugs, seen_slugs):
         loved = [f"{r['film']} ({r['stars']}★)"
                  for r in get_user_ratings(chat_id, user_id=p)
                  if int(r.get("stars") or 0) >= 4]
-        digest.append({"player": name, "library": lib[:40], "loved": loved[:20]})
+        digest.append({"player": name, "library": lib[:60], "loved": loved[:25]})
     won = sorted({h.get("winner_title") for h in ddb_query(_pk("movie", chat_id))
                   if str(h.get("SK", "")).startswith("history#")
                   and set(map(str, h.get("participants") or [])) & pset
@@ -1779,74 +1792,110 @@ def _wildcard_via_llm(chat_id, players, pool_slugs, seen_slugs):
         resp = _bedrock.converse(
             modelId=BEDROCK_MODEL_ID,
             system=[{"text": (
-                "You are SirWatchAlot choosing ONE wildcard film 'for the hat' on movie "
-                "night, built ONLY from these specific players' tastes. Prefer a film NONE "
-                "of them has yet (a discovery). Two strategies, strongest first: (1) a taste "
-                "rhyme connecting what these players rated highly or keep saving; (2) a shared "
-                "blind spot — a country, era or kind of cinema absent from their shelves. "
-                "Return STRICT JSON {\"title\":..., \"year\":..., \"reason\":...}. The reason "
-                "MUST name actual players and the real connection (e.g. 'Asa rated Poetry a 5 "
-                "and Khimka keeps circling Lynch — this sits between them'), one sentence, "
-                "plain text, no markdown. Choose a real, findable film."
+                "You are SirWatchAlot, a warm film-essayist host, choosing ONE wildcard film "
+                "'for the hat' on movie night — built from what THESE specific players LOVE. "
+                "Make the case from what they have SAVED or rated highly; NAME those films. "
+                "NEVER argue from absence — that a film 'isn't on someone's shelf' is not a "
+                "reason they'd like it; the case must come from love, not from a gap. The pick "
+                "MUST be a real, findable film that is NOT in any player's library and not in "
+                "the lists provided. Prefer a discovery none of them has. "
+                "Return STRICT JSON {\"title\":..., \"year\":..., \"reason\":...}. 'reason' is "
+                "1-2 sentences, plain text, NO markdown or asterisks (Telegram leaks them), in "
+                "your unhurried, slightly awed voice, naming the actual players and the actual "
+                "films they love that lead you to this pick — e.g. \"Chad's love of family "
+                "epics — Tokyo Story, Scenes from a Marriage — and Asa's passion for Asian "
+                "cinema — Poetry, To Live — bring me to Yi Yi.\" End on the film you are "
+                "suggesting. Do not restate year/runtime/rating; just the connection."
             )}],
             messages=[{"role": "user", "content": [{"text": json.dumps(
-                {"players": digest, "already_won_here": won,
-                 "already_in_tonights_hat": sorted(pool_slugs)})}]}],
-            inferenceConfig={"maxTokens": 300, "temperature": 0.8},
+                {"players": digest, "already_won_here": won})}]}],
+            inferenceConfig={"maxTokens": 280, "temperature": 0.8},
         )
         raw = "".join(b.get("text", "") for b in resp["output"]["message"]["content"]).strip()
         m = re.search(r"\{.*\}", raw, re.S)
         data = json.loads(m.group(0)) if m else {}
     except Exception as e:
-        log.warning("wildcard llm failed: %s", e)
+        log.warning("wildcard tier1: bedrock error: %s", e)
         return None
     title = (data.get("title") or "").strip()
     if not title:
+        log.warning("wildcard tier1: empty/unparseable LLM reply: %r", raw[:160])
         return None
     return {"title": title, "year": data.get("year"),
             "reason": (data.get("reason") or "").strip(), "tier": "taste"}
 
 
 def _build_wildcard(chat_id, game):
-    """Run the ladder; return a VERIFIED film {title, year, slug, reason, tier}
-    not in tonight's pool and never suggested before in this chat. None only if
-    even the canonical list is exhausted (effectively never)."""
+    """Run the ladder; return a VERIFIED film {title, year, slug, reason, tier} that
+    is NOT in tonight's pool, NOT already suggested in this chat, and NOT in ANY
+    current player's library. Tier 1 (taste rhyme) is the default whenever there's
+    library/rating data and retries once before dropping to canonical; canonical is
+    a true last resort. Logs WHY it falls through. None only if all tiers exhaust."""
+    players = game["players"]
     pool_slugs = {e["slug"] for e in _locked_pool_entries(game)}
-    blocked = pool_slugs | _wildcard_log(chat_id)
+    owned = _player_library_slugs(chat_id, players)
+    blocked = pool_slugs | _wildcard_log(chat_id) | owned   # novelty filter, all tiers
 
     def verify(title, year, reason, tier):
         info = lookup_film_cached(title, year)
         if not info.get("found"):
-            return None
+            return None, "not_found"
         slug = info.get("slug") or _slugify(title)
         if slug in blocked:
-            return None
-        return {"title": info.get("title") or title, "year": info.get("year") or year,
-                "slug": slug, "reason": reason, "tier": tier}
+            return None, "already_owned_or_suggested"      # in pool / log / a player's library
+        return ({"title": info.get("title") or title, "year": info.get("year") or year,
+                 "slug": slug, "reason": reason, "tier": tier}, "ok")
 
-    cand = _wildcard_via_llm(chat_id, game["players"], pool_slugs, _wildcard_log(chat_id))
-    if cand:
-        v = verify(cand["title"], cand.get("year"), cand.get("reason"), cand.get("tier"))
+    # Tier 1 — taste rhyme. The default whenever ANY player has library/rating data;
+    # a 60-film player must never fall to canonical. Retry once on error/rejection.
+    has_data = bool(owned) or any(get_user_ratings(chat_id, user_id=p) for p in players)
+    if AI_ENABLED and has_data:
+        for attempt in (1, 2):
+            cand = _wildcard_via_llm(chat_id, players)
+            if not cand:
+                log.warning("wildcard tier1 attempt %d/2: no usable candidate", attempt)
+                continue
+            v, why = verify(cand["title"], cand.get("year"), cand.get("reason"), "taste")
+            if v:
+                return v
+            log.warning("wildcard tier1 attempt %d/2: candidate %r rejected (%s)",
+                        attempt, cand.get("title"), why)
+        log.warning("wildcard: tier1 exhausted after retry -> falling through")
+    elif AI_ENABLED:
+        log.info("wildcard: no library/rating data for players -> skipping tier1")
+
+    for ev in _film_almanac(_now_iso()[:10]):       # tier 3 (deferred stub -> [])
+        v, _why = verify(ev.get("title", ""), ev.get("year"), None, "almanac")
         if v:
             return v
-    for ev in _film_almanac(_now_iso()[:10]):      # tier 3 (deferred stub -> [])
-        v = verify(ev.get("title", ""), ev.get("year"), None, "almanac")
+
+    for title, year in _WILDCARD_CANON:             # tier 4: last-resort canonical
+        v, _why = verify(title, year, None, "canon")
         if v:
+            log.warning("wildcard: fell through to CANONICAL pick %r", title)
             return v
-    for title, year in _WILDCARD_CANON:            # tier 4: honest canonical fallback
-        v = verify(title, year, None, "canon")
-        if v:
-            return v
+    log.error("wildcard: ladder fully exhausted — nothing to offer")
     return None
 
 
 def _post_wildcard_pitch(mode, chat_id, item, sugg):
-    if sugg["tier"] in ("taste", "almanac") and sugg.get("reason"):
-        lead = f"{sugg['reason']} Mind if I add one to the hat?"
-    else:                                          # canonical fallback — framed honestly
-        lead = "No clever hook tonight, but you should all see this — mind if I add it to the hat?"
-    body = f"{lead}\n\n\U0001f3a9 {_film_card(item)}\n\n(👎 or 'pass' to skip — otherwise it's in.)"
-    return send_message(mode, chat_id, body)
+    """The pitch, in SirWatchAlot's voice. Structure: header -> the REASON (from what
+    the players love, naming films) -> the film + card -> one in-voice line on why the
+    film itself matters (same voice as the candidate blurb) -> the consent question."""
+    blurb = _film_blurb(item)                       # one Cousins-voice line on the film
+    parts = []
+    if sugg.get("tier") == "taste" and sugg.get("reason"):
+        parts.append("My Pick for the Night")
+        parts.append(sugg["reason"])                # case from love, never from absence
+    else:                                           # canonical last resort — no taste claim
+        parts.append("Before we start, may I suggest one?")
+    card_block = f"\U0001f3a9 {_film_card(item)}"
+    if blurb:
+        card_block += f"\n{blurb}"
+    parts.append(card_block)
+    parts.append("Should we add it to the mix, or keep only human picks in the hat "
+                 "tonight? (👎 or 'pass' to keep it human-only.)")
+    return send_message(mode, chat_id, "\n\n".join(parts))
 
 
 def _offer_wildcard(mode, chat_id, game):
