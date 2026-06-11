@@ -1024,6 +1024,9 @@ def new_game(chat_id, initiator_id):
         "pool_all": [],    # full locked pool (kept for relax re-filtering)
         "pool": [],        # [{owner, slug, title}] eligible after the filter
         "current": None,   # {film, poll_id, poll_message_id, presented_at, resolved}
+        # wildcard "one for the hat" — offered once after selections lock (Phase 3)
+        "wildcard_offered": False, "wildcard_open": False, "wildcard_deadline": None,
+        "wildcard_msg_id": None, "wildcard": None,
         "created_at": now, "started_at": now, "last_activity_at": now,
     }
 
@@ -1550,7 +1553,7 @@ def _ask_player(mode, chat_id, game):
     them below 3, offer the short-pool buttons instead of a silent short deal."""
     uid = _current_selecting_uid(game)
     if uid is None:
-        _begin_veto(mode, chat_id, game)
+        _offer_wildcard(mode, chat_id, game)   # Phase 3 done -> offer one for the hat
         return
     picks = _draw_eligible(chat_id, uid, game, 3, set())
     sel = {"slots": [{"slug": f["slug"], "title": f["title"]} for f in picks],
@@ -1693,14 +1696,216 @@ def _eligible_pool(chat_id, game):
     return eligible, unknown
 
 
-def _begin_veto(mode, chat_id, game):
-    pool_all = []
+def _locked_pool_entries(game):
+    """The pool drawn from players' LOCKED selections: [{owner, slug, title}]."""
+    out = []
     for uid in game["players"]:
         sel = game["selection"].get(str(uid), {})
         if not sel.get("locked"):
             continue
         for s in sel.get("slots", []):
-            pool_all.append({"owner": str(uid), "slug": s["slug"], "title": s["title"]})
+            out.append({"owner": str(uid), "slug": s["slug"], "title": s["title"]})
+    return out
+
+
+# ---- wildcard "one for the hat" (end of Phase 3, once per game) ------------ #
+# After selections lock, the bot offers ONE extra film built ONLY from THIS
+# game's participants (all of game["players"], picks or not — never anyone else).
+# Permission-gated: a beat to react; any participant 👎 / "no" / "pass" drops it
+# silently. Otherwise it joins the pool as a normal candidate owned by sentinel 0
+# (the "house" — no real Telegram user is 0, so everyone may veto it) and is
+# drawn/vetoed like any other film. Suggestion ladder, strongest first; it
+# ALWAYS yields something. Offered only with 2+ players (the ladder is cross-player).
+_WILDCARD_OWNER = 0
+_WILDCARD_WINDOW = 90              # same beat as the veto window
+# Strong, globally-varied fallback for when the taste-rhyme / blind-spot / almanac
+# tiers yield nothing. Tried in order; first not already in tonight's pool and
+# never suggested before in this chat.
+_WILDCARD_CANON = [
+    ("Tokyo Story", 1953), ("Yi Yi", 2000), ("Close-Up", 1990),
+    ("A Brighter Summer Day", 1991), ("The Spirit of the Beehive", 1973),
+    ("Stalker", 1979), ("Come and See", 1985), ("In the Mood for Love", 2000),
+    ("The Battle of Algiers", 1966), ("Black Girl", 1966), ("Wanda", 1970),
+    ("Daisies", 1966), ("Touki Bouki", 1973), ("A City of Sadness", 1989),
+    ("The Gleaners and I", 2000), ("Memories of Murder", 2003),
+]
+
+
+def _wildcard_log(chat_id):
+    rec = ddb_get(_pk("movie", chat_id), "wildcardlog") or {}
+    return set(rec.get("slugs") or [])
+
+
+def _wildcard_remember(chat_id, slug):
+    seen = _wildcard_log(chat_id)
+    seen.add(slug)
+    ddb_put({"PK": _pk("movie", chat_id), "SK": "wildcardlog",
+             "slugs": sorted(seen), "updated_at": _now_iso()})
+
+
+def _film_almanac(date):
+    """Today's film-history events -> [{title, year}] for the almanac tier.
+    DEFERRED: a stub until the boxofficeprophets / onthisday scrape is wired and
+    validated against the live pages (kept isolated + swappable). Returns [] so
+    the ladder falls through to a canonical pick — the feature never goes silent."""
+    return []
+
+
+def _wildcard_via_llm(chat_id, players, pool_slugs, seen_slugs):
+    """Tiers 1-2: a taste-rhyme or shared blind-spot pick across THESE players
+    only. The model proposes; code verifies + dedupes. None if AI is off or it
+    yields nothing usable."""
+    if not AI_ENABLED:
+        return None
+    pset = {str(p) for p in players}
+    digest = []
+    for p in players:
+        name = _canonical_for_user(chat_id, p) or mention_for(chat_id, p)
+        lib = [f["title"] for f in get_library(chat_id, str(p))]
+        loved = [f"{r['film']} ({r['stars']}★)"
+                 for r in get_user_ratings(chat_id, user_id=p)
+                 if int(r.get("stars") or 0) >= 4]
+        digest.append({"player": name, "library": lib[:40], "loved": loved[:20]})
+    won = sorted({h.get("winner_title") for h in ddb_query(_pk("movie", chat_id))
+                  if str(h.get("SK", "")).startswith("history#")
+                  and set(map(str, h.get("participants") or [])) & pset
+                  and h.get("winner_title")})
+    try:
+        resp = _bedrock.converse(
+            modelId=BEDROCK_MODEL_ID,
+            system=[{"text": (
+                "You are SirWatchAlot choosing ONE wildcard film 'for the hat' on movie "
+                "night, built ONLY from these specific players' tastes. Prefer a film NONE "
+                "of them has yet (a discovery). Two strategies, strongest first: (1) a taste "
+                "rhyme connecting what these players rated highly or keep saving; (2) a shared "
+                "blind spot — a country, era or kind of cinema absent from their shelves. "
+                "Return STRICT JSON {\"title\":..., \"year\":..., \"reason\":...}. The reason "
+                "MUST name actual players and the real connection (e.g. 'Asa rated Poetry a 5 "
+                "and Khimka keeps circling Lynch — this sits between them'), one sentence, "
+                "plain text, no markdown. Choose a real, findable film."
+            )}],
+            messages=[{"role": "user", "content": [{"text": json.dumps(
+                {"players": digest, "already_won_here": won,
+                 "already_in_tonights_hat": sorted(pool_slugs)})}]}],
+            inferenceConfig={"maxTokens": 300, "temperature": 0.8},
+        )
+        raw = "".join(b.get("text", "") for b in resp["output"]["message"]["content"]).strip()
+        m = re.search(r"\{.*\}", raw, re.S)
+        data = json.loads(m.group(0)) if m else {}
+    except Exception as e:
+        log.warning("wildcard llm failed: %s", e)
+        return None
+    title = (data.get("title") or "").strip()
+    if not title:
+        return None
+    return {"title": title, "year": data.get("year"),
+            "reason": (data.get("reason") or "").strip(), "tier": "taste"}
+
+
+def _build_wildcard(chat_id, game):
+    """Run the ladder; return a VERIFIED film {title, year, slug, reason, tier}
+    not in tonight's pool and never suggested before in this chat. None only if
+    even the canonical list is exhausted (effectively never)."""
+    pool_slugs = {e["slug"] for e in _locked_pool_entries(game)}
+    blocked = pool_slugs | _wildcard_log(chat_id)
+
+    def verify(title, year, reason, tier):
+        info = lookup_film_cached(title, year)
+        if not info.get("found"):
+            return None
+        slug = info.get("slug") or _slugify(title)
+        if slug in blocked:
+            return None
+        return {"title": info.get("title") or title, "year": info.get("year") or year,
+                "slug": slug, "reason": reason, "tier": tier}
+
+    cand = _wildcard_via_llm(chat_id, game["players"], pool_slugs, _wildcard_log(chat_id))
+    if cand:
+        v = verify(cand["title"], cand.get("year"), cand.get("reason"), cand.get("tier"))
+        if v:
+            return v
+    for ev in _film_almanac(_now_iso()[:10]):      # tier 3 (deferred stub -> [])
+        v = verify(ev.get("title", ""), ev.get("year"), None, "almanac")
+        if v:
+            return v
+    for title, year in _WILDCARD_CANON:            # tier 4: honest canonical fallback
+        v = verify(title, year, None, "canon")
+        if v:
+            return v
+    return None
+
+
+def _post_wildcard_pitch(mode, chat_id, item, sugg):
+    if sugg["tier"] in ("taste", "almanac") and sugg.get("reason"):
+        lead = f"{sugg['reason']} Mind if I add one to the hat?"
+    else:                                          # canonical fallback — framed honestly
+        lead = "No clever hook tonight, but you should all see this — mind if I add it to the hat?"
+    body = f"{lead}\n\n\U0001f3a9 {_film_card(item)}\n\n(👎 or 'pass' to skip — otherwise it's in.)"
+    return send_message(mode, chat_id, body)
+
+
+def _offer_wildcard(mode, chat_id, game):
+    """End of Phase 3: offer one wildcard, once per game, 2+ players only."""
+    if game.get("wildcard_offered") or len([p for p in game.get("players") or []]) < 2:
+        _begin_veto(mode, chat_id, game)
+        return
+    game["wildcard_offered"] = True
+    sugg = _build_wildcard(chat_id, game)
+    if not sugg:
+        _begin_veto(mode, chat_id, game)           # ladder exhausted (effectively never)
+        return
+    # Persist as an ownerless 'house' library item so it rides the normal
+    # pick/veto/winner path with zero special-casing.
+    item, _info = add_to_library(chat_id, _WILDCARD_OWNER, sugg["title"], sugg.get("year"))
+    _wildcard_remember(chat_id, item["slug"])      # never suggest again in this chat
+    game["wildcard"] = {"owner": str(_WILDCARD_OWNER), "slug": item["slug"],
+                        "title": item["title"]}
+    game["phase"] = "WILDCARD"
+    game["wildcard_open"] = True
+    game["wildcard_deadline"] = _now_epoch() + _WILDCARD_WINDOW
+    resp = _post_wildcard_pitch(mode, chat_id, item, sugg)
+    game["wildcard_msg_id"] = (resp or {}).get("result", {}).get("message_id")
+    put_game(game)
+
+
+def _wildcard_accept(mode, chat_id, game):
+    game["wildcard_open"] = False
+    put_game(game)
+    _begin_veto(mode, chat_id, game)               # _begin_veto folds in the wildcard
+
+
+def _wildcard_decline(mode, chat_id, game):
+    wc = game.get("wildcard")
+    if wc:
+        ddb_delete(_pk("movie", chat_id), f"lib#{wc['owner']}#{wc['slug']}")
+    game["wildcard"] = None
+    game["wildcard_open"] = False
+    put_game(game)
+    _begin_veto(mode, chat_id, game)               # drop silently, proceed to the pick
+
+
+def _wildcard_backstop(mode, chat_id, game):
+    """No scheduler: if the consent beat lapses with no dissent, accept it."""
+    if game and game.get("phase") == "WILDCARD" and game.get("wildcard_open"):
+        if _now_epoch() >= (game.get("wildcard_deadline") or 0):
+            _wildcard_accept(mode, chat_id, game)
+            return True
+    return False
+
+
+def _wildcard_dissent(text):
+    if "👎" in (text or ""):
+        return True
+    words = set(re.findall(r"[a-z']+", (text or "").lower()))
+    return bool(words & {"no", "nope", "nah", "pass", "skip", "veto", "drop",
+                         "dont", "don't", "nay"})
+
+
+def _begin_veto(mode, chat_id, game):
+    pool_all = _locked_pool_entries(game)
+    wc = game.get("wildcard")
+    if wc:                                  # an accepted wildcard joins the hat
+        pool_all.append(wc)
     game["phase"] = "VETO"
     game["status"] = "picking"
     game["pool_all"] = pool_all
@@ -2423,9 +2628,20 @@ def on_message(mode, ev):
     # advances the corresponding window.
     if _veto_backstop(mode, chat_id, game):
         return
+    if _wildcard_backstop(mode, chat_id, game):
+        return
     if _relax_backstop(mode, chat_id, game):
         return
     if _constraints_backstop(mode, chat_id, game):
+        return
+    # Wildcard consent window: only a participant's 👎/"pass" (drop) or a clear
+    # yes (add now) acts; everything else just waits for the beat to lapse.
+    if game and game.get("phase") == "WILDCARD" and game.get("wildcard_open"):
+        if uid is not None and int(uid) in [int(p) for p in game["players"]] and text:
+            if _wildcard_dissent(text):
+                _wildcard_decline(mode, chat_id, game)
+            elif _is_affirmative(text):
+                _wildcard_accept(mode, chat_id, game)
         return
     # Empty-pool relax reply (within the window).
     if game and game.get("awaiting_relax"):
@@ -2491,8 +2707,20 @@ def handle_movie(mode, ev):
 
 
 def _on_reaction(mode, ev):
-    # Selection is reply-driven now; reactions only nudge the veto backstop.
-    _veto_backstop(mode, ev["chat_id"], get_game(ev["chat_id"]))
+    chat_id = ev["chat_id"]
+    game = get_game(chat_id)
+    if _wildcard_backstop(mode, chat_id, game):
+        return
+    # A 👎 from a participant on the wildcard pitch drops it (silent), proceed to pick.
+    if (game and game.get("phase") == "WILDCARD" and game.get("wildcard_open")
+            and ev.get("message_id") == game.get("wildcard_msg_id")
+            and ev.get("user_id") is not None
+            and int(ev["user_id"]) in [int(p) for p in game["players"]]
+            and any("👎" in (e or "") for e in (ev.get("reactions") or []))):
+        _wildcard_decline(mode, chat_id, game)
+        return
+    # Selection is reply-driven now; reactions otherwise only nudge the veto backstop.
+    _veto_backstop(mode, chat_id, game)
 
 
 # --------------------------------------------------------------------------- #

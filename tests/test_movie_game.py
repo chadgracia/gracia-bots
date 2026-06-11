@@ -199,7 +199,9 @@ def _two_player_game_to_veto():
     L.handle_movie(MODE, message(1, "go"))  # no constraints -> SELECTING (asks player 1)
     assert L.get_game(CHAT)["phase"] == "SELECTING"
     L.handle_movie(MODE, message(1, "👍"))  # player 1 keeps (1 film) -> next player
-    L.handle_movie(MODE, message(2, "👍"))  # player 2 keeps -> VETO
+    L.handle_movie(MODE, message(2, "👍"))  # player 2 keeps -> wildcard offered (2 players)
+    assert L.get_game(CHAT)["phase"] == "WILDCARD"
+    L.handle_movie(MODE, message(1, "pass"))  # decline the wildcard -> VETO (2-film pool)
     return L.get_game(CHAT)
 
 
@@ -339,9 +341,104 @@ def test_selection_is_sequential_one_player_at_a_time():
     L.handle_movie(MODE, message(1, "👍👍👍"))
     g = L.get_game(CHAT)
     assert g["selection"]["1"]["locked"] and L._current_selecting_uid(g) == 2
-    # player 2 keeps -> VETO
+    # player 2 keeps -> both locked -> wildcard offered (2 players)
     L.handle_movie(MODE, message(2, "👍👍👍"))
+    assert L.get_game(CHAT)["phase"] == "WILDCARD"
+    L.handle_movie(MODE, message(1, "pass"))   # decline -> VETO
     assert L.get_game(CHAT)["phase"] == "VETO"
+
+
+# ---- wildcard "one for the hat" ------------------------------------------- #
+def _two_player_to_wildcard():
+    """Two players (one film each) driven through selection to the wildcard offer."""
+    _reset()
+    L.add_to_library(CHAT, 1, "Film A")
+    L.add_to_library(CHAT, 2, "Film B")
+    L.start_game(MODE, CHAT, 1)
+    L.handle_movie(MODE, cb(2, "join"))
+    L.handle_movie(MODE, cb(1, "start"))
+    L.handle_movie(MODE, message(1, "go"))
+    L.handle_movie(MODE, message(1, "👍"))
+    L.handle_movie(MODE, message(2, "👍"))
+    g = L.get_game(CHAT)
+    assert g["phase"] == "WILDCARD" and g["wildcard"]
+    return g
+
+
+def test_wildcard_offered_after_lock_builds_canonical():
+    g = _two_player_to_wildcard()
+    wc = g["wildcard"]
+    assert wc["owner"] == "0"                          # ownerless 'house' candidate
+    assert wc["slug"] not in {"film-a", "film-b"}      # not in tonight's pool
+    assert wc["slug"] == L._slugify("Tokyo Story")     # first canonical (AI off)
+    assert wc["slug"] in L._wildcard_log(CHAT)         # logged so it's never repeated
+    assert L.get_film(CHAT, 0, wc["slug"]) is not None  # stored as a house lib item
+    assert any("🎩" in t for t, _ in SENT)             # a permission pitch went out
+    assert g["wildcard_offered"] is True
+
+
+def test_wildcard_accept_via_backstop_joins_pool():
+    g = _two_player_to_wildcard()
+    wc_slug = g["wildcard"]["slug"]
+    NOW[0] += L._WILDCARD_WINDOW + 1                    # the consent beat lapses
+    L.handle_movie(MODE, message(2, "so what's the pick"))   # any update fires backstop
+    g = L.get_game(CHAT)
+    assert g is not None and g["phase"] == "VETO"
+    slugs = {e["slug"] for e in g["pool_all"]}
+    assert wc_slug in slugs and {"film-a", "film-b"} <= slugs   # wildcard joined the hat
+    assert any(e["owner"] == "0" for e in g["pool_all"])
+
+
+def test_wildcard_declined_via_text_drops_silently():
+    g = _two_player_to_wildcard()
+    wc_slug = g["wildcard"]["slug"]
+    L.handle_movie(MODE, message(1, "nah pass"))       # a participant declines
+    g = L.get_game(CHAT)
+    assert g["phase"] == "VETO" and g["wildcard"] is None
+    assert wc_slug not in {e["slug"] for e in g["pool_all"]}   # not in the hat
+    assert L.get_film(CHAT, 0, wc_slug) is None         # the house item is cleaned up
+    assert g["wildcard_offered"] is True                # still won't re-offer
+
+
+def test_wildcard_declined_via_thumbsdown_reaction():
+    g = _two_player_to_wildcard()
+    wc_slug, msg_id = g["wildcard"]["slug"], g["wildcard_msg_id"]
+    L.handle_movie(MODE, reaction(2, msg_id, "👎"))    # 👎 from a participant on the pitch
+    g = L.get_game(CHAT)
+    assert g["phase"] == "VETO" and g["wildcard"] is None
+    assert wc_slug not in {e["slug"] for e in g["pool_all"]}
+
+
+def test_wildcard_not_offered_in_solo_game():
+    _reset()
+    L.add_to_library(CHAT, 1, "Solo Film")
+    L.start_game(MODE, CHAT, 1)
+    L.handle_movie(MODE, cb(1, "start"))
+    L.handle_movie(MODE, message(1, "go"))
+    L.handle_movie(MODE, message(1, "👍"))             # solo lock -> straight to winner
+    assert L.get_game(CHAT) is None
+    assert not any("🎩" in t for t, _ in SENT)         # no wildcard pitch for one player
+
+
+def test_wildcard_never_repeats_across_games():
+    _reset()
+    L.add_to_library(CHAT, 1, "Film A")
+    L.add_to_library(CHAT, 2, "Film B")
+
+    def play_to_wildcard():
+        L.start_game(MODE, CHAT, 1, force_new=True)
+        L.handle_movie(MODE, cb(2, "join"))
+        L.handle_movie(MODE, cb(1, "start"))
+        L.handle_movie(MODE, message(1, "go"))
+        L.handle_movie(MODE, message(1, "👍"))
+        L.handle_movie(MODE, message(2, "👍"))
+        return L.get_game(CHAT)["wildcard"]["slug"]
+
+    first = play_to_wildcard()
+    L.handle_movie(MODE, message(1, "pass"))           # finish offering game 1
+    second = play_to_wildcard()                         # force_new wipes it, starts game 2
+    assert first != second                              # never the same film twice
+    assert {first, second} <= L._wildcard_log(CHAT)
 
 
 def test_is_stale():

@@ -178,6 +178,38 @@ this round out] [➕ Add a film]**, since a player can still participate with th
   button tap — no auto-advance on silence. (`_post_short_pool` / `_handle_short_pool_callback` /
   `_handle_short_pool_add`.)
 
+### Phase 3.5 — Wildcard "one for the hat" (CURRENT)
+
+Right after selections lock (end of Phase 3), **once per game** and only with **2+
+participants**, the bot offers ONE extra film for the hat, built **only from this game's
+participant user_ids** (`game["players"]` — everyone who joined, picks or not; never any
+non-participant's data). Code: `_offer_wildcard` → `_build_wildcard` → consent window.
+
+- **Suggestion ladder** (`_build_wildcard`), strongest first; it ALWAYS yields something:
+  1. **Cross-player taste rhyme / shared blind spot** — `_wildcard_via_llm` gives the model a
+     participants-only digest (each player's library, their ≥4★ ratings, past winners they took
+     part in) and asks for ONE discovery, returning `{title, year, reason}` where the reason
+     **names the actual players**. AI-gated (off → skipped).
+  2. **Almanac** — `_film_almanac(date)`: today's film-history events turned into a real pick.
+     **DEFERRED**: currently a stub returning `[]` (kept isolated + swappable; the
+     boxofficeprophets / onthisday scrape will be wired and validated against the live pages in a
+     follow-up). The ladder falls through it cleanly.
+  3. **Canonical fallback** (`_WILDCARD_CANON`) — a strong, globally-varied list; the first not in
+     tonight's pool and never suggested before, framed honestly ("no clever hook tonight, but…").
+- **Verify + dedupe (code):** every candidate is confirmed via `lookup_film`; rejected if it's in
+  tonight's locked pool or in the per-chat `wildcardlog` (so **the same film is never suggested
+  twice across games**). The chosen film is persisted as an **ownerless "house" library item under
+  sentinel owner `0`** (no real Telegram user is 0), so it rides the existing pick/veto/winner path
+  with zero special-casing.
+- **Pitch:** one message, SirWatchAlot voice, plain text, asking permission ("Mind if I add one to
+  the hat?") + the factual card. Tiers 1–2 lead with the player-naming reason; the canonical tier
+  with the honest framing.
+- **Consent (text/reaction window, lazy backstop — `_wildcard_backstop`, same 90s beat):** any
+  participant 👎 on the pitch, or a short "no/pass/nope/skip" (`_wildcard_dissent`), **drops it
+  silently** and proceeds to the pick. A clear "yes" adds it now; otherwise the beat lapses and it's
+  accepted. Accepted → `_begin_veto` folds it into `pool_all` as a **normal, drawable, vetoable**
+  candidate (owner `0`, so everyone may veto it; the owner-can't-veto rule never shields it).
+
 ### Phase 4 — Lock
 - `/lock` (host) or once everyone has confirmed: drop all `👎` films, optionally backfill from
   libraries to keep ~3 each, build `pool`, post the final list, ask for `go`.
