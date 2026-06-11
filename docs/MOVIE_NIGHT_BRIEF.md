@@ -215,23 +215,36 @@ non-participant's data). Code: `_offer_wildcard` → `_build_wildcard` → conse
   libraries to keep ~3 each, build `pool`, post the final list, ask for `go`.
 - "go" must be a command or a reply to the lock message (`/go` or reply `go`/`👍`), not ambient text.
 
-### Phase 5 — The pick + veto (CURRENT: non-anonymous poll, two hard rules)
+### Phase 5 — The pick + veto (CURRENT: non-anonymous poll, roster-validated resolution)
 - Code does `random.choice(pool)` (**not** the LLM) and posts a full info card + a non-anonymous
-  Telegram poll **["🚫 Veto", "👍 Fine by me"]** (`open_period=90`). You can't restrict who taps a
-  poll option, but because it's non-anonymous the bot knows exactly who cast each "Veto" and
-  decides which ones **count** — both rules enforced at `poll_answer` resolution, all in code:
-  - **One veto per player per game.** `vetoes_remaining[uid]` starts at 1. A "Veto" counts only
-    if that voter still has one; a valid veto consumes it (→ 0), drops the pick, and re-picks. A
-    "Veto" from a spent player is ignored (told once: "you've already used your veto tonight").
-  - **No vetoing your own pick.** A "Veto" from the candidate's `owner` never counts — they
-    already approved it in confirmation. Ignored (told once: "that's your own pick").
-- **Resolution timing:** the **first valid** veto re-picks immediately; **everyone** voting "Fine
-  by me" wins immediately; otherwise the 90s poll auto-closes (lazy backstop, no scheduler) and
-  the un-vetoed pick wins.
-- **Vetoes run out:** when no player can validly veto the current candidate (everyone else is
+  Telegram poll **["🚫 Veto", "👍 Fine by me"]** (`open_period=_VETO_WINDOW`, **120s**). You can't
+  restrict who taps a poll option, but because it's non-anonymous the bot knows exactly who cast
+  each "Veto" and decides which ones **count**. Every veto tap is recorded into
+  `current["veto_votes"][uid]` *before* the eligibility checks (so the close/backstop can tally and
+  explain it). On each `poll_answer`, checks run **in this order** (all in code):
+  1. **Owner** — a "Veto" from the candidate's `owner` never counts (they approved it in
+     confirmation). Told once: "that's your own pick".
+  2. **Roster** — checked **before** veto-used: a voter **not in `game["players"]`** is a
+     non-participant. Told "you're not in tonight's game — want to join?" and **never** "already
+     used". (Joined-but-didn't-submit players ARE on the roster and keep their veto.)
+  3. **Veto-used** — `vetoes_remaining[uid]` starts at 1; a "Veto" from a spent participant is
+     ignored ("you've already used your veto tonight").
+  4. **Consume** — a valid veto consumes it (→ 0), drops the pick, and re-picks immediately.
+- **The winner is decided from the roster, never from raw poll counts or an event that may not
+  arrive.** At every decision point — first valid `poll_answer`, the 120s poll auto-close
+  (`on_poll`, which also captures each option's `voter_count` as a cross-check), and the lazy
+  backstop (`_veto_backstop`, fired by any later update) — resolution runs through `_finalize_veto`:
+  `_valid_vetoes` = recorded voters who are on the roster, not the owner, with a veto left. **Any**
+  valid veto removes the pick and re-picks; **zero** valid vetoes declares the winner. Nothing ever
+  announces `current["film"]` blindly.
+- **Early finish:** the **owner is an automatic yes**; the instant every *non-owner* participant
+  has voted "Fine by me", the pick wins without waiting out the window.
+- **Clarifying note:** if the winning pick's poll carried veto taps that didn't count (the owner, a
+  non-participant, or a spent veto), the announcement adds one line saying so (`_invalid_veto_note`)
+  — so a "vetoed but it won" poll doesn't read as a bug.
+- **Vetoes run out:** when no participant can validly veto the current candidate (everyone else is
   spent, and the owner can't veto their own), it's declared the winner immediately — no poll. So a
-  solo game's pick simply wins. (`vetoes_remaining` / owner check / `_present_candidate`
-  short-circuit / `on_poll_answer`.)
+  solo game's pick simply wins.
 
 ### Phase 6 — Winner
 - Announce winner with a full info card **plus a spoiler-free context note** (production facts,

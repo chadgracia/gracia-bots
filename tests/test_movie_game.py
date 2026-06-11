@@ -245,6 +245,71 @@ def test_owner_blocked_then_nonowner_veto_consumes_and_repicks():
     assert g2["vetoes_remaining"][str(voter)] == 0
 
 
+# ---- Phase 1 fixes: roster-validated veto resolution + clarifying note ----- #
+def test_owner_and_nonparticipant_vetoes_dont_block_win_with_note():
+    # Scenario 1: owner vetoes own pick + a non-participant vetoes + everyone else
+    # says fine -> the film WINS, with one line explaining why those taps didn't count.
+    game = _veto_setup([1, 2, 3], [(1, "a", "A"), (2, "b", "B"), (3, "c", "C")])
+    cur = game["current"]
+    pid, owner = cur["poll_id"], int(cur["film"]["owner"])
+    others = [p for p in (1, 2, 3) if p != owner]
+    L.handle_movie(MODE, poll_answer(owner, pid, [0]))   # owner vetoes own pick -> ignored
+    L.handle_movie(MODE, poll_answer(99, pid, [0]))      # a non-participant vetoes -> ignored
+    assert any("not in tonight's game" in t for t, _ in SENT)
+    L.handle_movie(MODE, poll_answer(others[0], pid, [1]))   # fine
+    L.handle_movie(MODE, poll_answer(others[1], pid, [1]))   # all non-owners fine -> win
+    assert L.get_game(CHAT) is None                          # WON despite 2 veto taps
+    win = [t for t, _ in SENT if "winner" in t.lower()][-1]
+    assert "didn't count" in win and "own pick" in win and "not in tonight's game" in win
+
+
+def test_participant_veto_removes_pick_and_repicks():
+    # Scenario 2: a real participant's single veto removes the pick and re-picks.
+    game = _veto_setup([1, 2, 3], [(1, "a", "A"), (2, "b", "B"), (3, "c", "C")])
+    cur = game["current"]
+    pid, slug, owner = cur["poll_id"], cur["film"]["slug"], int(cur["film"]["owner"])
+    voter = next(p for p in (1, 2, 3) if p != owner)
+    L.handle_movie(MODE, poll_answer(voter, pid, [0]))
+    g = L.get_game(CHAT)
+    assert g is not None and g["vetoes_remaining"][str(voter)] == 0
+    assert g["current"]["film"]["slug"] != slug and g["current"]["poll_id"] != pid
+
+
+def test_nonparticipant_veto_gets_join_invite_not_already_used():
+    # Scenario 3: a non-participant tapping veto is invited to join, never told
+    # "already used", and removes nothing.
+    game = _veto_setup([1, 2], [(1, "a", "A"), (2, "b", "B")])
+    pid = game["current"]["poll_id"]
+    L.handle_movie(MODE, poll_answer(77, pid, [0]))      # 77 never joined tonight
+    msgs = " ".join(t for t, _ in SENT)
+    assert "not in tonight's game" in msgs and "already used" not in msgs
+    g = L.get_game(CHAT)
+    assert g is not None and "77" not in g["vetoes_remaining"]   # nothing removed/created
+
+
+def test_poll_close_decides_from_roster_not_raw_counts():
+    # An invalid-only veto tally arriving via poll-close still declares the winner
+    # (raw counts are a cross-check, the per-voter record is the decision).
+    game = _veto_setup([1, 2], [(1, "a", "A"), (2, "b", "B")])
+    cur = game["current"]
+    pid, owner = cur["poll_id"], int(cur["film"]["owner"])
+    L.handle_movie(MODE, poll_answer(owner, pid, [0]))   # only the owner vetoed (invalid)
+    ev = poll_closed(pid); ev["poll_option_counts"] = [1, 0]   # poll shows 1 veto
+    L.handle_movie(MODE, ev)
+    assert L.get_game(CHAT) is None                          # winner, not blocked
+    win = [t for t, _ in SENT if "winner" in t.lower()][-1]
+    assert "didn't count" in win and "own pick" in win
+
+
+def test_placeholder_reply_guard_suppresses_parentheticals():
+    assert L._is_placeholder_reply("(silent)")
+    assert L._is_placeholder_reply("(silent).")
+    assert L._is_placeholder_reply("(no reply)")
+    assert L._is_placeholder_reply("(...)")
+    assert not L._is_placeholder_reply("Add it? (yes/no)")
+    assert not L._is_placeholder_reply("Sure, adding Dune (1984).")
+
+
 def test_no_eligible_vetoer_wins_immediately():
     # solo player can't veto their own pick -> nobody can veto -> instant winner
     _veto_setup([1], [(1, "a", "A")])
@@ -294,12 +359,12 @@ def test_stale_poll_close_is_ignored():
     assert g is not None and g["phase"] == "VETO"
 
 
-def test_backstop_resolves_after_90s_on_any_update():
+def test_backstop_resolves_after_window_on_any_update():
     game = _two_player_game_to_veto()
     cur = game["current"]
-    NOW[0] += 91                              # candidate is now stale
+    NOW[0] += L._VETO_WINDOW + 1              # candidate is now stale
     L.handle_movie(MODE, message(2, "anything at all"))   # any update fires backstop
-    assert L.get_game(CHAT) is None           # winner declared, game cleared
+    assert L.get_game(CHAT) is None           # no valid veto -> winner declared, game cleared
 
 
 def test_thumbs_down_swaps_a_slot_and_reasks():
@@ -956,12 +1021,15 @@ def test_confirm_saves_pending_film():
 
 
 def test_unanimous_fine_finalizes_without_clock():
-    game = _two_player_game_to_veto()
-    pid = game["current"]["poll_id"]
-    L.handle_movie(MODE, poll_answer(1, pid, [1]))       # player 1: fine by me
-    assert L.get_game(CHAT) is not None                  # not yet — player 2 pending
-    L.handle_movie(MODE, poll_answer(2, pid, [1]))       # player 2: fine -> unanimous
-    assert L.get_game(CHAT) is None                      # finalized immediately
+    # The owner is an automatic yes; finalize the instant every NON-owner says "fine".
+    game = _veto_setup([1, 2, 3], [(1, "a", "A"), (2, "b", "B"), (3, "c", "C")])
+    cur = game["current"]
+    pid, owner = cur["poll_id"], int(cur["film"]["owner"])
+    others = [p for p in (1, 2, 3) if p != owner]
+    L.handle_movie(MODE, poll_answer(others[0], pid, [1]))   # one non-owner: fine
+    assert L.get_game(CHAT) is not None                      # not yet — one still pending
+    L.handle_movie(MODE, poll_answer(others[1], pid, [1]))   # all non-owners fine
+    assert L.get_game(CHAT) is None                          # finalized immediately
     hist = [v for (_p, s), v in STORE.items() if s.startswith("history#")]
     assert len(hist) == 1
 

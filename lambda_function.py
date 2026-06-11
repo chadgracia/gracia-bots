@@ -341,7 +341,8 @@ def parse_update(update):
           "text": "", "user_id": None, "user_name": "someone", "username": None,
           "message_id": None, "reactions": [], "callback_data": None,
           "callback_query_id": None, "poll_id": None, "poll_is_closed": None,
-          "poll_option_ids": [], "reply_to_message_id": None,
+          "poll_option_ids": [], "poll_option_counts": [], "poll_total_voters": None,
+          "reply_to_message_id": None,
           "migrate_to_chat_id": None, "migrate_from_chat_id": None}
 
     if "callback_query" in update:
@@ -384,7 +385,11 @@ def parse_update(update):
 
     if "poll" in update:
         p = update["poll"]
-        ev.update(kind="poll", poll_id=p.get("id"), poll_is_closed=p.get("is_closed"))
+        # Capture each option's running voter_count (otherwise discarded) so the
+        # close handler can cross-check the raw tally the group actually saw.
+        ev.update(kind="poll", poll_id=p.get("id"), poll_is_closed=p.get("is_closed"),
+                  poll_option_counts=[o.get("voter_count", 0) for o in (p.get("options") or [])],
+                  poll_total_voters=p.get("total_voter_count"))
         return ev
 
     msg = (update.get("message") or update.get("edited_message")
@@ -1975,6 +1980,9 @@ def _relax_backstop(mode, chat_id, game):
     return False
 
 
+_VETO_WINDOW = 120        # seconds the veto poll stays open before the backstop fires
+
+
 def _present_candidate(mode, chat_id, game):
     """Draw and present the next candidate. Returns True if it RESOLVED the game
     (winner declared / pool empty -> cleared) so callers skip put_game; False if a
@@ -2002,13 +2010,15 @@ def _present_candidate(mode, chat_id, game):
         _declare_winner(mode, chat_id, game, cand)
         return True
     resp = send_poll(mode, chat_id, "Veto this pick?", ["🚫 Veto", "👍 Fine by me"],
-                     is_anonymous=False, open_period=90)
+                     is_anonymous=False, open_period=_VETO_WINDOW)
     result = resp.get("result") or {}
     poll_id = (result.get("poll") or {}).get("id")
     game["current"] = {
         "film": cand, "poll_id": poll_id,
         "poll_message_id": result.get("message_id"),
         "presented_at": _now_epoch(), "resolved": False, "notified": [],
+        # per-voter veto record (roster-validated at decision time) + a "fine" set
+        "veto_votes": {}, "fine": [],
     }
     if poll_id:
         put_poll_map(poll_id, chat_id, cand)
@@ -2113,32 +2123,48 @@ def on_poll_answer(mode, ev):
         return  # stale or already resolved poll
     opts = ev.get("poll_option_ids") or []
     uid = str(ev.get("user_id"))
+    owner = str(cur["film"].get("owner"))
+    roster = [str(p) for p in game["players"]]
     if 0 not in opts:
-        # "Fine by me" (option 1): event-driven consent — once every player has
-        # said fine, finalize this pick immediately rather than waiting on the clock.
+        # Not a veto (👍 "Fine by me", or the vote retracted): drop any prior veto
+        # of theirs from the tally so a vote change is reflected accurately.
+        cur.get("veto_votes", {}).pop(uid, None)
         if 1 in opts:
+            # Event-driven consent: once everyone EXCEPT the owner (an automatic yes)
+            # has said fine, finalize now rather than waiting out the window.
             fine = set(cur.get("fine") or [])
             fine.add(uid)
             cur["fine"] = list(fine)
-            if {str(p) for p in game["players"]}.issubset(fine):
+            needed = {p for p in roster} - {owner}
+            if needed and needed.issubset(fine):
                 _declare_winner(mode, chat_id, game, cur["film"])
-            else:
-                put_game(game)
+                return
+        put_game(game)
         return
+    # A veto tap. Record it FIRST (even if it turns out invalid) so the poll-close /
+    # backstop can tally and explain it; then apply the eligibility checks.
+    cur.setdefault("veto_votes", {})[uid] = True
     notified = cur.setdefault("notified", [])
 
     def _notify_once(text):
+        put_game(game)                            # persist the recorded vote regardless
         if uid not in notified:
             notified.append(uid)
             put_game(game)
             send_message(mode, chat_id, text)
 
-    # Fix 2: you can't veto your own pick — you already approved it in confirmation.
-    if uid == str(cur["film"].get("owner")):
+    # Order of checks: owner -> roster -> veto-used -> consume.
+    # Owner can't veto their own pick — they approved it in confirmation.
+    if uid == owner:
         _notify_once(f"{mention_for(chat_id, ev.get('user_id'))}, that's your own pick — "
                      "can't veto it 🙂")
         return
-    # Fix 1: one veto per player per game. A spent player's veto doesn't count.
+    # Roster check BEFORE veto-used: a non-participant must never be told "already used".
+    if uid not in roster:
+        _notify_once(f"{mention_for(chat_id, ev.get('user_id'))} — you're not in tonight's "
+                     "game. Want to join? I'll pull three from your library.")
+        return
+    # One veto per participant per game. A spent player's veto doesn't count.
     if game["vetoes_remaining"].get(uid, 0) <= 0:
         _notify_once(f"{mention_for(chat_id, ev.get('user_id'))}, you've already used your "
                      "veto tonight.")
@@ -2156,6 +2182,38 @@ def on_poll_answer(mode, ev):
         put_game(game)
 
 
+def _valid_vetoes(game, cur):
+    """The veto taps that actually COUNT: cast by someone on tonight's roster, who
+    is not the film's owner, and who still has a veto left. Attribution comes from
+    the per-voter record (cur['veto_votes']), never from raw poll counts."""
+    owner = str((cur.get("film") or {}).get("owner"))
+    roster = {str(p) for p in game.get("players", [])}
+    return [uid for uid in (cur.get("veto_votes") or {})
+            if uid in roster and uid != owner
+            and int(game["vetoes_remaining"].get(uid, 0)) > 0]
+
+
+def _finalize_veto(mode, chat_id, game):
+    """Decide the current pick from the ROSTER-validated tally — not from raw poll
+    counts and not from an event that may never arrive. Any valid veto removes the
+    pick and re-picks; zero valid vetoes announces the winner."""
+    cur = game.get("current") or {}
+    valid = _valid_vetoes(game, cur)
+    if valid:
+        for uid in valid:
+            game["vetoes_remaining"][uid] = max(0, int(game["vetoes_remaining"].get(uid, 0)) - 1)
+        cur["resolved"] = True
+        if cur.get("poll_message_id"):
+            stop_poll(mode, chat_id, cur["poll_message_id"])
+        if cur.get("poll_id"):
+            del_poll_map(cur["poll_id"])
+        send_message(mode, chat_id, f"🚫 “{cur['film']['title']}” vetoed. Next pick…")
+        if not _present_candidate(mode, chat_id, game):
+            put_game(game)
+        return
+    _declare_winner(mode, chat_id, game, cur["film"])
+
+
 def on_poll(mode, ev):
     if not ev.get("poll_is_closed"):
         return
@@ -2165,18 +2223,22 @@ def on_poll(mode, ev):
         return
     cur = game.get("current")
     if not cur or cur.get("poll_id") != ev.get("poll_id") or cur.get("resolved"):
-        return  # only the un-vetoed CURRENT poll auto-closing declares a winner
-    _declare_winner(mode, chat_id, game, cur["film"])
+        return  # only the CURRENT, unresolved poll auto-closing decides anything
+    # Record the raw tally the group saw (for the clarifying note), then decide
+    # from the roster-validated vetoes — never announce cur["film"] blindly.
+    counts = ev.get("poll_option_counts") or []
+    cur["raw_veto_count"] = counts[0] if counts else None
+    _finalize_veto(mode, chat_id, game)
 
 
 def _veto_backstop(mode, chat_id, game):
-    """No scheduler: if an un-vetoed candidate is past its 90s and any update
-    arrives, resolve it as the winner now. Returns True if it fired."""
+    """No scheduler: once an un-resolved candidate is past its window and any update
+    arrives, decide it now — from the roster-validated tally, not blindly. True if fired."""
     if not game or game.get("phase") != "VETO":
         return False
     cur = game.get("current")
-    if cur and not cur.get("resolved") and _now_epoch() - cur.get("presented_at", 0) >= 90:
-        _declare_winner(mode, chat_id, game, cur["film"])
+    if cur and not cur.get("resolved") and _now_epoch() - cur.get("presented_at", 0) >= _VETO_WINDOW:
+        _finalize_veto(mode, chat_id, game)
         return True
     return False
 
@@ -2204,9 +2266,41 @@ def _declare_winner(mode, chat_id, game, film):
     text = f"🏆 Tonight's winner:\n\n{card}"
     if note:
         text += f"\n\n{note}"
+    disclaimer = _invalid_veto_note(game, cur, film)   # explain a "vetoed but won" poll
+    if disclaimer:
+        text += f"\n\n{disclaimer}"
     text += "\n\nEnjoy! 🎬"
     send_message(mode, chat_id, text)
     clear_game(chat_id)
+
+
+def _invalid_veto_note(game, cur, film):
+    """One line explaining why veto taps on THIS pick's poll didn't count (the film's
+    owner, someone not playing, or an already-spent veto) — so a poll showing vetoes
+    that still won doesn't read as a bug. Empty if there were none, or if the votes
+    were for a different pick. A valid veto would have re-picked, so any taps left on
+    the winning pick are invalid by definition."""
+    if (cur.get("film") or {}).get("slug") != film.get("slug"):
+        return ""
+    votes = cur.get("veto_votes") or {}
+    raw = cur.get("raw_veto_count")
+    if not votes and not raw:
+        return ""
+    owner = str(film.get("owner"))
+    roster = {str(p) for p in game.get("players", [])}
+    cats = []
+    if any(u == owner for u in votes):
+        cats.append("the film's own pick")
+    if any(u not in roster for u in votes):
+        cats.append("someone not in tonight's game")
+    if any(u in roster and u != owner and int(game["vetoes_remaining"].get(u, 0)) <= 0
+           for u in votes):
+        cats.append("an already-spent veto")
+    n = raw if raw else len(votes)
+    if not cats or not n:
+        return ""
+    return (f"(Heads up: {n} veto tap{'s' if n != 1 else ''} on that poll didn't count — "
+            f"{', '.join(cats)}.)")
 
 
 def winner_note(title, year):
@@ -2412,6 +2506,12 @@ _AFFIRM_LEAD = {"yes", "yep", "yeah", "yup", "ya", "ok", "okay", "sure", "confir
                 "yies", "yas"}
 _AFFIRM_PHRASES = {"add it", "add that", "do it", "go for it", "go ahead",
                    "save it", "keep it", "add it please", "yes do it"}
+
+
+def _is_placeholder_reply(text):
+    """True if the whole reply is just a parenthetical stage-direction ('(silent)',
+    '(no reply).', '(...)') — never something to actually post to the group."""
+    return bool(re.fullmatch(r"\(.*?\)[.!?\s]*", (text or "").strip()))
 
 
 def _is_affirmative(text):
@@ -2685,7 +2785,9 @@ def on_message(mode, ev):
         log.error("bedrock movie failed: %s", e)
         return
     reply = (reply or "").strip()
-    if reply and reply.lower() != "(silent)" and not ctx.get("suppress_reply"):
+    # Stay quiet via suppress_reply; the placeholder guard is a backstop so a bare
+    # parenthetical ("(silent)", "(no reply).", "(...)") never leaks to the group.
+    if reply and not ctx.get("suppress_reply") and not _is_placeholder_reply(reply):
         send_message(mode, chat_id, reply)
 
 
