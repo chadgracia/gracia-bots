@@ -123,12 +123,25 @@ def ddb_query(pk):
     return _decimals_to_native(items)
 
 
+def ddb_scan():
+    """Every item in the table, paginated. Used ONLY by the low-frequency daily job
+    (the morning-after poll has no chat to key on); the hot path always queries by PK."""
+    items, kwargs = [], {}
+    while True:
+        resp = _table.scan(**kwargs)
+        items.extend(resp.get("Items", []))
+        if "LastEvaluatedKey" not in resp:
+            break
+        kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+    return _decimals_to_native(items)
+
+
 # --------------------------------------------------------------------------- #
 # Chat registry + supergroup migration
 # --------------------------------------------------------------------------- #
 # Chat id is NEVER hardcoded. We persist a registry item per (mode, chat) so
-# proactive senders (e.g. a future morning-after poll cron) can resolve the
-# current id, and so we can rewrite data when Telegram migrates a group to a
+# proactive senders (e.g. the morning-after poll cron) can resolve the current
+# id, and so we can rewrite data when Telegram migrates a group to a
 # supergroup (the failure that haunted the previous third-party setup).
 def _pk(mode, chat_id):
     return f"{mode}#{chat_id}"
@@ -938,6 +951,16 @@ def seed_starter_libraries(chat_id):
 # --------------------------------------------------------------------------- #
 def _now_epoch():
     return int(datetime.now(timezone.utc).timestamp())
+
+
+def _iso_to_epoch(iso):
+    """Parse a stored ISO timestamp to epoch seconds; 0 if missing/unparseable."""
+    if not iso:
+        return 0
+    try:
+        return int(datetime.fromisoformat(iso).timestamp())
+    except (ValueError, TypeError):
+        return 0
 
 
 def get_game(chat_id):
@@ -2211,6 +2234,75 @@ def _handle_rating_vote(mode, rp, ev):
              "stars": stars, "rated_at": _now_iso()})
 
 
+# ---- morning-after rating poll (daily scheduled job) ---------------------- #
+# A once-a-day EventBridge invocation (see tools/setup_schedule.py) routes here.
+# For every movie chat it finds recent winners that never got rated and posts the
+# 5★ poll via _post_rating_poll, so votes feed get_ratings. Posts at most once per
+# winner (a flag on the history row), and never re-posts once anyone has rated it.
+_MORNING_LOOKBACK_DAYS = 3      # back-fill any un-rated winner this fresh, not ancient ones
+
+
+def _all_movie_chats():
+    """Distinct chat_ids that have a registry row — proactive senders read it here,
+    never from a hardcoded id (supergroup migration keeps it current)."""
+    return sorted({int(i["chat_id"]) for i in ddb_scan()
+                   if i.get("SK") == "chat" and i.get("mode") == "movie"
+                   and i.get("chat_id") is not None})
+
+
+def _session_has_ratings(chat_id, session_id):
+    """True if anyone has logged a star rating for this game's winner already."""
+    if not session_id:
+        return False
+    pref = f"rating#{session_id}#"
+    return any(str(r.get("SK", "")).startswith(pref)
+               for r in ddb_query(_pk("movie", chat_id)))
+
+
+def _morning_after_for_chat(chat_id):
+    """Post the rating poll for every recent un-rated, not-yet-polled winner in this
+    chat. Returns how many polls it posted (0 = nothing due — the clean skip)."""
+    rows = [h for h in ddb_query(_pk("movie", chat_id))
+            if str(h.get("SK", "")).startswith("history#") and h.get("winner_title")]
+    rows.sort(key=lambda h: h.get("watched_date") or "", reverse=True)
+    cutoff = _now_epoch() - _MORNING_LOOKBACK_DAYS * 86400
+    posted = 0
+    for h in rows:
+        if _iso_to_epoch(h.get("watched_date")) < cutoff:
+            break                                    # older than the window -> stop
+        if h.get("morning_poll_posted") or _session_has_ratings(chat_id, h.get("session_id")):
+            continue                                 # already polled, or already rated
+        res = _post_rating_poll("movie", chat_id, h.get("winner_title"),
+                                h.get("winner_year"), film_id=h.get("winner_slug"),
+                                session_id=h.get("session_id"),
+                                participant_ids=h.get("participants") or [])
+        if res:
+            h["morning_poll_posted"] = True          # post exactly once per winner
+            ddb_put(h)
+            posted += 1
+    return posted
+
+
+def run_morning_after():
+    """Daily job entry: poll un-rated recent winners across all movie chats."""
+    total = 0
+    for chat_id in _all_movie_chats():
+        try:
+            total += _morning_after_for_chat(chat_id)
+        except Exception as e:
+            log.exception("morning-after failed for chat %s: %s", chat_id, e)
+    log.info("morning-after: posted %d rating poll(s)", total)
+    return {"statusCode": 200, "body": f"morning-after: {total} posted"}
+
+
+def _is_scheduled_event(event):
+    """A daily EventBridge invocation, recognised by our constant input task marker
+    or the native scheduled-event shape — never a Telegram webhook (those have a path)."""
+    return (event.get("task") == "morning_after"
+            or event.get("source") == "aws.events"
+            or event.get("detail-type") == "Scheduled Event")
+
+
 def _norm_title(s):
     """Case/whitespace-insensitive key for matching a film's bare TITLE."""
     return " ".join(str(s or "").lower().split())
@@ -3050,6 +3142,12 @@ def _load_body(event):
 
 
 def lambda_handler(event, context):
+    # Scheduled (EventBridge) invocation: no Telegram path/secret — run the daily
+    # morning-after poll and return before the webhook-only checks below.
+    if _is_scheduled_event(event):
+        log.info("scheduled invocation -> morning-after poll")
+        return run_morning_after()
+
     mode = _mode_from_path(event)
     modes = _mode_config()
     if mode not in modes:

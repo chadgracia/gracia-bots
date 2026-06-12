@@ -95,6 +95,27 @@ In BotFather, also set the bot's **group privacy** as you intend: privacy ON
 (default) means the bot only sees commands and replies/mentions in groups — which
 is what the free-form handler comment assumes.
 
+## 5b. Schedule the morning-after rating poll (EventBridge)
+The deploy pipeline only updates Lambda **code**, so the daily trigger is created
+once by hand — the same way the webhook is. It invokes the Lambda each morning with
+`{"task": "morning_after"}`; the handler (`_is_scheduled_event` → `run_morning_after`)
+scans the chat registry, finds recent un-rated winners, and posts the 5★ rating poll
+so votes feed `get_ratings`.
+
+```
+python tools/setup_schedule.py set       # create the rule + target + invoke permission
+python tools/setup_schedule.py info       # show the rule and its target
+python tools/setup_schedule.py test       # invoke once now with the cron payload
+python tools/setup_schedule.py console    # print exact Console/CLI steps to do it by hand
+```
+
+Rule `gracia-bots-morning-after`, `cron(0 6 * * ? *)` = 06:00 UTC ≈ 09:00 Kyiv
+(summer). Classic rules fire on fixed UTC, so local time drifts ~1h across DST — for
+exact 09:00 Kyiv year-round use EventBridge **Scheduler** with
+`ScheduleExpressionTimezone="Europe/Kyiv"` (see `setup_schedule.py console`). It posts
+at most once per winner (a `morning_poll_posted` flag on the history row) and never
+re-posts once anyone has rated it.
+
 ## 6. Verify end-to-end
 Two ways:
 

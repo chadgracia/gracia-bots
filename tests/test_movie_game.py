@@ -77,6 +77,10 @@ def fake_query(pk):
     return [copy.deepcopy(v) for (p, _s), v in STORE.items() if p == pk]
 
 
+def fake_scan():
+    return [copy.deepcopy(v) for v in STORE.values()]
+
+
 def fake_seen(mode, chat_id, update_id):
     if update_id is None:
         return False
@@ -110,6 +114,7 @@ L.ddb_get = fake_get
 L.ddb_put = fake_put
 L.ddb_delete = fake_delete
 L.ddb_query = fake_query
+L.ddb_scan = fake_scan
 L.seen_update = fake_seen
 L.send_message = fake_send
 L.send_poll = fake_send_poll
@@ -1210,6 +1215,84 @@ def test_letterboxd_resolves_via_search_and_scrapes():
     assert r["runtime_min"] == 155
     assert "Science Fiction" in r["genres"]
     assert r["description"].startswith("Paul Atreides")
+
+
+# ---- morning-after rating poll (daily scheduled job) ---------------------- #
+import datetime as _dt
+
+
+def _iso_at(epoch):
+    return _dt.datetime.fromtimestamp(epoch, _dt.timezone.utc).isoformat()
+
+
+def _seed_winner(session="s1", title="The Overnighters", year="2014",
+                 watched=None, participants=(1, 2)):
+    pk = L._pk(MODE, CHAT)
+    STORE[(pk, "chat")] = {"PK": pk, "SK": "chat", "mode": "movie", "chat_id": CHAT}
+    STORE[(pk, f"history#{session}")] = {
+        "PK": pk, "SK": f"history#{session}", "session_id": session,
+        "winner_title": title, "winner_slug": L._slugify(title), "winner_year": year,
+        "watched_date": watched or _iso_at(NOW[0]),
+        "participants": list(participants), "pool": [], "ratings": {}}
+
+
+def _rating_polls():
+    return [v for (p, _s), v in STORE.items() if p == "ratingpoll"]
+
+
+def test_morning_after_posts_poll_for_unrated_winner():
+    _reset()
+    _seed_winner()
+    res = L.run_morning_after()
+    assert res["body"].endswith("1 posted")
+    rp = _rating_polls()
+    assert len(rp) == 1 and rp[0]["session_id"] == "s1"
+    assert rp[0]["film_title"] == "The Overnighters"
+    # the winner row is flagged so tomorrow's run won't double-post
+    assert STORE[(L._pk(MODE, CHAT), "history#s1")]["morning_poll_posted"] is True
+
+
+def test_morning_after_idempotent_no_double_post():
+    _reset()
+    _seed_winner()
+    L.run_morning_after()
+    n = len(_rating_polls())
+    assert L.run_morning_after()["body"].endswith("0 posted")   # already flagged
+    assert len(_rating_polls()) == n
+
+
+def test_morning_after_skips_already_rated_winner():
+    _reset()
+    _seed_winner(session="s2")
+    pk = L._pk(MODE, CHAT)
+    STORE[(pk, "rating#s2#1")] = {"PK": pk, "SK": "rating#s2#1", "stars": 5}
+    assert L.run_morning_after()["body"].endswith("0 posted")
+    assert _rating_polls() == []
+
+
+def test_morning_after_skips_winner_outside_lookback():
+    _reset()
+    _seed_winner(session="old", watched=_iso_at(NOW[0] - 10 * 86400))   # ancient
+    assert L.run_morning_after()["body"].endswith("0 posted")
+    assert _rating_polls() == []
+
+
+def test_morning_after_no_winners_is_clean_noop():
+    _reset()
+    pk = L._pk(MODE, CHAT)
+    STORE[(pk, "chat")] = {"PK": pk, "SK": "chat", "mode": "movie", "chat_id": CHAT}
+    assert L.run_morning_after()["body"].endswith("0 posted")
+
+
+def test_scheduled_event_routes_to_morning_after():
+    _reset()
+    _seed_winner()
+    out = L.lambda_handler({"task": "morning_after"}, None)   # cron event, no path/secret
+    assert out["statusCode"] == 200 and "morning-after" in out["body"]
+    assert len(_rating_polls()) == 1
+    # the native EventBridge shape is recognised too
+    assert L._is_scheduled_event({"source": "aws.events", "detail-type": "Scheduled Event"})
+    assert not L._is_scheduled_event({"rawPath": "/movie"})
 
 
 if __name__ == "__main__":
