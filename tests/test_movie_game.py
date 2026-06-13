@@ -874,6 +874,82 @@ def test_short_pool_zero_eligible_can_sit_out():
     assert L.get_game(CHAT) is None
 
 
+# ---- swap dead-end: 👎 with nothing left in the library that fits ---------- #
+def test_swap_deadend_offers_buttons_instead_of_forcing_keep():
+    # Meri's bug: 👎 a film when nothing else in the library fits tonight's filter must
+    # NOT corner her into 👍👍👍. Drop the rejected film, offer a button way out.
+    g = _short_pool_setup(["drama", "drama", "drama"])    # all fit -> full 3-slot slate
+    assert len(g["selection"]["1"]["slots"]) == 3 and not g["selection"]["1"].get("short_pool")
+    SENT.clear()
+    L.handle_movie(MODE, message(1, "👎👍👍"))            # drop 1, nothing to swap in
+    g = L.get_game(CHAT)
+    sel = g["selection"]["1"]
+    assert g["phase"] == "SELECTING" and not sel["locked"]   # NOT forced to lock
+    assert len(sel["slots"]) == 2                            # the rejected film is dropped
+    assert not any("keep these" in t.lower() for t, _ in SENT)  # no forced-keep demand
+    assert any("go with the 2" in t.lower() for t, _ in SENT)
+    kb = L._swap_deadend_keyboard(2)["inline_keyboard"]
+    assert kb[0][0] == {"text": "✅ Go with the 2 I approved", "callback_data": "sp_play"}
+    assert kb[1][0] == {"text": "➕ Add a film", "callback_data": "sp_add"}
+
+
+def test_swap_deadend_go_with_approved_locks_the_subset():
+    _short_pool_setup(["drama", "drama", "drama"])
+    L.handle_movie(MODE, message(1, "👎👍👍"))
+    assert len(L.get_game(CHAT)["selection"]["1"]["slots"]) == 2
+    L.handle_movie(MODE, cb(1, "sp_play"))                # "Go with the 2" -> solo wildcard
+    g = L.get_game(CHAT)
+    assert g["phase"] == "WILDCARD" and g["selection"]["1"]["locked"]
+    assert len(g["selection"]["1"]["slots"]) == 2
+    L.handle_movie(MODE, message(1, "pass"))              # decline -> solo veto -> winner
+    assert L.get_game(CHAT) is None
+
+
+def test_swap_deadend_add_film_uses_filter_validation():
+    _short_pool_setup(["drama", "drama", "drama"])
+    L.handle_movie(MODE, message(1, "👎👍👍"))            # 2 approved, dead-ended
+    L.handle_movie(MODE, cb(1, "sp_add"))
+    assert L.get_game(CHAT)["selection"]["1"]["awaiting_add"] is True
+    L.handle_movie(MODE, message(1, "New Drama"))         # fake_lookup -> Drama, fits filter
+    g = L.get_game(CHAT)
+    assert g["phase"] == "WILDCARD"                       # 2 + 1 added = 3 -> locks -> wildcard
+    assert any(f["title"] == "New Drama" for f in L.get_library(CHAT, 1))
+
+
+def test_swap_deadend_add_nonqualifying_is_rejected_and_reprompts():
+    _short_pool_setup(["drama", "drama", "drama"])
+    L.handle_movie(MODE, message(1, "👎👍👍"))
+    L.handle_movie(MODE, cb(1, "sp_add"))
+    orig = L.lookup_film_cached
+    L.lookup_film_cached = lambda t, y=None: {
+        "found": True, "title": t, "slug": L._slugify(t), "year": "1980",
+        "genres": ["Horror"], "runtime_min": 100, "rating": 4.0, "rating_scale": 10,
+        "rt_rating": None, "tmdb_id": 2, "alts": []}
+    try:
+        L.handle_movie(MODE, message(1, "Scary Movie"))   # horror -> excluded tonight
+    finally:
+        L.lookup_film_cached = orig
+    g = L.get_game(CHAT)
+    sel = g["selection"]["1"]
+    assert g["phase"] == "SELECTING" and not sel["locked"]   # rejected, still choosing
+    assert len(sel["slots"]) == 2                            # not added to tonight's slate
+    assert any("can't play" in t.lower() for t, _ in SENT)
+
+
+def test_swap_deadend_all_thumbs_down_drops_go_with_and_offers_sit_out():
+    g = _short_pool_setup(["drama", "drama", "drama"])
+    SENT.clear()
+    L.handle_movie(MODE, message(1, "👎👎👎"))            # reject all, nothing to swap in
+    g = L.get_game(CHAT)
+    sel = g["selection"]["1"]
+    assert g["phase"] == "SELECTING" and not sel["locked"] and len(sel["slots"]) == 0
+    assert any("sit this round out" in t.lower() for t, _ in SENT)
+    kb = L._swap_deadend_keyboard(0)["inline_keyboard"]
+    assert kb[0][0] == {"text": "🙅 Sit this round out (keep your veto)", "callback_data": "sp_play"}
+    L.handle_movie(MODE, cb(1, "sp_play"))                # sit out -> empty pool -> no winner
+    assert L.get_game(CHAT) is None
+
+
 def _seed_named(name, titles):
     pk = L._pk(MODE, CHAT)
     okey = f"seed:{name.lower()}"

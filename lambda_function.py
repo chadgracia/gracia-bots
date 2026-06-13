@@ -1590,6 +1590,14 @@ def _short_pool_keyboard(n):
                                 [{"text": "➕ Add a film", "callback_data": "sp_add"}]]}
 
 
+def _swap_deadend_keyboard(n):
+    """Escape from a 👎 with no filter-fitting replacement: lock the films they DID
+    approve, or add one. Reuses the sp_play / sp_add callbacks — never a forced keep."""
+    go = f"✅ Go with the {n} I approved" if n else "🙅 Sit this round out (keep your veto)"
+    return {"inline_keyboard": [[{"text": go, "callback_data": "sp_play"}],
+                                [{"text": "➕ Add a film", "callback_data": "sp_add"}]]}
+
+
 def _post_short_pool(mode, chat_id, game, uid):
     """Tell the player the filter trimmed them below 3 and offer buttons. Buttons,
     not emoji, to avoid the parse fragility (mentions / skin-tone modifiers)."""
@@ -1606,6 +1614,28 @@ def _post_short_pool(mode, chat_id, game, uid):
         text = (f"{who} — nothing in your library fits tonight's filter ({desc}). "
                 "Add one that fits, or sit this round out (you keep your veto).")
     resp = send_message(mode, chat_id, text, reply_markup=_short_pool_keyboard(n))
+    game["sel_msg_id"] = (resp.get("result") or {}).get("message_id")
+    put_game(game)
+
+
+def _post_swap_deadend(mode, chat_id, game, uid):
+    """A swap was asked for but nothing in their library fits tonight's filter to swap
+    in. Don't force a keep: offer the films they approved as-is, or add one. Buttons
+    (sp_play / sp_add), same pattern as the short-pool case."""
+    sel = game["selection"][str(uid)]
+    sel["awaiting_add"] = False           # require a fresh "Add a film" tap to re-arm
+    n = len(sel["slots"])
+    who = mention_for(chat_id, uid)
+    desc = _describe_filter(game["filter"]) or "tonight's filter"
+    if n:
+        lst = ", ".join(f"{i + 1}) {s['title']}" for i, s in enumerate(sel["slots"]))
+        text = (f"{who} — nothing left in your library fits tonight's filter ({desc}) to "
+                f"swap in. Go with the {n} you approved ({lst}), or add one that fits?")
+    else:
+        text = (f"{who} — you passed on all of them and nothing else in your library fits "
+                f"tonight's filter ({desc}). Add one that fits, or sit this round out "
+                "(you keep your veto).")
+    resp = send_message(mode, chat_id, text, reply_markup=_swap_deadend_keyboard(n))
     game["sel_msg_id"] = (resp.get("result") or {}).get("message_id")
     put_game(game)
 
@@ -1755,9 +1785,11 @@ def _handle_selection_reply(mode, chat_id, game, uid, text):
         swapped += 1
     put_game(game)
     if swapped == 0:
-        send_message(mode, chat_id,
-                     f"{mention_for(chat_id, uid)}, nothing left to swap in — "
-                     f"reply {'👍' * n} to keep these.")
+        # Nothing in their library fits to swap in. Don't corner them into 👍-ing the
+        # rejected film(s): drop those slots and let them lock what they approved (N),
+        # or add a fitting film. Buttons are the way out — never a forced keep.
+        sel["slots"] = [s for s, keep in zip(sel["slots"], toks) if keep]
+        _post_swap_deadend(mode, chat_id, game, uid)
         return
     _post_player_slate(mode, chat_id, game, uid)
     put_game(game)
