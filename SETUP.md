@@ -95,37 +95,26 @@ In BotFather, also set the bot's **group privacy** as you intend: privacy ON
 (default) means the bot only sees commands and replies/mentions in groups — which
 is what the free-form handler comment assumes.
 
-## 5b. Schedule the background jobs (EventBridge)
-The deploy pipeline only updates Lambda **code**, so the scheduled triggers are
-created once by hand — the same way the webhook is. Each rule invokes the Lambda with
-a constant input whose top-level `task` field the handler routes on
-(`_scheduled_task`); no Telegram path/secret is involved.
+## 5b. Schedule the morning-after rating poll (EventBridge)
+The deploy pipeline only updates Lambda **code**, so the daily trigger is created
+once by hand — the same way the webhook is. It invokes the Lambda each morning with
+`{"task": "morning_after"}`; the handler (`_is_scheduled_event` → `run_morning_after`)
+scans the chat registry, finds recent un-rated winners, and posts the 5★ rating poll
+so votes feed `get_ratings`.
 
 ```
-python tools/setup_schedule.py set       # create both rules + targets + invoke permissions
-python tools/setup_schedule.py info       # show each rule and its target
-python tools/setup_schedule.py test       # invoke once per job with its payload
+python tools/setup_schedule.py set       # create the rule + target + invoke permission
+python tools/setup_schedule.py info       # show the rule and its target
+python tools/setup_schedule.py test       # invoke once now with the cron payload
 python tools/setup_schedule.py console    # print exact Console/CLI steps to do it by hand
 ```
 
-Two jobs:
-
-- **`gracia-bots-morning-after`** — `cron(0 6 * * ? *)`, input `{"task": "morning_after"}`.
-  06:00 UTC ≈ 09:00 Kyiv (summer). Scans the chat registry, finds recent un-rated
-  winners, and posts the 5★ rating poll so votes feed `get_ratings`. Posts at most once
-  per winner (a `morning_poll_posted` flag) and never re-posts once anyone has rated it.
-  Classic rules fire on fixed UTC, so local time drifts ~1h across DST — for exact 09:00
-  Kyiv year-round use EventBridge **Scheduler** with
-  `ScheduleExpressionTimezone="Europe/Kyiv"` (see `setup_schedule.py console`).
-- **`gracia-bots-constraint-tick`** — `rate(1 minute)`, input `{"task": "constraint_tick"}`.
-  Sweeps every chat and closes any constraint-collection window whose 60s deadline has
-  passed, so the window closes **even when the chat goes silent** ("if no one responds,
-  too late"). It never closes a window before its deadline, so the full minute always
-  runs and everyone gets a turn. **This rule is required** — without it a window opened
-  in a chat that then goes quiet would stay open until the next message (only a
-  best-effort backstop on the next incoming update closes it otherwise). Granularity is
-  one minute, so a window closes 60–120s after it opens; there is no live countdown
-  (Telegram edit limits + the stateless Lambda), so the prompt just states the close time.
+Rule `gracia-bots-morning-after`, `cron(0 6 * * ? *)` = 06:00 UTC ≈ 09:00 Kyiv
+(summer). Classic rules fire on fixed UTC, so local time drifts ~1h across DST — for
+exact 09:00 Kyiv year-round use EventBridge **Scheduler** with
+`ScheduleExpressionTimezone="Europe/Kyiv"` (see `setup_schedule.py console`). It posts
+at most once per winner (a `morning_poll_posted` flag on the history row) and never
+re-posts once anyone has rated it.
 
 ## 6. Verify end-to-end
 Two ways:

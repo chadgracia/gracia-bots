@@ -159,11 +159,12 @@ def cards_for(game, user_id):
 
 
 def _skip_constraints():
-    """Constraints now ALWAYS run the full ~60s — there is no early 'go'. To reach
-    SELECTING in tests, fast-forward past the window and fire the real timed close
-    (the EventBridge sweep), exactly as production does when the chat goes silent."""
-    NOW[0] += 61
-    L.run_constraint_tick()
+    """Constraints now ALWAYS run the full ~60s — there is no early 'go'. The window is
+    timed by its poll's open_period; to reach SELECTING in tests, fast-forward and fire
+    the poll-close update Telegram would send (the real close path, even on silence)."""
+    g = L.get_game(CHAT)
+    NOW[0] += L._CONSTRAINTS_WINDOW + 1
+    L.handle_movie(MODE, poll_closed(g["constraints_poll_id"]))
 
 
 # ---- tests ---------------------------------------------------------------- #
@@ -1023,9 +1024,9 @@ def test_constraints_window_parses_three_people_then_times_out():
         "owner_id": 1, "title": "Film A", "year": "1980", "genres": ["drama"],
         "runtime_min": 100, "watched": False}
     L.start_game(MODE, CHAT, 1)
-    L.handle_movie(MODE, cb(1, "start"))              # -> CONSTRAINTS, question asked once
+    L.handle_movie(MODE, cb(1, "start"))              # -> CONSTRAINTS, timer poll posted
     assert L.get_game(CHAT)["phase"] == "CONSTRAINTS"
-    assert sum("constraints tonight" in t.lower() for t, _ in SENT) == 1
+    assert L.get_game(CHAT).get("constraints_poll_id")
     mapping = {"no documentaries": {"exclude_genres": ["documentary"]},
                "under 2.5 hours": {"max_runtime_min": 150},
                "nothing earlier than 1960": {"min_year": 1960}}
@@ -1060,45 +1061,40 @@ def test_constraints_backstop_closes_after_deadline_on_next_update():
     assert L.get_game(CHAT)["phase"] == "SELECTING"
 
 
-def test_constraints_prompt_states_the_close_time():
+def test_constraints_window_is_a_poll_with_open_period_timer():
+    # The window is timed by a Telegram poll's open_period (same mechanism as veto),
+    # not a scheduler — so it closes even on silence and shows a native countdown.
     _reset()
     L.add_to_library(CHAT, 1, "Film A")
-    L.start_game(MODE, CHAT, 1)
-    L.handle_movie(MODE, cb(1, "start"))
-    prompt = next(t for t, _ in SENT if "close at" in t)              # no live countdown
-    hhmm = prompt.split("close at", 1)[1].strip().rstrip(".")[:5]
-    assert hhmm[:2].isdigit() and hhmm[2] == ":" and hhmm[3:5].isdigit()
+    seen = {}
+    orig = L.send_poll
+
+    def spy(mode, chat_id, question, options, **kw):
+        seen.update(kw, question=question)
+        return orig(mode, chat_id, question, options, **kw)
+
+    L.send_poll = spy
+    try:
+        L.start_game(MODE, CHAT, 1)
+        L.handle_movie(MODE, cb(1, "start"))
+    finally:
+        L.send_poll = orig
+    assert seen.get("open_period") == L._CONSTRAINTS_WINDOW
+    assert L.get_game(CHAT).get("constraints_poll_id")
 
 
-def test_constraint_tick_closes_silent_window_without_any_message():
-    # The whole point: the window closes at ~60s EVEN IF the chat goes silent.
+def test_constraint_window_closes_on_poll_timer_even_when_silent():
+    # The whole point: Telegram auto-closes the poll and pushes a `poll` update that
+    # closes the window — no message in the chat required.
     _reset()
     L.add_to_library(CHAT, 1, "Film A")
     L.start_game(MODE, CHAT, 1)
     L.handle_movie(MODE, cb(1, "start"))
     assert L.get_game(CHAT)["phase"] == "CONSTRAINTS"
-    NOW[0] += 61
-    out = L.run_constraint_tick()                     # EventBridge sweep, no chat activity
-    assert out["body"].endswith("1 closed")
+    pid = L.get_game(CHAT)["constraints_poll_id"]
+    NOW[0] += L._CONSTRAINTS_WINDOW + 1
+    L.handle_movie(MODE, poll_closed(pid))            # Telegram open_period auto-close
     assert L.get_game(CHAT)["phase"] == "SELECTING"
-
-
-def test_constraint_tick_never_closes_before_deadline():
-    _reset()
-    L.add_to_library(CHAT, 1, "Film A")
-    L.start_game(MODE, CHAT, 1)
-    L.handle_movie(MODE, cb(1, "start"))
-    out = L.run_constraint_tick()                     # still inside the minute
-    assert out["body"].endswith("0 closed")
-    assert L.get_game(CHAT)["phase"] == "CONSTRAINTS"
-
-
-def test_constraint_tick_ignores_games_not_in_constraints_phase():
-    _reset()
-    pk = L._pk(MODE, CHAT)
-    STORE[(pk, "game#current")] = {"PK": pk, "SK": "game#current", "phase": "SELECTING",
-                                   "constraints_open": False, "constraints_deadline": 0}
-    assert L.run_constraint_tick()["body"].endswith("0 closed")
 
 
 def test_no_early_go_keeps_window_open_for_everyone():
@@ -1110,16 +1106,6 @@ def test_no_early_go_keeps_window_open_for_everyone():
     L.handle_movie(MODE, message(1, "go"))
     L.handle_movie(MODE, message(1, "lets go"))
     assert L.get_game(CHAT)["phase"] == "CONSTRAINTS"   # still open
-
-
-def test_scheduled_constraint_tick_routes_through_handler():
-    _reset()
-    out = L.lambda_handler({"task": "constraint_tick"}, None)
-    assert out["statusCode"] == 200 and "constraint-tick" in out["body"]
-    assert L._scheduled_task({"task": "constraint_tick"}) == "constraint_tick"
-    assert L._scheduled_task({"task": "morning_after"}) == "morning_after"
-    assert L._scheduled_task({"source": "aws.events"}) == "morning_after"   # bare -> daily
-    assert L._scheduled_task({"rawPath": "/movie"}) is None                 # webhook
 
 
 def test_resolver_passes_year_as_separate_param():

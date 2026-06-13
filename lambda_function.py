@@ -147,15 +147,6 @@ def _pk(mode, chat_id):
     return f"{mode}#{chat_id}"
 
 
-def _chat_id_from_pk(pk):
-    """Inverse of _pk for the daily/sweep jobs, which read items by scan and need the
-    chat id back out of the partition key (e.g. 'movie#-100123' -> -100123)."""
-    try:
-        return int(str(pk).split("#", 1)[1])
-    except (IndexError, ValueError):
-        return None
-
-
 def remember_chat(mode, chat_id, title=None):
     item = {
         "PK": _pk(mode, chat_id),
@@ -1133,6 +1124,8 @@ def new_game(chat_id, initiator_id):
         "filter": _empty_filter(),   # Phase 1.5 constraints (AND across people)
         "constraints_open": False,
         "constraints_deadline": None,
+        "constraints_poll_id": None,         # the open_period poll that times the window
+        "constraints_poll_message_id": None,
         "awaiting_relax": False,
         "relax_deadline": None,
         "pool_all": [],    # full locked pool (kept for relax re-filtering)
@@ -1321,9 +1314,14 @@ def on_callback(mode, ev):
 
 
 # ---- constraints (Phase 1.5, optional) ------------------------------------ #
-# After the roster settles we ask once for constraints and open a 60s window.
-# No scheduler: the window closes on the next inbound event past the deadline
-# (same lazy backstop as the veto round), or early on an explicit "go".
+# After the roster settles we open a fixed 60s window and collect constraints from
+# anyone (free text, merged with AND — never overwritten). The window is timed by a
+# Telegram poll's open_period (the SAME server-side timer the veto round uses): when
+# Telegram auto-closes the poll it pushes a `poll` update that wakes the Lambda
+# (on_poll -> _close_constraints), so the window closes even if the chat goes silent —
+# no scheduler needed, and the client renders a live countdown for free. The poll's
+# votes are ignored: there is NO early close, so the full minute always runs and
+# everyone gets a turn. The lazy backstop is just a faster close when the chat is busy.
 _CONSTRAINTS_PARSE_SYSTEM = (
     "Parse ONE chat message into movie-night filter constraints. Output ONLY a JSON "
     "object, including just the keys actually mentioned, from: exclude_genres (list of "
@@ -1342,21 +1340,21 @@ def _begin_constraints(mode, chat_id, game):
     game["phase"] = "CONSTRAINTS"
     game["filter"] = _empty_filter()
     game["constraints_open"] = True
-    game["constraints_deadline"] = _now_epoch() + 60
+    game["constraints_deadline"] = _now_epoch() + _CONSTRAINTS_WINDOW
+    # The poll carries the timer (open_period) and shows a native countdown; its votes
+    # are ignored. People type their actual constraints in chat — anyone, any number.
+    resp = send_poll(mode, chat_id,
+                     "🎛 Any constraints tonight? Type them in chat — length, genre, "
+                     "year. Locks when this timer runs out.",
+                     ["I'll add some 💬", "No constraints from me"],
+                     is_anonymous=True, open_period=_CONSTRAINTS_WINDOW)
+    result = resp.get("result") or {}
+    poll_id = (result.get("poll") or {}).get("id")
+    game["constraints_poll_id"] = poll_id
+    game["constraints_poll_message_id"] = result.get("message_id")
     put_game(game)
-    send_message(mode, chat_id,
-                 "🎛 Any constraints tonight? Length, genre, or year range — "
-                 "everyone's welcome to chime in. I'll collect them all and close "
-                 f"at {_close_clock(game['constraints_deadline'])}.")
-
-
-def _close_clock(epoch):
-    """Window close time as HH:MM in Kyiv local — stated in the prompt instead of a
-    live countdown (Telegram edit limits + the Lambda is stateless between updates)."""
-    try:
-        return datetime.fromtimestamp(int(epoch), _KYIV).strftime("%H:%M")
-    except (TypeError, ValueError, OverflowError):
-        return "in a minute"
+    if poll_id:
+        put_poll_map(poll_id, chat_id, None)   # so the close update resolves chat_id
 
 
 def parse_constraint_text(text):
@@ -1428,14 +1426,17 @@ def _handle_constraints_message(mode, chat_id, game, text):
         _merge_filter(game["filter"], delta)
         put_game(game)
         send_message(mode, chat_id, f"Got it — {_describe_filter(game['filter'])} "
-                                    f"(still collecting until {_close_clock(game['constraints_deadline'])}).")
+                                    "(still collecting until the timer ends).")
     # anything that isn't a constraint just leaves the window open until it times out
 
 
 def _close_constraints(mode, chat_id, game, announce):
     if not game.get("constraints_open"):
-        return                            # already closed (tick + backstop can race)
+        return                            # already closed (poll-close + backstop can race)
     game["constraints_open"] = False
+    pid = game.get("constraints_poll_id")
+    if pid:
+        del_poll_map(pid)                 # the timer poll has served its purpose
     if announce:
         if _filter_active(game["filter"]):
             send_message(mode, chat_id, f"🎛 Constraints locked: {_describe_filter(game['filter'])}.")
@@ -1446,37 +1447,14 @@ def _close_constraints(mode, chat_id, game, announce):
 
 def _constraints_backstop(mode, chat_id, game):
     """Belt-and-suspenders for an ACTIVE chat: any update past the deadline closes the
-    window immediately rather than waiting for the next sweep. The guaranteed close on
-    silence is the EventBridge tick (run_constraint_tick) — this is just faster when
-    there's traffic."""
+    window immediately. The guaranteed close on silence is the poll's open_period timer
+    (Telegram pushes a `poll` close update -> on_poll); this is just faster when there's
+    traffic, and covers the gap before that update lands."""
     if game and game.get("phase") == "CONSTRAINTS" and game.get("constraints_open"):
         if _now_epoch() >= (game.get("constraints_deadline") or 0):
             _close_constraints(mode, chat_id, game, announce=True)
             return True
     return False
-
-
-def run_constraint_tick():
-    """Timed close, fired ~once a minute by EventBridge (task=constraint_tick). Sweeps
-    every chat's game and closes any constraint window whose 60s deadline has passed —
-    so 'if no one responds, too late' fires even when the chat goes silent. Never closes
-    before the deadline, so the full minute always runs."""
-    now, closed = _now_epoch(), 0
-    for g in ddb_scan():
-        if g.get("SK") != "game#current" or g.get("phase") != "CONSTRAINTS":
-            continue
-        if not g.get("constraints_open") or now < (g.get("constraints_deadline") or 0):
-            continue
-        chat_id = _chat_id_from_pk(g.get("PK"))
-        if chat_id is None:
-            continue
-        try:
-            _close_constraints("movie", chat_id, g, announce=True)
-            closed += 1
-        except Exception as e:
-            log.exception("constraint tick close failed for %s: %s", g.get("PK"), e)
-    log.info("constraint-tick: closed %d window(s)", closed)
-    return {"statusCode": 200, "body": f"constraint-tick: {closed} closed"}
 
 
 # ---- selection ------------------------------------------------------------ #
@@ -2176,6 +2154,7 @@ def _relax_backstop(mode, chat_id, game):
 
 
 _VETO_WINDOW = 120        # seconds the veto poll stays open before the backstop fires
+_CONSTRAINTS_WINDOW = 60  # fixed constraint-collection window; the poll's open_period
 
 
 def _present_candidate(mode, chat_id, game):
@@ -2335,24 +2314,14 @@ def run_morning_after():
     return {"statusCode": 200, "body": f"morning-after: {total} posted"}
 
 
-_SCHEDULED_TASKS = ("morning_after", "constraint_tick")
-
-
-def _scheduled_task(event):
-    """The scheduled-job name for an EventBridge invocation, else None. Routes on our
-    explicit top-level `task` marker (set as the rule's constant input); a bare
-    scheduled-event shape with no task defaults to the daily morning-after poll for
-    back-compat. A Telegram webhook (which carries an HTTP path) returns None."""
-    task = event.get("task")
-    if task in _SCHEDULED_TASKS:
-        return task
-    if event.get("source") == "aws.events" or event.get("detail-type") == "Scheduled Event":
-        return "morning_after"
-    return None
-
-
 def _is_scheduled_event(event):
-    return _scheduled_task(event) is not None
+    """A daily EventBridge invocation, recognised by our constant input task marker
+    or the native scheduled-event shape — never a Telegram webhook (those have a path).
+    The only scheduled job is the morning-after poll; the constraint window is timed by
+    its own Telegram poll (open_period), not a sweep."""
+    return (event.get("task") == "morning_after"
+            or event.get("source") == "aws.events"
+            or event.get("detail-type") == "Scheduled Event")
 
 
 def _norm_title(s):
@@ -2496,7 +2465,15 @@ def on_poll(mode, ev):
         return
     chat_id = ev["chat_id"]
     game = get_game(chat_id)
-    if not game or game.get("phase") != "VETO":
+    if not game:
+        return
+    # Constraint window: the poll's open_period IS the timer. When Telegram auto-closes
+    # it, lock the merged constraints and move on — votes are not consulted (no early
+    # close). Same server-side timer as the veto round below.
+    if game.get("phase") == "CONSTRAINTS" and ev.get("poll_id") == game.get("constraints_poll_id"):
+        _close_constraints(mode, chat_id, game, announce=True)
+        return
+    if game.get("phase") != "VETO":
         return
     cur = game.get("current")
     if not cur or cur.get("poll_id") != ev.get("poll_id") or cur.get("resolved"):
@@ -3194,13 +3171,9 @@ def _load_body(event):
 
 
 def lambda_handler(event, context):
-    # Scheduled (EventBridge) invocation: no Telegram path/secret — dispatch by task
-    # and return before the webhook-only checks below.
-    task = _scheduled_task(event)
-    if task == "constraint_tick":
-        log.info("scheduled invocation -> constraint window sweep")
-        return run_constraint_tick()
-    if task == "morning_after":
+    # Scheduled (EventBridge) invocation: no Telegram path/secret — run the daily
+    # morning-after poll and return before the webhook-only checks below.
+    if _is_scheduled_event(event):
         log.info("scheduled invocation -> morning-after poll")
         return run_morning_after()
 
