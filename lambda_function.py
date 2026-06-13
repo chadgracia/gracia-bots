@@ -1126,6 +1126,8 @@ def new_game(chat_id, initiator_id):
         "constraints_deadline": None,
         "constraints_poll_id": None,         # the open_period poll that times the window
         "constraints_poll_message_id": None,
+        # per-player selection turn timer (same open_period poll mechanism)
+        "turn_deadline": None, "turn_poll_id": None, "turn_poll_msg_id": None,
         "awaiting_relax": False,
         "relax_deadline": None,
         "pool_all": [],    # full locked pool (kept for relax re-filtering)
@@ -1615,6 +1617,7 @@ def _post_short_pool(mode, chat_id, game, uid):
                 "Add one that fits, or sit this round out (you keep your veto).")
     resp = send_message(mode, chat_id, text, reply_markup=_short_pool_keyboard(n))
     game["sel_msg_id"] = (resp.get("result") or {}).get("message_id")
+    _arm_turn_timer(mode, chat_id, game, uid)
     put_game(game)
 
 
@@ -1637,6 +1640,7 @@ def _post_swap_deadend(mode, chat_id, game, uid):
                 "(you keep your veto).")
     resp = send_message(mode, chat_id, text, reply_markup=_swap_deadend_keyboard(n))
     game["sel_msg_id"] = (resp.get("result") or {}).get("message_id")
+    _arm_turn_timer(mode, chat_id, game, uid)
     put_game(game)
 
 
@@ -1657,9 +1661,10 @@ def _handle_short_pool_callback(mode, chat_id, game, uid, data):
         _advance_player(mode, chat_id, game)
     elif data == "sp_add":
         sel["awaiting_add"] = True
-        put_game(game)
         desc = _describe_filter(game["filter"]) or "tonight's filter"
         send_message(mode, chat_id, f"{who}, send a film title that fits {desc}.")
+        _arm_turn_timer(mode, chat_id, game, uid)   # still their turn while they type
+        put_game(game)
 
 
 def _handle_short_pool_add(mode, chat_id, game, uid, text):
@@ -1743,12 +1748,64 @@ def _post_player_slate(mode, chat_id, game, uid):
             f"\n\nReply with {n} emoji in order — 👍 keep / 👎 swap (e.g. {'👍' * n}).")
     resp = send_message(mode, chat_id, text)
     game["sel_msg_id"] = (resp.get("result") or {}).get("message_id")
+    _arm_turn_timer(mode, chat_id, game, uid)   # 60s clock; caller persists the game
 
 
 def _advance_player(mode, chat_id, game):
     game["sel_idx"] = game.get("sel_idx", 0) + 1
     put_game(game)
     _ask_player(mode, chat_id, game)
+
+
+def _arm_turn_timer(mode, chat_id, game, uid):
+    """(Re)start the 60s clock on the current player's selection turn. Timed by a
+    Telegram poll's open_period — the same reliable, clock-driven close as the
+    constraint window — so a silent player is skipped ON THE CLOCK, not only on their
+    own input. Replaces any prior turn poll (its later close is harmless: the poll_id
+    won't match the new turn_poll_id). The player still replies 👍/👎 in chat; the poll
+    is purely the timer (votes ignored, like the constraints poll)."""
+    old = game.get("turn_poll_id")
+    if old:
+        del_poll_map(old)
+        try:
+            stop_poll(mode, chat_id, game.get("turn_poll_msg_id"))
+        except Exception:
+            pass
+    game["turn_deadline"] = _now_epoch() + _TURN_WINDOW
+    resp = send_poll(mode, chat_id,
+                     f"⏳ {mention_for(chat_id, uid)}'s turn — reply 👍 keep / 👎 swap in "
+                     "chat. Auto-skips when this runs out (your veto still counts).",
+                     ["I'm choosing", "⏳"], is_anonymous=True, open_period=_TURN_WINDOW)
+    result = resp.get("result") or {}
+    pid = (result.get("poll") or {}).get("id")
+    game["turn_poll_id"] = pid
+    game["turn_poll_msg_id"] = result.get("message_id")
+    if pid:
+        put_poll_map(pid, chat_id, None)   # so the close update resolves chat_id
+
+
+def _clear_turn_timer(game):
+    pid = game.get("turn_poll_id")
+    if pid:
+        del_poll_map(pid)
+    game["turn_poll_id"] = None
+    game["turn_poll_msg_id"] = None
+
+
+def _timeout_player_turn(mode, chat_id, game, uid):
+    """The turn clock ran out with no decision: sit this player out (no picks, but their
+    veto still counts) and advance. The next player's prompt re-arms the timer."""
+    sel = game["selection"].get(str(uid)) or {}
+    sel["slots"] = []
+    sel["locked"] = True
+    sel["awaiting_add"] = False
+    game["selection"][str(uid)] = sel
+    _clear_turn_timer(game)
+    put_game(game)
+    send_message(mode, chat_id,
+                 f"⏳ {mention_for(chat_id, uid)} didn't pick in time — sitting this round "
+                 "out (veto still counts). Moving on.")
+    _advance_player(mode, chat_id, game)
 
 
 def _handle_selection_reply(mode, chat_id, game, uid, text):
@@ -1917,7 +1974,7 @@ def _film_almanac(date):
     return []
 
 
-def _wildcard_via_llm(chat_id, players):
+def _wildcard_via_llm(chat_id, players, filter_desc=""):
     """Tier 1: a taste-rhyme pick built from what THESE players LOVE (the films they
     saved / rated highly), with the reason written in the same warm, film-essayist
     voice as the candidate/winner blurbs. The model proposes a film + an in-voice
@@ -1956,9 +2013,13 @@ def _wildcard_via_llm(chat_id, players):
                 "epics — Tokyo Story, Scenes from a Marriage — and Asa's passion for Asian "
                 "cinema — Poetry, To Live — bring me to Yi Yi.\" End on the film you are "
                 "suggesting. Do not restate year/runtime/rating; just the connection."
+                + (f" HARD CONSTRAINT: tonight's filter is {filter_desc}; the pick MUST "
+                   "satisfy it (genre, length, and year). Do not suggest anything that "
+                   "violates it." if filter_desc else "")
             )}],
             messages=[{"role": "user", "content": [{"text": json.dumps(
-                {"players": digest, "already_won_here": won})}]}],
+                {"players": digest, "already_won_here": won,
+                 "constraints": filter_desc or None})}]}],
             inferenceConfig={"maxTokens": 280, "temperature": 0.8},
         )
         raw = "".join(b.get("text", "") for b in resp["output"]["message"]["content"]).strip()
@@ -1987,6 +2048,11 @@ def _build_wildcard(chat_id, game):
     # novelty filter (all tiers): not in tonight's pool, not already suggested here,
     # not in any player's library, and never a past winner of this chat.
     blocked = pool_slugs | _wildcard_log(chat_id) | owned | _past_winner_slugs(chat_id)
+    # tonight's CONSTRAINTS apply to the wildcard too — it rides the same pick/veto
+    # path, so an off-filter suggestion is as wrong as an off-filter player pick.
+    f = game.get("filter") or _empty_filter()
+    filter_on = _filter_active(f)
+    filter_desc = _describe_filter(f) if filter_on else ""
 
     def verify(title, year, reason, tier):
         info = lookup_film_cached(title, year)
@@ -1995,6 +2061,8 @@ def _build_wildcard(chat_id, game):
         slug = info.get("slug") or _slugify(title)
         if slug in blocked:
             return None, "already_owned_or_suggested"      # in pool / log / a player's library
+        if filter_on and not _passes_filter(info, f):
+            return None, "off_filter"                       # violates tonight's constraints
         return ({"title": info.get("title") or title, "year": info.get("year") or year,
                  "slug": slug, "reason": reason, "tier": tier}, "ok")
 
@@ -2003,7 +2071,7 @@ def _build_wildcard(chat_id, game):
     has_data = bool(owned) or any(get_user_ratings(chat_id, user_id=p) for p in players)
     if AI_ENABLED and has_data:
         for attempt in (1, 2):
-            cand = _wildcard_via_llm(chat_id, players)
+            cand = _wildcard_via_llm(chat_id, players, filter_desc)
             if not cand:
                 log.warning("wildcard tier1 attempt %d/2: no usable candidate", attempt)
                 continue
@@ -2185,8 +2253,9 @@ def _relax_backstop(mode, chat_id, game):
     return False
 
 
-_VETO_WINDOW = 120        # seconds the veto poll stays open before the backstop fires
+_VETO_WINDOW = 60         # seconds the veto poll stays open before the backstop fires
 _CONSTRAINTS_WINDOW = 60  # fixed constraint-collection window; the poll's open_period
+_TURN_WINDOW = 60         # per-player selection turn; same poll-open_period timer
 
 
 def _present_candidate(mode, chat_id, game):
@@ -2504,6 +2573,15 @@ def on_poll(mode, ev):
     # close). Same server-side timer as the veto round below.
     if game.get("phase") == "CONSTRAINTS" and ev.get("poll_id") == game.get("constraints_poll_id"):
         _close_constraints(mode, chat_id, game, announce=True)
+        return
+    # Per-player selection turn: the turn poll's open_period ran out — skip the silent
+    # player (veto still counts) and advance. A stale prior turn poll won't match the
+    # current turn_poll_id, so its later close is ignored.
+    if game.get("phase") == "SELECTING" and ev.get("poll_id") == game.get("turn_poll_id"):
+        cur = _current_selecting_uid(game)
+        sel = game["selection"].get(str(cur)) if cur is not None else None
+        if cur is not None and sel and not sel.get("locked"):
+            _timeout_player_turn(mode, chat_id, game, cur)
         return
     if game.get("phase") != "VETO":
         return
@@ -3042,11 +3120,40 @@ def converse(system_prompt, user_text, ctx, tools=MOVIE_TOOLS, max_turns=6, prio
     return ""
 
 
+def _meta_command(text):
+    """Cancel / new-game intent that must work in ANY phase (even mid-turn). Matched
+    deterministically because during a window we gate ambient chat to that window and
+    never reach the LLM agent where cancel_game / start_game live."""
+    t = " ".join((text or "").lower().split())
+    if not t:
+        return None
+    if t in {"cancel", "cancel game", "cancel the game", "cancel movie night", "abort",
+             "scrap it", "scrap the game", "end the game", "stop the game"} \
+            or ("cancel" in t and any(w in t for w in ("game", "movie", "night"))):
+        return "cancel"
+    if t in {"new game", "new movie night", "start over", "start a new game",
+             "start new game", "restart", "restart the game", "reset the game"} \
+            or "new game" in t or "start over" in t or "start a new game" in t:
+        return "new"
+    return None
+
+
 def on_message(mode, ev):
     chat_id, uid = ev["chat_id"], ev.get("user_id")
     text = (ev.get("text") or "").strip()
     remember_member(chat_id, uid, ev["user_name"], ev.get("username"))
     game = get_game(chat_id)
+    # Escape hatch FIRST: cancel / new game must work in ANY phase, including while we're
+    # waiting on a player mid-turn (the phase branches below otherwise swallow the text).
+    if text and game and game.get("status") not in _TERMINAL_STATUS:
+        act = _meta_command(text)
+        if act == "cancel":
+            _abandon_game(chat_id, game)
+            send_message(mode, chat_id, "Movie night cancelled.")
+            return
+        if act == "new":
+            start_game(mode, chat_id, uid, force_new=True)
+            return
     # Lazy deadline backstops (no scheduler): a later event past a deadline
     # advances the corresponding window.
     if _veto_backstop(mode, chat_id, game):
@@ -3079,12 +3186,22 @@ def on_message(mode, ev):
     # Selection: only the CURRENT player's reply matters; ignore others.
     if game and game.get("phase") == "SELECTING":
         cur = _current_selecting_uid(game)
+        # The current player's reply is authoritative — handle it (never time out a
+        # borderline-late reply we actually received).
         if cur is not None and uid is not None and int(uid) == int(cur) and text:
             sel = game["selection"].get(str(cur), {})
             if sel.get("awaiting_add"):
                 _handle_short_pool_add(mode, chat_id, game, int(cur), text)
             else:
                 _handle_selection_reply(mode, chat_id, game, int(cur), text)
+            return
+        # Anyone else (or a no-text update) past the turn deadline -> the clock's up,
+        # skip the silent player. (Faster than the poll for an active chat; the poll's
+        # open_period close covers a fully silent one.)
+        if cur is not None and _now_epoch() >= (game.get("turn_deadline") or 0):
+            sel = game["selection"].get(str(cur), {})
+            if sel and not sel.get("locked"):
+                _timeout_player_turn(mode, chat_id, game, cur)
         return
     if not text:
         return

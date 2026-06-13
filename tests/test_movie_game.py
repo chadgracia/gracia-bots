@@ -402,6 +402,38 @@ def test_wildcard_excludes_past_winner():
     assert sugg["slug"] == L._slugify("Yi Yi")
 
 
+def _wildcard_game_with_filter(**filter_overrides):
+    game = L.new_game(CHAT, 1)
+    L._add_player(game, 1)
+    L._add_player(game, 2)
+    game["selection"] = {
+        "1": {"locked": True, "slots": [{"slug": "film-a", "title": "Film A"}]},
+        "2": {"locked": True, "slots": [{"slug": "film-b", "title": "Film B"}]},
+    }
+    game["filter"].update(filter_overrides)
+    return game
+
+
+def test_wildcard_skipped_when_nothing_fits_the_filter():
+    # Every fake-lookup film is Drama/120m/1950; a filter that excludes all of those
+    # must yield NO wildcard rather than an off-filter suggestion.
+    _reset()
+    game = _wildcard_game_with_filter(exclude_genres=["drama"])
+    assert L._build_wildcard(CHAT, game) is None
+    _reset()
+    game = _wildcard_game_with_filter(include_genres=["documentary"], min_runtime_min=201)
+    assert L._build_wildcard(CHAT, game) is None
+
+
+def test_wildcard_respects_filter_and_only_returns_a_fitting_film():
+    _reset()
+    game = _wildcard_game_with_filter(exclude_genres=["horror"])   # Drama passes this
+    sugg = L._build_wildcard(CHAT, game)
+    assert sugg is not None
+    info = L.lookup_film_cached(sugg["title"], sugg.get("year"))
+    assert L._passes_filter(info, game["filter"])                  # the pick truly fits
+
+
 def test_no_eligible_vetoer_wins_immediately():
     # solo player can't veto their own pick -> nobody can veto -> instant winner
     _veto_setup([1], [(1, "a", "A")])
@@ -505,6 +537,76 @@ def test_selection_is_sequential_one_player_at_a_time():
     assert L.get_game(CHAT)["phase"] == "WILDCARD"
     L.handle_movie(MODE, message(1, "pass"))   # decline -> VETO
     assert L.get_game(CHAT)["phase"] == "VETO"
+
+
+# ---- per-player turn timer + cancel/new-game escape hatch ----------------- #
+def _two_player_to_selection():
+    """Two players (3 films each), driven to SELECTING with player 1 on the clock."""
+    _reset()
+    for t in ["A1", "A2", "A3"]:
+        L.add_to_library(CHAT, 1, t)
+    for t in ["B1", "B2", "B3"]:
+        L.add_to_library(CHAT, 2, t)
+    L.start_game(MODE, CHAT, 1)
+    L.handle_movie(MODE, cb(2, "join"))
+    L.handle_movie(MODE, cb(1, "start"))
+    _skip_constraints()
+    g = L.get_game(CHAT)
+    assert g["phase"] == "SELECTING" and L._current_selecting_uid(g) == 1
+    return g
+
+
+def test_turn_arms_a_timer_poll():
+    g = _two_player_to_selection()
+    assert g["turn_poll_id"] and g["turn_deadline"]            # 60s clock is running
+
+
+def test_turn_timer_skips_silent_player_on_poll_close():
+    g = _two_player_to_selection()
+    tp = g["turn_poll_id"]
+    NOW[0] += L._TURN_WINDOW + 1
+    L.handle_movie(MODE, poll_closed(tp))                      # Telegram closes the poll
+    g = L.get_game(CHAT)
+    assert g["selection"]["1"]["locked"] and g["selection"]["1"]["slots"] == []  # sat out
+    assert L._current_selecting_uid(g) == 2                    # advanced, on the clock
+    assert any("didn't pick in time" in t.lower() for t, _ in SENT)
+
+
+def test_turn_timer_backstop_fires_on_other_activity_past_deadline():
+    _two_player_to_selection()
+    NOW[0] += L._TURN_WINDOW + 1
+    L.handle_movie(MODE, message(2, "anyone there?"))          # other player, past deadline
+    g = L.get_game(CHAT)
+    assert g["selection"]["1"]["locked"] and L._current_selecting_uid(g) == 2
+
+
+def test_current_player_late_reply_still_counts():
+    # A reply we actually received from the current player is authoritative — never
+    # sacrificed to the timer, even if it lands a hair late.
+    _two_player_to_selection()
+    NOW[0] += L._TURN_WINDOW + 5
+    L.handle_movie(MODE, message(1, "👍👍👍"))                 # late, but it's THEIR pick
+    g = L.get_game(CHAT)
+    assert g["selection"]["1"]["locked"] and g["selection"]["1"]["slots"]   # kept, not sat out
+    assert L._current_selecting_uid(g) == 2
+
+
+def test_cancel_works_mid_turn():
+    _two_player_to_selection()
+    L.handle_movie(MODE, message(1, "cancel the game"))
+    assert L.get_game(CHAT) is None
+    assert any("cancelled" in t.lower() for t, _ in SENT)
+
+
+def test_new_game_works_mid_turn_from_any_player():
+    _two_player_to_selection()
+    L.handle_movie(MODE, message(2, "new game"))              # not even the current player
+    g = L.get_game(CHAT)
+    assert g is not None and g["phase"] == "JOINING"          # scrapped + fresh game
+
+
+def test_veto_window_is_sixty_seconds():
+    assert L._VETO_WINDOW == 60
 
 
 # ---- wildcard "one for the hat" ------------------------------------------- #
