@@ -147,6 +147,15 @@ def _pk(mode, chat_id):
     return f"{mode}#{chat_id}"
 
 
+def _chat_id_from_pk(pk):
+    """Inverse of _pk for the daily/sweep jobs, which read items by scan and need the
+    chat id back out of the partition key (e.g. 'movie#-100123' -> -100123)."""
+    try:
+        return int(str(pk).split("#", 1)[1])
+    except (IndexError, ValueError):
+        return None
+
+
 def remember_chat(mode, chat_id, title=None):
     item = {
         "PK": _pk(mode, chat_id),
@@ -1328,10 +1337,6 @@ _CONSTRAINTS_PARSE_SYSTEM = (
     "If the message states no constraint, output {}."
 )
 
-_CONSTRAINTS_DONE = {"go", "go!", "let's go", "lets go", "let's pick", "lets pick",
-                     "pick", "that's it", "thats it", "that's all", "thats all",
-                     "done", "start", "no constraints", "none", "nope"}
-
 
 def _begin_constraints(mode, chat_id, game):
     game["phase"] = "CONSTRAINTS"
@@ -1341,7 +1346,17 @@ def _begin_constraints(mode, chat_id, game):
     put_game(game)
     send_message(mode, chat_id,
                  "🎛 Any constraints tonight? Length, genre, or year range — "
-                 "or just say go. (You've got about a minute.)")
+                 "everyone's welcome to chime in. I'll collect them all and close "
+                 f"at {_close_clock(game['constraints_deadline'])}.")
+
+
+def _close_clock(epoch):
+    """Window close time as HH:MM in Kyiv local — stated in the prompt instead of a
+    live countdown (Telegram edit limits + the Lambda is stateless between updates)."""
+    try:
+        return datetime.fromtimestamp(int(epoch), _KYIV).strftime("%H:%M")
+    except (TypeError, ValueError, OverflowError):
+        return "in a minute"
 
 
 def parse_constraint_text(text):
@@ -1405,38 +1420,63 @@ def _describe_filter(f):
 
 
 def _handle_constraints_message(mode, chat_id, game, text):
-    """A message during the open constraints window: close early on 'go', else
-    parse it into the filter and acknowledge."""
-    t = (text or "").strip().lower()
-    if t in _CONSTRAINTS_DONE:
-        _close_constraints(mode, chat_id, game, announce=True)
-        return
+    """A message during the open constraints window: accumulate it into the filter and
+    acknowledge. There is NO early close — the full minute always runs so everyone gets
+    a turn; the window only closes on the timed sweep (or the post-deadline backstop)."""
     delta = parse_constraint_text(text)
     if delta:
         _merge_filter(game["filter"], delta)
         put_game(game)
-        send_message(mode, chat_id, f"Got it — {_describe_filter(game['filter'])}. "
-                                    "More, or say go.")
-    # a non-constraint, non-"go" message just leaves the window open
+        send_message(mode, chat_id, f"Got it — {_describe_filter(game['filter'])} "
+                                    f"(still collecting until {_close_clock(game['constraints_deadline'])}).")
+    # anything that isn't a constraint just leaves the window open until it times out
 
 
 def _close_constraints(mode, chat_id, game, announce):
+    if not game.get("constraints_open"):
+        return                            # already closed (tick + backstop can race)
     game["constraints_open"] = False
     if announce:
         if _filter_active(game["filter"]):
             send_message(mode, chat_id, f"🎛 Constraints locked: {_describe_filter(game['filter'])}.")
         else:
-            send_message(mode, chat_id, "No constraints — playing the full libraries.")
+            send_message(mode, chat_id, "🎬 No constraints tonight — let's go.")
     _begin_selection(mode, chat_id, game)
 
 
 def _constraints_backstop(mode, chat_id, game):
-    """Lazy 60s window: any later event past the deadline closes the window."""
+    """Belt-and-suspenders for an ACTIVE chat: any update past the deadline closes the
+    window immediately rather than waiting for the next sweep. The guaranteed close on
+    silence is the EventBridge tick (run_constraint_tick) — this is just faster when
+    there's traffic."""
     if game and game.get("phase") == "CONSTRAINTS" and game.get("constraints_open"):
         if _now_epoch() >= (game.get("constraints_deadline") or 0):
             _close_constraints(mode, chat_id, game, announce=True)
             return True
     return False
+
+
+def run_constraint_tick():
+    """Timed close, fired ~once a minute by EventBridge (task=constraint_tick). Sweeps
+    every chat's game and closes any constraint window whose 60s deadline has passed —
+    so 'if no one responds, too late' fires even when the chat goes silent. Never closes
+    before the deadline, so the full minute always runs."""
+    now, closed = _now_epoch(), 0
+    for g in ddb_scan():
+        if g.get("SK") != "game#current" or g.get("phase") != "CONSTRAINTS":
+            continue
+        if not g.get("constraints_open") or now < (g.get("constraints_deadline") or 0):
+            continue
+        chat_id = _chat_id_from_pk(g.get("PK"))
+        if chat_id is None:
+            continue
+        try:
+            _close_constraints("movie", chat_id, g, announce=True)
+            closed += 1
+        except Exception as e:
+            log.exception("constraint tick close failed for %s: %s", g.get("PK"), e)
+    log.info("constraint-tick: closed %d window(s)", closed)
+    return {"statusCode": 200, "body": f"constraint-tick: {closed} closed"}
 
 
 # ---- selection ------------------------------------------------------------ #
@@ -2295,12 +2335,24 @@ def run_morning_after():
     return {"statusCode": 200, "body": f"morning-after: {total} posted"}
 
 
+_SCHEDULED_TASKS = ("morning_after", "constraint_tick")
+
+
+def _scheduled_task(event):
+    """The scheduled-job name for an EventBridge invocation, else None. Routes on our
+    explicit top-level `task` marker (set as the rule's constant input); a bare
+    scheduled-event shape with no task defaults to the daily morning-after poll for
+    back-compat. A Telegram webhook (which carries an HTTP path) returns None."""
+    task = event.get("task")
+    if task in _SCHEDULED_TASKS:
+        return task
+    if event.get("source") == "aws.events" or event.get("detail-type") == "Scheduled Event":
+        return "morning_after"
+    return None
+
+
 def _is_scheduled_event(event):
-    """A daily EventBridge invocation, recognised by our constant input task marker
-    or the native scheduled-event shape — never a Telegram webhook (those have a path)."""
-    return (event.get("task") == "morning_after"
-            or event.get("source") == "aws.events"
-            or event.get("detail-type") == "Scheduled Event")
+    return _scheduled_task(event) is not None
 
 
 def _norm_title(s):
@@ -3142,9 +3194,13 @@ def _load_body(event):
 
 
 def lambda_handler(event, context):
-    # Scheduled (EventBridge) invocation: no Telegram path/secret — run the daily
-    # morning-after poll and return before the webhook-only checks below.
-    if _is_scheduled_event(event):
+    # Scheduled (EventBridge) invocation: no Telegram path/secret — dispatch by task
+    # and return before the webhook-only checks below.
+    task = _scheduled_task(event)
+    if task == "constraint_tick":
+        log.info("scheduled invocation -> constraint window sweep")
+        return run_constraint_tick()
+    if task == "morning_after":
         log.info("scheduled invocation -> morning-after poll")
         return run_morning_after()
 

@@ -158,6 +158,14 @@ def cards_for(game, user_id):
     return [int(mid) for mid, e in game["cards"].items() if str(e["uid"]) == str(user_id)]
 
 
+def _skip_constraints():
+    """Constraints now ALWAYS run the full ~60s — there is no early 'go'. To reach
+    SELECTING in tests, fast-forward past the window and fire the real timed close
+    (the EventBridge sweep), exactly as production does when the chat goes silent."""
+    NOW[0] += 61
+    L.run_constraint_tick()
+
+
 # ---- tests ---------------------------------------------------------------- #
 def test_add_to_library_is_slug_keyed_with_metadata():
     _reset()
@@ -201,7 +209,7 @@ def _two_player_game_to_veto():
     L.start_game(MODE, CHAT, 1)             # initiator 1 auto-joins
     L.handle_movie(MODE, cb(2, "join"))     # player 2 joins
     L.handle_movie(MODE, cb(1, "start"))    # -> CONSTRAINTS window
-    L.handle_movie(MODE, message(1, "go"))  # no constraints -> SELECTING (asks player 1)
+    _skip_constraints()                     # window times out -> SELECTING (asks player 1)
     assert L.get_game(CHAT)["phase"] == "SELECTING"
     L.handle_movie(MODE, message(1, "👍"))  # player 1 keeps (1 film) -> next player
     L.handle_movie(MODE, message(2, "👍"))  # player 2 keeps -> wildcard offered (2 players)
@@ -456,7 +464,7 @@ def test_thumbs_down_swaps_a_slot_and_reasks():
         L.add_to_library(CHAT, 1, t)
     L.start_game(MODE, CHAT, 1)
     L.handle_movie(MODE, cb(1, "start"))
-    L.handle_movie(MODE, message(1, "go"))      # -> SELECTING, player 1 asked
+    _skip_constraints()                         # -> SELECTING, player 1 asked
     sel = L.get_game(CHAT)["selection"]["1"]
     assert len(sel["slots"]) == 3 and len(sel["shown"]) == 3
     slot0_before = sel["slots"][0]["slug"]
@@ -480,7 +488,7 @@ def test_selection_is_sequential_one_player_at_a_time():
     L.start_game(MODE, CHAT, 1)
     L.handle_movie(MODE, cb(2, "join"))
     L.handle_movie(MODE, cb(1, "start"))
-    L.handle_movie(MODE, message(1, "go"))           # -> SELECTING, player 1 first
+    _skip_constraints()                              # -> SELECTING, player 1 first
     g = L.get_game(CHAT)
     assert g["sel_idx"] == 0 and L._current_selecting_uid(g) == 1
     # a reply from player 2 (not their turn yet) is ignored
@@ -507,7 +515,7 @@ def _two_player_to_wildcard():
     L.start_game(MODE, CHAT, 1)
     L.handle_movie(MODE, cb(2, "join"))
     L.handle_movie(MODE, cb(1, "start"))
-    L.handle_movie(MODE, message(1, "go"))
+    _skip_constraints()
     L.handle_movie(MODE, message(1, "👍"))
     L.handle_movie(MODE, message(2, "👍"))
     g = L.get_game(CHAT)
@@ -585,7 +593,7 @@ def test_wildcard_offered_in_solo_game():
     L.add_to_library(CHAT, 1, "Solo Film")
     L.start_game(MODE, CHAT, 1)
     L.handle_movie(MODE, cb(1, "start"))
-    L.handle_movie(MODE, message(1, "go"))
+    _skip_constraints()
     L.handle_movie(MODE, message(1, "👍"))             # solo lock -> wildcard offered
     assert L.get_game(CHAT)["phase"] == "WILDCARD"
     assert any("🎩" in t for t, _ in SENT)             # the pitch went out
@@ -602,7 +610,7 @@ def test_wildcard_never_repeats_across_games():
         L.start_game(MODE, CHAT, 1, force_new=True)
         L.handle_movie(MODE, cb(2, "join"))
         L.handle_movie(MODE, cb(1, "start"))
-        L.handle_movie(MODE, message(1, "go"))
+        _skip_constraints()
         L.handle_movie(MODE, message(1, "👍"))
         L.handle_movie(MODE, message(2, "👍"))
         return L.get_game(CHAT)["wildcard"]["slug"]
@@ -1008,7 +1016,7 @@ def test_over_constrained_offers_relax_then_unfilter():
     assert hist and hist[0]["winner_slug"] == "dra"
 
 
-def test_constraints_window_parses_three_people_then_go_closes():
+def test_constraints_window_parses_three_people_then_times_out():
     _reset()
     pk = L._pk(MODE, CHAT)   # a film that survives the filter below (1980, drama, 100m)
     STORE[(pk, "lib#1#film-a")] = {"PK": pk, "SK": "lib#1#film-a", "slug": "film-a",
@@ -1030,13 +1038,18 @@ def test_constraints_window_parses_three_people_then_go_closes():
         f = L.get_game(CHAT)["filter"]
         assert f["exclude_genres"] == ["documentary"]
         assert f["max_runtime_min"] == 150 and f["min_year"] == 1960
-        L.handle_movie(MODE, message(1, "go"))        # explicit close
+        # No early 'go' — saying go does NOT close; the full window must run.
+        L.handle_movie(MODE, message(1, "go"))
+        assert L.get_game(CHAT)["phase"] == "CONSTRAINTS"
+        _skip_constraints()                           # timed sweep closes it
         assert L.get_game(CHAT)["phase"] == "SELECTING"
     finally:
         L.parse_constraint_text = orig
 
 
-def test_constraints_backstop_closes_after_60s_silence():
+def test_constraints_backstop_closes_after_deadline_on_next_update():
+    # Belt-and-suspenders path: when the chat IS active, the first update past the
+    # deadline closes the window immediately (faster than waiting for the sweep).
     _reset()
     L.add_to_library(CHAT, 1, "Film A")
     L.start_game(MODE, CHAT, 1)
@@ -1045,6 +1058,68 @@ def test_constraints_backstop_closes_after_60s_silence():
     NOW[0] += 61
     L.handle_movie(MODE, message(2, "anything"))      # next event past deadline closes it
     assert L.get_game(CHAT)["phase"] == "SELECTING"
+
+
+def test_constraints_prompt_states_the_close_time():
+    _reset()
+    L.add_to_library(CHAT, 1, "Film A")
+    L.start_game(MODE, CHAT, 1)
+    L.handle_movie(MODE, cb(1, "start"))
+    prompt = next(t for t, _ in SENT if "close at" in t)              # no live countdown
+    hhmm = prompt.split("close at", 1)[1].strip().rstrip(".")[:5]
+    assert hhmm[:2].isdigit() and hhmm[2] == ":" and hhmm[3:5].isdigit()
+
+
+def test_constraint_tick_closes_silent_window_without_any_message():
+    # The whole point: the window closes at ~60s EVEN IF the chat goes silent.
+    _reset()
+    L.add_to_library(CHAT, 1, "Film A")
+    L.start_game(MODE, CHAT, 1)
+    L.handle_movie(MODE, cb(1, "start"))
+    assert L.get_game(CHAT)["phase"] == "CONSTRAINTS"
+    NOW[0] += 61
+    out = L.run_constraint_tick()                     # EventBridge sweep, no chat activity
+    assert out["body"].endswith("1 closed")
+    assert L.get_game(CHAT)["phase"] == "SELECTING"
+
+
+def test_constraint_tick_never_closes_before_deadline():
+    _reset()
+    L.add_to_library(CHAT, 1, "Film A")
+    L.start_game(MODE, CHAT, 1)
+    L.handle_movie(MODE, cb(1, "start"))
+    out = L.run_constraint_tick()                     # still inside the minute
+    assert out["body"].endswith("0 closed")
+    assert L.get_game(CHAT)["phase"] == "CONSTRAINTS"
+
+
+def test_constraint_tick_ignores_games_not_in_constraints_phase():
+    _reset()
+    pk = L._pk(MODE, CHAT)
+    STORE[(pk, "game#current")] = {"PK": pk, "SK": "game#current", "phase": "SELECTING",
+                                   "constraints_open": False, "constraints_deadline": 0}
+    assert L.run_constraint_tick()["body"].endswith("0 closed")
+
+
+def test_no_early_go_keeps_window_open_for_everyone():
+    # Saying 'go' must NOT short-circuit the window — everyone still gets their turn.
+    _reset()
+    L.add_to_library(CHAT, 1, "Film A")
+    L.start_game(MODE, CHAT, 1)
+    L.handle_movie(MODE, cb(1, "start"))
+    L.handle_movie(MODE, message(1, "go"))
+    L.handle_movie(MODE, message(1, "lets go"))
+    assert L.get_game(CHAT)["phase"] == "CONSTRAINTS"   # still open
+
+
+def test_scheduled_constraint_tick_routes_through_handler():
+    _reset()
+    out = L.lambda_handler({"task": "constraint_tick"}, None)
+    assert out["statusCode"] == 200 and "constraint-tick" in out["body"]
+    assert L._scheduled_task({"task": "constraint_tick"}) == "constraint_tick"
+    assert L._scheduled_task({"task": "morning_after"}) == "morning_after"
+    assert L._scheduled_task({"source": "aws.events"}) == "morning_after"   # bare -> daily
+    assert L._scheduled_task({"rawPath": "/movie"}) is None                 # webhook
 
 
 def test_resolver_passes_year_as_separate_param():
