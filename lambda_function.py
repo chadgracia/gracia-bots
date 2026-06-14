@@ -47,6 +47,10 @@ AI_ENABLED = bool(BEDROCK_MODEL_ID)
 # primary; Rotten Tomatoes comes from OMDb's Ratings array (free key, OMDB_API_KEY).
 TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "").strip()
 OMDB_API_KEY = os.environ.get("OMDB_API_KEY", "").strip()
+# ScraperAPI: routes the Letterboxd fetch through a non-AWS IP. The Lambda's
+# own IP is blocked by Letterboxd's Cloudflare; TMDB isn't, which is why only
+# the Letterboxd rating needed this. Env override wins; literal is the live key.
+SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY", "b0351922a06edcff416822d09cbd5a2c").strip()
 
 _ddb = boto3.resource("dynamodb", region_name=REGION)
 _table = _ddb.Table(DDB_TABLE)
@@ -582,27 +586,40 @@ def _letterboxd(title):
             "genres": genres, "description": desc}
 
 
+def _scraperapi_get(target_url, ultra=False, timeout=35):
+    """GET target_url through ScraperAPI so the request leaves a non-AWS IP
+    (Letterboxd's Cloudflare blocks the Lambda's own AWS IP). ultra=True turns
+    on the anti-bot/Cloudflare bypass, which costs more credits."""
+    params = {"api_key": SCRAPER_API_KEY, "url": target_url}
+    if ultra:
+        params["ultra_premium"] = "true"
+    api_url = "https://api.scraperapi.com/?" + urllib.parse.urlencode(params)
+    with urllib.request.urlopen(api_url, timeout=timeout) as r:
+        return r.read().decode("utf-8", "replace")
+
+
 def _letterboxd_rating(tmdb_id):
-    """Letterboxd average rating (0–5) for a film by TMDB id. Resolves the
-    canonical page via the /tmdb/<id> redirect and reads the rating meta tag.
-    Sets a browser UA so Lambda isn't 403'd. Returns float or None."""
-    req = urllib.request.Request(f"{_LB_BASE}/tmdb/{tmdb_id}", headers={
-        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                       "AppleWebKit/537.36 (KHTML, like Gecko) "
-                       "Chrome/124.0.0.0 Safari/537.36"),
-        "Accept": "text/html",
-    })
-    try:
-        with urllib.request.urlopen(req, timeout=8) as r:
-            html = r.read().decode("utf-8", "replace")
-    except Exception as e:
-        log.warning("letterboxd rating fetch failed for tmdb %s: %s", tmdb_id, e)
-        return None
-    m = re.search(r'twitter:data2"[^>]*content="([\d.]+) out of 5"', html)
-    if not m:
-        log.warning("letterboxd: no rating meta for tmdb %s", tmdb_id)
-        return None
-    return round(float(m.group(1)), 2)
+    """Letterboxd average rating (0–5) for a film by TMDB id, fetched through
+    ScraperAPI (the Lambda's AWS IP is Cloudflare-blocked by Letterboxd).
+    Resolves the /tmdb/<id> redirect to the film page and reads the rating
+    meta tag. Tries a cheap plain request first; if Cloudflare blocks it (no
+    meta in the HTML), retries once with the anti-bot bypass. Returns float
+    or None."""
+    target = f"{_LB_BASE}/tmdb/{tmdb_id}"
+    for ultra in (False, True):
+        try:
+            html = _scraperapi_get(target, ultra=ultra, timeout=70 if ultra else 35)
+        except Exception as e:
+            log.warning("letterboxd via scraperapi failed for tmdb %s (ultra=%s): %s",
+                        tmdb_id, ultra, e)
+            continue
+        m = re.search(r'twitter:data2"[^>]*content="([\d.]+) out of 5"', html)
+        if m:
+            return round(float(m.group(1)), 2)
+        log.info("letterboxd: no rating meta for tmdb %s (ultra=%s)%s",
+                 tmdb_id, ultra, "" if ultra else " — retrying with bypass")
+    log.warning("letterboxd: giving up on tmdb %s after bypass", tmdb_id)
+    return None
 
 
 def _runtime_to_min(s):
