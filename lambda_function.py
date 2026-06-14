@@ -457,6 +457,23 @@ def _slugify(s):
     return s or "film"
 
 
+def _extract_title(text):
+    """Pull a film title out of a messy add-loop reply: prefer a quoted title,
+    else strip a leading @mention and command lead-ins. Returns a clean title, or
+    None for emoji/reaction-only or empty input."""
+    t = (text or "").strip()
+    q = re.search(r'["“]([^"”]{2,})["”]', t)          # prefer an explicitly quoted title
+    if q:
+        return q.group(1).strip()
+    t = re.sub(r'@\w+', '', t)                         # drop @mentions
+    t = re.sub(r'^\s*(?:please\s+)?'
+               r'(?:add(?:\s+to)?(?:\s+my)?(?:\s+library)?'
+               r'|i\s+want\s+to\s+see|let\'?s\s+watch|look\s*up|find|watch)\s+',
+               '', t, flags=re.I)
+    t = t.strip(' \t\n"“”\'')
+    return t if re.search(r'\w', t) else None
+
+
 def _http_get(url, timeout=12):
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -1241,6 +1258,54 @@ def _film_card(item):
     return " · ".join(bits)
 
 
+def _film_logline(item):
+    """One short, plain 'what it's about' line, grounded in the known synopsis.
+    No poetry, no opinion, no spoilers. For wildcard + winner cards."""
+    if not AI_ENABLED or not item:  return ""
+    title = item.get("title") or ""
+    if not title:  return ""
+    syn = (item.get("description") or "").strip()
+    ystr = f" ({item['year']})" if item.get("year") else ""
+    resp = _bedrock.converse(
+        modelId=BEDROCK_MODEL_ID,
+        system=[{"text": (
+            "Write ONE short, plain-language sentence (max ~20 words) saying what a film "
+            "is ABOUT — enough to decide whether to watch. E.g. 'A farm boy is swept into a "
+            "galactic rebellion to rescue a princess.' No poetry, no opinion, no spoilers, "
+            "no title prefix, no 'why it matters' — just the premise. Plain text, one line.")}],
+        messages=[{"role": "user", "content": [{"text":
+            f'Film: "{title}"{ystr}.' + (f' Synopsis to compress: {syn}' if syn else '')
+            + ' Write the logline.'}]}],
+        inferenceConfig={"maxTokens": 80, "temperature": 0.4})
+    return "".join(b.get("text","") for b in resp["output"]["message"]["content"]).strip()
+
+
+def _film_decider(item):
+    """Veto round: a plain logline + one factual context note, NO poetry. One call,
+    two lines back. Context fact is guarded against confabulation."""
+    if not AI_ENABLED or not item:  return ""
+    title = item.get("title") or ""
+    if not title:  return ""
+    syn = (item.get("description") or "").strip()
+    ystr = f" ({item['year']})" if item.get("year") else ""
+    resp = _bedrock.converse(
+        modelId=BEDROCK_MODEL_ID,
+        system=[{"text": (
+            "Help a group decide whether to veto a film. Output EXACTLY two short plain-text "
+            "lines, no labels, no poetry, no opinion:\n"
+            "Line 1 — what it's ABOUT: one ~20-word premise, no spoilers, no title prefix.\n"
+            "Line 2 — one factual context note, e.g. 'The debut feature of director X.' / "
+            "'Won the Academy Award for Film Editing.' / 'Features Ukrainian-born actor Y.' "
+            "State ONLY what you are confident is TRUE. If unsure of a specific award or "
+            "credit, give a safe general note (director, country, or era) instead of "
+            "inventing one. Never guess specifics.")}],
+        messages=[{"role": "user", "content": [{"text":
+            f'Film: "{title}"{ystr}.' + (f' Synopsis: {syn}' if syn else '')
+            + ' Write the two lines.'}]}],
+        inferenceConfig={"maxTokens": 120, "temperature": 0.3})
+    return "".join(b.get("text","") for b in resp["output"]["message"]["content"]).strip()
+
+
 def _film_blurb(item):
     """One short, spoiler-free, in-voice line about a film for a candidate card.
     LLM writes the prose; it picks nothing. Empty string when AI is off or it fails,
@@ -1694,7 +1759,10 @@ def _handle_short_pool_add(mode, chat_id, game, uid, text):
     sel = game["selection"].get(str(uid))
     if not sel:
         return
-    title = text.strip()
+    title = _extract_title(text)
+    if not title:
+        send_message(mode, chat_id, "That doesn't look like a film title — just type the title (e.g. The Hand of God), or tap Play with these.")
+        return
     info = lookup_film_cached(title)
     if not info.get("found"):
         send_message(mode, chat_id, f"Couldn't find “{title}” — try another title, "
@@ -2124,6 +2192,9 @@ def _post_wildcard_pitch(mode, chat_id, item, sugg):
     else:                                           # canonical last resort — no taste claim
         parts.append("Before we start, may I suggest one?")
     card_block = f"\U0001f3a9 {_film_card(item)}"
+    logline = _film_logline(item)
+    if logline:
+        card_block += f"\n{logline}"
     if blurb:
         card_block += f"\n{blurb}"
     parts.append(card_block)
@@ -2285,9 +2356,9 @@ def _present_candidate(mode, chat_id, game):
     pool.remove(cand)
     item = get_film(chat_id, int(cand["owner"]), cand["slug"])
     card = _film_card(item) if item else cand["title"]
-    blurb = _film_blurb(item) if item else ""
-    if blurb:
-        card += f"\n\n{blurb}"
+    decider = _film_decider(item) if item else ""
+    if decider:
+        card += f"\n\n{decider}"
     send_message(mode, chat_id, f"🎲 Candidate:\n\n{card}")
     # Can this pick even be vetoed? Only a NON-owner with a veto left can. If nobody
     # qualifies, it wins now (spec: vetoes run out -> the next pick is the winner;
@@ -2661,6 +2732,9 @@ def _declare_winner(mode, chat_id, game, film):
     note = winner_note(title, year)
     card = _film_card(item) if item else title
     text = f"🏆 Tonight's winner:\n\n{card}"
+    logline = _film_logline(item) if item else ""
+    if logline:
+        text += f"\n\n{logline}"
     if note:
         text += f"\n\n{note}"
     disclaimer = _invalid_veto_note(game, cur, film)   # explain a "vetoed but won" poll
