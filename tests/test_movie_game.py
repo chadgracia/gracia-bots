@@ -693,16 +693,15 @@ def test_wildcard_novelty_excludes_a_players_library():
     assert sugg["slug"] == L._slugify("Yi Yi")          # next canonical instead
 
 
-def test_wildcard_accept_via_backstop_joins_pool():
+def test_wildcard_dropped_when_ignored_via_backstop():
     g = _two_player_to_wildcard()
     wc_slug = g["wildcard"]["slug"]
-    NOW[0] += L._WILDCARD_WINDOW + 1                    # the consent beat lapses
-    L.handle_movie(MODE, message(2, "so what's the pick"))   # any update fires backstop
+    NOW[0] += L._WILDCARD_WINDOW + 1
+    L.handle_movie(MODE, message(2, "so what's the pick"))   # ignored past the beat
     g = L.get_game(CHAT)
     assert g is not None and g["phase"] == "VETO"
     slugs = {e["slug"] for e in g["pool_all"]}
-    assert wc_slug in slugs and {"film-a", "film-b"} <= slugs   # wildcard joined the hat
-    assert any(e["owner"] == "0" for e in g["pool_all"])
+    assert wc_slug not in slugs and {"film-a", "film-b"} <= slugs   # dropped, not foisted
 
 
 def test_wildcard_declined_via_text_drops_silently():
@@ -723,6 +722,26 @@ def test_wildcard_declined_via_thumbsdown_reaction():
     g = L.get_game(CHAT)
     assert g["phase"] == "VETO" and g["wildcard"] is None
     assert wc_slug not in {e["slug"] for e in g["pool_all"]}
+
+
+def test_wildcard_accepted_via_text_joins_pool():
+    g = _two_player_to_wildcard()
+    wc_slug = g["wildcard"]["slug"]
+    L.handle_movie(MODE, message(2, "yes add it"))     # consent from anyone, in chat
+    g = L.get_game(CHAT)
+    assert g is not None and g["phase"] == "VETO"
+    slugs = {e["slug"] for e in g["pool_all"]}
+    assert wc_slug in slugs and {"film-a", "film-b"} <= slugs   # joined the hat
+    assert any(e["owner"] == "0" for e in g["pool_all"])        # ownerless house item
+
+
+def test_wildcard_accepted_via_thumbsup_reaction():
+    g = _two_player_to_wildcard()
+    wc_slug, msg_id = g["wildcard"]["slug"], g["wildcard_msg_id"]
+    L.handle_movie(MODE, reaction(2, msg_id, "👍"))    # 👍 from anyone on the pitch adds it
+    g = L.get_game(CHAT)
+    assert g is not None and g["phase"] == "VETO"
+    assert wc_slug in {e["slug"] for e in g["pool_all"]}
 
 
 def test_wildcard_offered_in_solo_game():

@@ -2306,10 +2306,11 @@ def _wildcard_decline(mode, chat_id, game):
 
 
 def _wildcard_backstop(mode, chat_id, game):
-    """No scheduler: if the consent beat lapses with no dissent, accept it."""
+    """No countdown: a suggestion nobody acted on is quietly DROPPED so the game can't
+    hang — we never foist an unendorsed pick into the hat."""
     if game and game.get("phase") == "WILDCARD" and game.get("wildcard_open"):
         if _now_epoch() >= (game.get("wildcard_deadline") or 0):
-            _wildcard_accept(mode, chat_id, game)
+            _wildcard_decline(mode, chat_id, game)
             return True
     return False
 
@@ -2320,6 +2321,14 @@ def _wildcard_dissent(text):
     words = set(re.findall(r"[a-z']+", (text or "").lower()))
     return bool(words & {"no", "nope", "nah", "pass", "skip", "veto", "drop",
                          "dont", "don't", "nay"})
+
+
+def _wildcard_consent(text):
+    if "👍" in (text or ""):
+        return True
+    words = set(re.findall(r"[a-z']+", (text or "").lower()))
+    return bool(words & {"yes", "yeah", "yep", "yup", "sure", "ok", "okay",
+                         "add", "include", "keep", "do", "please"})
 
 
 def _begin_veto(mode, chat_id, game):
@@ -3331,10 +3340,10 @@ def on_message(mode, ev):
     # Wildcard consent window: only a participant's 👎/"pass" (drop) or a clear
     # yes (add now) acts; everything else just waits for the beat to lapse.
     if game and game.get("phase") == "WILDCARD" and game.get("wildcard_open"):
-        if uid is not None and int(uid) in [int(p) for p in game["players"]] and text:
+        if text:                                   # anyone in the chat can decide it
             if _wildcard_dissent(text):
                 _wildcard_decline(mode, chat_id, game)
-            elif _is_affirmative(text):
+            elif _wildcard_consent(text):
                 _wildcard_accept(mode, chat_id, game)
         return
     # Empty-pool relax reply (within the window).
@@ -3421,14 +3430,16 @@ def _on_reaction(mode, ev):
     game = get_game(chat_id)
     if _wildcard_backstop(mode, chat_id, game):
         return
-    # A 👎 from a participant on the wildcard pitch drops it (silent), proceed to pick.
+    # A reaction on the wildcard pitch decides it: 👎 drops, 👍 adds — from anyone.
     if (game and game.get("phase") == "WILDCARD" and game.get("wildcard_open")
-            and ev.get("message_id") == game.get("wildcard_msg_id")
-            and ev.get("user_id") is not None
-            and int(ev["user_id"]) in [int(p) for p in game["players"]]
-            and any("👎" in (e or "") for e in (ev.get("reactions") or []))):
-        _wildcard_decline(mode, chat_id, game)
-        return
+            and ev.get("message_id") == game.get("wildcard_msg_id")):
+        reacts = "".join(e or "" for e in (ev.get("reactions") or []))
+        if "👎" in reacts:                          # 👎 from anyone drops it
+            _wildcard_decline(mode, chat_id, game)
+            return
+        if "👍" in reacts:                          # 👍 from anyone adds it
+            _wildcard_accept(mode, chat_id, game)
+            return
     # Selection is reply-driven now; reactions otherwise only nudge the veto backstop.
     _veto_backstop(mode, chat_id, game)
 
