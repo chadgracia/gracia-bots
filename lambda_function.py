@@ -1406,13 +1406,17 @@ def _film_blurb(item):
             modelId=BEDROCK_MODEL_ID,
             system=[{"text": (
                 "You are SirWatchAlot offering tonight's candidate to a friends' film-night "
-                "group. Write ONE short, spoiler-free sentence that reaches for feeling and "
-                "a single concrete image — where the light falls, a face, a gesture, the "
-                "texture of the place — not plot and not why it's Important. Gentle, "
-                "unhurried, a little awed. Plain text only, NO markdown or asterisks (your "
-                "Telegram leaks them); emoji are fine. No title/year/rating restatement; "
-                "just the hook. Never sign or quote a critic — the words are your own. "
-                "One sentence."
+                "group. Write ONE short, spoiler-free sentence that points at ONE specific, "
+                "TRUE thing about THIS film — a particular scene, a real craft choice (how "
+                "it's shot, a performance, the sound), or a concrete detail — so the sentence "
+                "could only describe this film, not any quiet arthouse picture. Prefer "
+                "concrete over atmospheric; avoid 'as if', 'somehow', 'a secret', 'stays with "
+                "you' and similar soft flourishes — warm and plain, not purple. State only "
+                "what you are confident is true; if unsure of a specific, fall back to a "
+                "concrete image you can stand behind rather than inventing one. Plain text "
+                "only, NO markdown or asterisks (your Telegram leaks them); emoji are fine. "
+                "No title/year/rating restatement. Never sign or quote a critic — the words "
+                "are your own. One sentence."
             )}],
             messages=[{"role": "user", "content": [
                 {"text": f'The film is "{title}"{ystr}. Write the one-sentence hook.'}]}],
@@ -2340,9 +2344,9 @@ def _post_wildcard_pitch(mode, chat_id, item, sugg):
     card_block = f"\U0001f3a9 {_film_card(item)}"
     logline = _film_logline(item)
     if logline:
-        card_block += f"\n{logline}"
+        card_block += f"\n\n{logline}"
     if blurb:
-        card_block += f"\n{blurb}"
+        card_block += f"\n\n{blurb}"
     parts.append(card_block)
     parts.append("Should we add it to the mix, or keep only human picks in the hat "
                  "tonight? (👎 or 'pass' to keep it human-only.)")
@@ -2956,14 +2960,17 @@ def winner_note(title, year):
             modelId=BEDROCK_MODEL_ID,
             system=[{"text": (
                 "You are SirWatchAlot announcing tonight's winning film to a friends' "
-                "film-night group. Write 1-2 short, SPOILER-FREE sentences that reach for "
-                "FEELING and one concrete image — a face, the light, a gesture, the texture "
-                "of the place — not plot summary and not why it's Important. Gentle, "
-                "unhurried, a little awed; brief, no essay. Don't restate the year, runtime "
-                "or rating (already shown). Plain text only — NO markdown or asterisks "
-                "(your Telegram leaks them as literal characters); emoji are fine. Never "
-                "reveal plot, twists or the ending. Never sign a critic's name or quote "
-                "anyone — the words are your own."
+                "film-night group. Write 1-2 short, SPOILER-FREE sentences naming ONE "
+                "specific, TRUE thing about THIS film — a particular scene, a real craft "
+                "choice (how it's shot, a performance, the score), or a concrete detail — so "
+                "it could only be describing this film and no other. Prefer concrete over "
+                "atmospheric; avoid 'as if', 'somehow', 'a secret', 'stays with you' and "
+                "similar soft flourishes — warm and plain, not purple, brief, no essay. State "
+                "only what you are confident is true; if unsure, stay with a concrete image "
+                "you can stand behind rather than inventing a fact. Don't restate the year, "
+                "runtime or rating (already shown). Plain text only — NO markdown or asterisks "
+                "(your Telegram leaks them); emoji are fine. Never reveal plot, twists or the "
+                "ending. Never sign a critic's name or quote anyone — the words are your own."
             )}],
             messages=[{"role": "user", "content": [
                 {"text": f'The film is "{title}"{ystr}. Write the note.'}]}],
