@@ -1049,6 +1049,21 @@ def test_short_pool_add_nonqualifying_persists_and_flags():
     assert any("horror" in t.lower() and "can't play" in t.lower() for t, _ in SENT)
 
 
+def test_short_pool_add_multiple_films_in_one_message():
+    _short_pool_setup(["horror", "horror"])               # 0 qualify -> add-loop, empty slate
+    L.handle_movie(MODE, cb(1, "sp_add"))
+    orig = L._identify_films
+    L._identify_films = lambda text, miny=None, maxy=None: [("Drama One", 1980), ("Drama Two", 1981)]
+    try:
+        L.handle_movie(MODE, message(1, "Drama One and Drama Two"))   # two films, one message
+    finally:
+        L._identify_films = orig
+    sel = L.get_game(CHAT)["selection"]["1"]
+    titles = {s["title"] for s in sel["slots"]}
+    assert {"Drama One", "Drama Two"} <= titles            # both resolved + added at once
+    assert any("those fit" in t.lower() for t, _ in SENT)  # grouped acknowledgement
+
+
 def test_short_pool_zero_eligible_can_sit_out():
     g = _short_pool_setup(["horror", "horror"])           # nothing qualifies
     sel = g["selection"]["1"]

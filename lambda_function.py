@@ -507,6 +507,45 @@ def _identify_film(text, min_year=None, max_year=None):
         return text, None
 
 
+def _identify_films(text, min_year=None, max_year=None):
+    """Like _identify_film but for a message that may name SEVERAL films
+    ('What's Up Doc, Pink Panther, Dr Strangelove' -> three). The model decides,
+    so a title that legitimately contains a comma ('Paris, Texas') stays one
+    film. Returns a list of (title, year|None); [(text, None)] when AI is off."""
+    if not AI_ENABLED:
+        return [(text, None)]
+    window = ""
+    if min_year or max_year:
+        window = (f" Each film must be one released between "
+                  f"{min_year or 'any'} and {max_year or 'any'}.")
+    resp = _bedrock.converse(
+        modelId=BEDROCK_MODEL_ID,
+        system=[{"text": (
+            "You extract the film(s) a user named in a short message. It may name one "
+            "film or several, separated by commas, 'and', or newlines — but a single "
+            "title can itself contain a comma (e.g. 'Paris, Texas' is ONE film). Use "
+            "judgment." + window +
+            " Reply with ONLY a JSON array; each item {\"title\": \"<canonical title>\", "
+            "\"year\": <4-digit year or null>}. Use [] if you can name none. No other text.")}],
+        messages=[{"role": "user", "content": [{"text": text}]}],
+        inferenceConfig={"maxTokens": 200, "temperature": 0})
+    raw = "".join(b.get("text", "") for b in resp["output"]["message"]["content"]).strip()
+    try:
+        data = json.loads(raw)
+        out = [(d.get("title"), d.get("year")) for d in data if d.get("title")]
+        return out or [(text, None)]
+    except (ValueError, TypeError):
+        return [(text, None)]
+
+
+def _join_titles(names):
+    """['A'] -> “A”; ['A','B'] -> “A” and “B”; ['A','B','C'] -> “A”, “B” and “C”."""
+    q = [f"“{n}”" for n in names]
+    if len(q) <= 1:
+        return q[0] if q else ""
+    return ", ".join(q[:-1]) + " and " + q[-1]
+
+
 def _http_get(url, timeout=12):
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -1843,8 +1882,10 @@ def _handle_short_pool_callback(mode, chat_id, game, uid, data):
 
 
 def _handle_short_pool_add(mode, chat_id, game, uid, text):
-    """A title typed during the add loop: resolve, add to the LIBRARY for real,
-    then gate tonight's eligibility on the filter (deterministic) and explain."""
+    """Title(s) typed during the add loop: resolve each, add to the LIBRARY for
+    real, then gate tonight's eligibility on the filter (deterministic) and
+    explain. One message may name several films ('A, B and C'); the resolver
+    decides whether a comma joins titles or sits inside one ('Paris, Texas')."""
     sel = game["selection"].get(str(uid))
     if not sel:
         return
@@ -1853,38 +1894,50 @@ def _handle_short_pool_add(mode, chat_id, game, uid, text):
         send_message(mode, chat_id, "That doesn't look like a film title — just type the title (e.g. The Hand of God), or tap Play with these.")
         return
     f = game.get("filter") or {}
-    ident, iyear = _identify_film(title, f.get("min_year"), f.get("max_year"))
-    info = lookup_film_cached(ident or title, iyear)
-    if not info.get("found") and ident and ident != title:
-        info = lookup_film_cached(title)          # last resort: the literal text
-    if not info.get("found"):
-        send_message(mode, chat_id, f"Couldn't find “{title}” — try another title, "
-                                    "or tap Play with these.")
+    who = mention_for(chat_id, uid)
+    fits, nofit, missing = [], [], []
+    locked_now = False
+    for ident, iyear in _identify_films(title, f.get("min_year"), f.get("max_year")):
+        info = lookup_film_cached(ident or title, iyear)
+        if not info.get("found") and ident and ident != title:
+            info = lookup_film_cached(title)          # last resort: the literal text
+        if not info.get("found"):
+            missing.append(ident or title)
+            continue
+        slug = info.get("slug") or _slugify(info.get("title") or ident or title)
+        item, _ = add_to_library(chat_id, uid, info["title"], info.get("year"))   # real entry
+        name = item["title"]
+        reason = _filter_reason(item, game["filter"])
+        if reason is None:
+            if not any(s["slug"] == slug for s in sel["slots"]):
+                sel["slots"].append({"slug": slug, "title": name})
+            if slug not in sel["shown"]:
+                sel["shown"].append(slug)
+            fits.append(name)
+            if len(sel["slots"]) >= 3:
+                locked_now = True
+                break
+        else:
+            nofit.append((name, reason))
+    parts = []
+    if fits:
+        parts.append(f"Added {_join_titles(fits)} — "
+                     f"{'that fits' if len(fits) == 1 else 'those fit'} ✅.")
+    for name, reason in nofit:
+        parts.append(f"“{name}” is in your library, but {reason} — it can't play tonight.")
+    if missing:
+        parts.append(f"Couldn't find {_join_titles(missing)}.")
+    summary = " ".join(parts) or ("That doesn't look like a film title — try another, "
+                                  "or tap Play with these.")
+    if locked_now:
+        sel["locked"] = True
+        sel["awaiting_add"] = False
+        put_game(game)
+        send_message(mode, chat_id, f"{summary} {who}'s three are set!")
+        _advance_player(mode, chat_id, game)
         return
-    slug = info.get("slug") or _slugify(info.get("title") or title)
-    existed = get_film(chat_id, uid, slug) is not None
-    item, _ = add_to_library(chat_id, uid, info["title"], info.get("year"))   # real entry
-    name, who = item["title"], mention_for(chat_id, uid)
-    reason = _filter_reason(item, game["filter"])
-    if reason is None:
-        if not any(s["slug"] == slug for s in sel["slots"]):
-            sel["slots"].append({"slug": slug, "title": name})
-        if slug not in sel["shown"]:
-            sel["shown"].append(slug)
-        verb = "already had" if existed else "added"
-        if len(sel["slots"]) >= 3:
-            sel["locked"] = True
-            sel["awaiting_add"] = False
-            put_game(game)
-            send_message(mode, chat_id, f"{verb} “{name}” — that fits ✅. {who}'s three are set!")
-            _advance_player(mode, chat_id, game)
-            return
-        send_message(mode, chat_id, f"{verb} “{name}” — that fits ✅.")
-        _post_short_pool(mode, chat_id, game, uid)
-    else:
-        send_message(mode, chat_id, f"Added “{name}” to your library, but {reason} — "
-                                    "it can't play tonight.")
-        _post_short_pool(mode, chat_id, game, uid)
+    send_message(mode, chat_id, summary)
+    _post_short_pool(mode, chat_id, game, uid)
 
 
 def _ask_player(mode, chat_id, game):
