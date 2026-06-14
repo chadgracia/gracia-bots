@@ -147,6 +147,15 @@ def _pk(mode, chat_id):
     return f"{mode}#{chat_id}"
 
 
+def _chat_id_from_pk(pk):
+    """Inverse of _pk for the tick sweep, which reads game items by scan and needs the
+    chat id back out of the partition key (e.g. 'movie#-100123' -> -100123)."""
+    try:
+        return int(str(pk).split("#", 1)[1])
+    except (IndexError, ValueError):
+        return None
+
+
 def remember_chat(mode, chat_id, title=None):
     item = {
         "PK": _pk(mode, chat_id),
@@ -1122,12 +1131,10 @@ def new_game(chat_id, initiator_id):
         "selection": {},   # {uid: {slots:[{slug,title,state}], shown:[slug], locked}}
         "cards": {},       # {message_id: {uid, slot}}
         "filter": _empty_filter(),   # Phase 1.5 constraints (AND across people)
-        "constraints_open": False,
-        "constraints_deadline": None,
-        "constraints_poll_id": None,         # the open_period poll that times the window
-        "constraints_poll_message_id": None,
-        # per-player selection turn timer (same open_period poll mechanism)
-        "turn_deadline": None, "turn_poll_id": None, "turn_poll_msg_id": None,
+        # Phase 1.5 constraint window + per-player turn: deadlines only (no poll); the
+        # tick sweep / lazy backstop advance whatever the game is waiting on.
+        "constraints_open": False, "constraints_deadline": None,
+        "turn_deadline": None,
         "awaiting_relax": False,
         "relax_deadline": None,
         "pool_all": [],    # full locked pool (kept for relax re-filtering)
@@ -1317,13 +1324,11 @@ def on_callback(mode, ev):
 
 # ---- constraints (Phase 1.5, optional) ------------------------------------ #
 # After the roster settles we open a fixed 60s window and collect constraints from
-# anyone (free text, merged with AND — never overwritten). The window is timed by a
-# Telegram poll's open_period (the SAME server-side timer the veto round uses): when
-# Telegram auto-closes the poll it pushes a `poll` update that wakes the Lambda
-# (on_poll -> _close_constraints), so the window closes even if the chat goes silent —
-# no scheduler needed, and the client renders a live countdown for free. The poll's
-# votes are ignored: there is NO early close, so the full minute always runs and
-# everyone gets a turn. The lazy backstop is just a faster close when the chat is busy.
+# anyone (free text, merged with AND — never overwritten). The window is just a chat
+# message + a deadline: the rate(1 min) tick sweep (run_tick) locks it on the clock even
+# if the chat goes silent, and any incoming message past the deadline closes it sooner
+# (the lazy backstop). There is NO early close and NO timer poll — the full minute runs
+# so everyone gets a turn, and players just type constraints in chat.
 _CONSTRAINTS_PARSE_SYSTEM = (
     "Parse ONE chat message into movie-night filter constraints. Output ONLY a JSON "
     "object, including just the keys actually mentioned, from: exclude_genres (list of "
@@ -1343,20 +1348,11 @@ def _begin_constraints(mode, chat_id, game):
     game["filter"] = _empty_filter()
     game["constraints_open"] = True
     game["constraints_deadline"] = _now_epoch() + _CONSTRAINTS_WINDOW
-    # The poll carries the timer (open_period) and shows a native countdown; its votes
-    # are ignored. People type their actual constraints in chat — anyone, any number.
-    resp = send_poll(mode, chat_id,
-                     "🎛 Any constraints tonight? Type them in chat — length, genre, "
-                     "year. Locks when this timer runs out.",
-                     ["I'll add some 💬", "No constraints from me"],
-                     is_anonymous=True, open_period=_CONSTRAINTS_WINDOW)
-    result = resp.get("result") or {}
-    poll_id = (result.get("poll") or {}).get("id")
-    game["constraints_poll_id"] = poll_id
-    game["constraints_poll_message_id"] = result.get("message_id")
     put_game(game)
-    if poll_id:
-        put_poll_map(poll_id, chat_id, None)   # so the close update resolves chat_id
+    # No poll — just chat. The tick sweep / lazy backstop lock it on the deadline.
+    send_message(mode, chat_id,
+                 "🎛 Any constraints tonight? Length, genre, or year range — anyone can "
+                 "chime in. Auto-locks in ~1 min if no reply.")
 
 
 def parse_constraint_text(text):
@@ -1434,11 +1430,8 @@ def _handle_constraints_message(mode, chat_id, game, text):
 
 def _close_constraints(mode, chat_id, game, announce):
     if not game.get("constraints_open"):
-        return                            # already closed (poll-close + backstop can race)
+        return                            # already closed (tick + lazy backstop can race)
     game["constraints_open"] = False
-    pid = game.get("constraints_poll_id")
-    if pid:
-        del_poll_map(pid)                 # the timer poll has served its purpose
     if announce:
         if _filter_active(game["filter"]):
             send_message(mode, chat_id, f"🎛 Constraints locked: {_describe_filter(game['filter'])}.")
@@ -1448,10 +1441,9 @@ def _close_constraints(mode, chat_id, game, announce):
 
 
 def _constraints_backstop(mode, chat_id, game):
-    """Belt-and-suspenders for an ACTIVE chat: any update past the deadline closes the
-    window immediately. The guaranteed close on silence is the poll's open_period timer
-    (Telegram pushes a `poll` close update -> on_poll); this is just faster when there's
-    traffic, and covers the gap before that update lands."""
+    """Close the constraint window once past its deadline. Called both by the tick sweep
+    (fires on the clock even in a silent chat) and lazily on any incoming message (faster
+    when the chat is active). Returns True if it closed the window."""
     if game and game.get("phase") == "CONSTRAINTS" and game.get("constraints_open"):
         if _now_epoch() >= (game.get("constraints_deadline") or 0):
             _close_constraints(mode, chat_id, game, announce=True)
@@ -1617,7 +1609,7 @@ def _post_short_pool(mode, chat_id, game, uid):
                 "Add one that fits, or sit this round out (you keep your veto).")
     resp = send_message(mode, chat_id, text, reply_markup=_short_pool_keyboard(n))
     game["sel_msg_id"] = (resp.get("result") or {}).get("message_id")
-    _arm_turn_timer(mode, chat_id, game, uid)
+    _set_turn_deadline(game)
     put_game(game)
 
 
@@ -1640,7 +1632,7 @@ def _post_swap_deadend(mode, chat_id, game, uid):
                 "(you keep your veto).")
     resp = send_message(mode, chat_id, text, reply_markup=_swap_deadend_keyboard(n))
     game["sel_msg_id"] = (resp.get("result") or {}).get("message_id")
-    _arm_turn_timer(mode, chat_id, game, uid)
+    _set_turn_deadline(game)
     put_game(game)
 
 
@@ -1663,7 +1655,7 @@ def _handle_short_pool_callback(mode, chat_id, game, uid, data):
         sel["awaiting_add"] = True
         desc = _describe_filter(game["filter"]) or "tonight's filter"
         send_message(mode, chat_id, f"{who}, send a film title that fits {desc}.")
-        _arm_turn_timer(mode, chat_id, game, uid)   # still their turn while they type
+        _set_turn_deadline(game)   # still their turn while they type
         put_game(game)
 
 
@@ -1735,20 +1727,26 @@ def _ask_player(mode, chat_id, game):
     put_game(game)
 
 
-def _post_player_slate(mode, chat_id, game, uid):
+def _post_player_slate(mode, chat_id, game, uid, swapped_titles=None):
     sel = game["selection"][str(uid)]
     n = len(sel["slots"])
     lines = []
     for i, slot in enumerate(sel["slots"], 1):
         item = get_film(chat_id, uid, slot["slug"])
         lines.append(f"{i}. {_film_card(item) if item else slot['title']}")
-    text = (f"🎬 {mention_for(chat_id, uid)} — I picked these {n} from your library. "
-            "Are these what you want to share with the group tonight, or should we swap "
-            "some?\n\n" + "\n\n".join(lines) +
-            f"\n\nReply with {n} emoji in order — 👍 keep / 👎 swap (e.g. {'👍' * n}).")
+    if swapped_titles:        # re-display after a swap — don't repeat "I picked these…"
+        head = (f"🔀 Swapped in {', '.join(swapped_titles)} — "
+                f"{mention_for(chat_id, uid)}'s slate now:")
+    else:
+        head = (f"🎬 {mention_for(chat_id, uid)} — I picked these {n} from your library. "
+                "Are these what you want to share with the group tonight, or should we "
+                "swap some?")
+    text = (head + "\n\n" + "\n\n".join(lines) +
+            f"\n\nReply with {n} emoji in order — 👍 keep / 👎 swap (e.g. {'👍' * n}). "
+            "Auto-skips in ~1 min if no reply.")
     resp = send_message(mode, chat_id, text)
     game["sel_msg_id"] = (resp.get("result") or {}).get("message_id")
-    _arm_turn_timer(mode, chat_id, game, uid)   # 60s clock; caller persists the game
+    _set_turn_deadline(game)   # 60s clock; caller persists the game
 
 
 def _advance_player(mode, chat_id, game):
@@ -1757,55 +1755,42 @@ def _advance_player(mode, chat_id, game):
     _ask_player(mode, chat_id, game)
 
 
-def _arm_turn_timer(mode, chat_id, game, uid):
-    """(Re)start the 60s clock on the current player's selection turn. Timed by a
-    Telegram poll's open_period — the same reliable, clock-driven close as the
-    constraint window — so a silent player is skipped ON THE CLOCK, not only on their
-    own input. Replaces any prior turn poll (its later close is harmless: the poll_id
-    won't match the new turn_poll_id). The player still replies 👍/👎 in chat; the poll
-    is purely the timer (votes ignored, like the constraints poll)."""
-    old = game.get("turn_poll_id")
-    if old:
-        del_poll_map(old)
-        try:
-            stop_poll(mode, chat_id, game.get("turn_poll_msg_id"))
-        except Exception:
-            pass
+def _set_turn_deadline(game):
+    """Start/refresh the per-player turn clock. No poll — the tick sweep and the lazy
+    backstop advance it on the deadline; the player just replies 👍/👎 in chat."""
     game["turn_deadline"] = _now_epoch() + _TURN_WINDOW
-    resp = send_poll(mode, chat_id,
-                     f"⏳ {mention_for(chat_id, uid)}'s turn — reply 👍 keep / 👎 swap in "
-                     "chat. Auto-skips when this runs out (your veto still counts).",
-                     ["I'm choosing", "⏳"], is_anonymous=True, open_period=_TURN_WINDOW)
-    result = resp.get("result") or {}
-    pid = (result.get("poll") or {}).get("id")
-    game["turn_poll_id"] = pid
-    game["turn_poll_msg_id"] = result.get("message_id")
-    if pid:
-        put_poll_map(pid, chat_id, None)   # so the close update resolves chat_id
-
-
-def _clear_turn_timer(game):
-    pid = game.get("turn_poll_id")
-    if pid:
-        del_poll_map(pid)
-    game["turn_poll_id"] = None
-    game["turn_poll_msg_id"] = None
 
 
 def _timeout_player_turn(mode, chat_id, game, uid):
-    """The turn clock ran out with no decision: sit this player out (no picks, but their
-    veto still counts) and advance. The next player's prompt re-arms the timer."""
+    """The turn clock ran out with no decision: auto-KEEP the films already dealt (veto
+    still counts) and move on. Fired by the tick sweep or the lazy backstop, never by the
+    awaited player's own input."""
     sel = game["selection"].get(str(uid)) or {}
-    sel["slots"] = []
     sel["locked"] = True
     sel["awaiting_add"] = False
     game["selection"][str(uid)] = sel
-    _clear_turn_timer(game)
     put_game(game)
-    send_message(mode, chat_id,
-                 f"⏳ {mention_for(chat_id, uid)} didn't pick in time — sitting this round "
-                 "out (veto still counts). Moving on.")
+    kept = len(sel.get("slots") or [])
+    who = mention_for(chat_id, uid)
+    msg = (f"⏳ {who} didn't reply — keeping their {kept} pick{'' if kept == 1 else 's'} "
+           "(veto still counts). Moving on." if kept else
+           f"⏳ {who} didn't reply — sitting this round out (veto still counts). Moving on.")
+    send_message(mode, chat_id, msg)
     _advance_player(mode, chat_id, game)
+
+
+def _turn_backstop(mode, chat_id, game):
+    """Advance a per-player selection turn past its deadline. Called by the tick sweep
+    (fires on the clock even in a silent chat) and lazily on any incoming message.
+    Returns True if it advanced the turn."""
+    if game and game.get("phase") == "SELECTING":
+        cur = _current_selecting_uid(game)
+        sel = game["selection"].get(str(cur)) if cur is not None else None
+        if (cur is not None and sel and not sel.get("locked")
+                and _now_epoch() >= (game.get("turn_deadline") or 0)):
+            _timeout_player_turn(mode, chat_id, game, cur)
+            return True
+    return False
 
 
 def _handle_selection_reply(mode, chat_id, game, uid, text):
@@ -1829,7 +1814,7 @@ def _handle_selection_reply(mode, chat_id, game, uid, text):
         send_message(mode, chat_id,
                      f"Send {n} marks in order — 👍 keep / 👎 swap (e.g. {'👍' * n}).")
         return
-    swapped = 0
+    swapped_titles = []
     for i, keep in enumerate(toks):
         if keep:
             continue
@@ -1839,16 +1824,16 @@ def _handle_selection_reply(mode, chat_id, game, uid, text):
         nf = repl[0]
         sel["slots"][i] = {"slug": nf["slug"], "title": nf["title"]}
         sel["shown"].append(nf["slug"])
-        swapped += 1
+        swapped_titles.append(nf["title"])
     put_game(game)
-    if swapped == 0:
+    if not swapped_titles:
         # Nothing in their library fits to swap in. Don't corner them into 👍-ing the
         # rejected film(s): drop those slots and let them lock what they approved (N),
         # or add a fitting film. Buttons are the way out — never a forced keep.
         sel["slots"] = [s for s, keep in zip(sel["slots"], toks) if keep]
         _post_swap_deadend(mode, chat_id, game, uid)
         return
-    _post_player_slate(mode, chat_id, game, uid)
+    _post_player_slate(mode, chat_id, game, uid, swapped_titles=swapped_titles)
     put_game(game)
 
 
@@ -2254,8 +2239,8 @@ def _relax_backstop(mode, chat_id, game):
 
 
 _VETO_WINDOW = 60         # seconds the veto poll stays open before the backstop fires
-_CONSTRAINTS_WINDOW = 60  # fixed constraint-collection window; the poll's open_period
-_TURN_WINDOW = 60         # per-player selection turn; same poll-open_period timer
+_CONSTRAINTS_WINDOW = 60  # constraint-collection window (deadline; tick / lazy backstop)
+_TURN_WINDOW = 60         # per-player selection turn (deadline; tick / lazy backstop)
 
 
 def _present_candidate(mode, chat_id, game):
@@ -2415,14 +2400,45 @@ def run_morning_after():
     return {"statusCode": 200, "body": f"morning-after: {total} posted"}
 
 
+def run_tick():
+    """rate(1 min) EventBridge sweep (payload {"task":"tick"}): advance any game past the
+    deadline of whatever it's waiting on — the constraint window or a per-player selection
+    turn (incl. the add-a-film sub-state). No-op fast when nothing is due. The same close
+    functions run lazily on incoming messages too."""
+    advanced = 0
+    for g in ddb_scan():
+        if g.get("SK") != "game#current":
+            continue
+        chat_id = _chat_id_from_pk(g.get("PK"))
+        if chat_id is None:
+            continue
+        try:
+            if _constraints_backstop("movie", chat_id, g) or _turn_backstop("movie", chat_id, g):
+                advanced += 1
+        except Exception as e:
+            log.exception("tick advance failed for %s: %s", g.get("PK"), e)
+    log.info("tick: advanced %d game(s)", advanced)
+    return {"statusCode": 200, "body": f"tick: {advanced} advanced"}
+
+
+_SCHEDULED_TASKS = ("morning_after", "tick")
+
+
+def _scheduled_task(event):
+    """The scheduled-job name for an EventBridge invocation, else None. Routes on the
+    top-level `task` marker set as the rule's constant input (e.g. {"task":"tick"} or
+    {"task":"morning_after"}); a bare scheduled-event shape with no task defaults to the
+    daily morning-after poll. A Telegram webhook (which carries an HTTP path) -> None."""
+    task = event.get("task")
+    if task in _SCHEDULED_TASKS:
+        return task
+    if event.get("source") == "aws.events" or event.get("detail-type") == "Scheduled Event":
+        return "morning_after"
+    return None
+
+
 def _is_scheduled_event(event):
-    """A daily EventBridge invocation, recognised by our constant input task marker
-    or the native scheduled-event shape — never a Telegram webhook (those have a path).
-    The only scheduled job is the morning-after poll; the constraint window is timed by
-    its own Telegram poll (open_period), not a sweep."""
-    return (event.get("task") == "morning_after"
-            or event.get("source") == "aws.events"
-            or event.get("detail-type") == "Scheduled Event")
+    return _scheduled_task(event) is not None
 
 
 def _norm_title(s):
@@ -2568,21 +2584,8 @@ def on_poll(mode, ev):
     game = get_game(chat_id)
     if not game:
         return
-    # Constraint window: the poll's open_period IS the timer. When Telegram auto-closes
-    # it, lock the merged constraints and move on — votes are not consulted (no early
-    # close). Same server-side timer as the veto round below.
-    if game.get("phase") == "CONSTRAINTS" and ev.get("poll_id") == game.get("constraints_poll_id"):
-        _close_constraints(mode, chat_id, game, announce=True)
-        return
-    # Per-player selection turn: the turn poll's open_period ran out — skip the silent
-    # player (veto still counts) and advance. A stale prior turn poll won't match the
-    # current turn_poll_id, so its later close is ignored.
-    if game.get("phase") == "SELECTING" and ev.get("poll_id") == game.get("turn_poll_id"):
-        cur = _current_selecting_uid(game)
-        sel = game["selection"].get(str(cur)) if cur is not None else None
-        if cur is not None and sel and not sel.get("locked"):
-            _timeout_player_turn(mode, chat_id, game, cur)
-        return
+    # Only the veto round uses a real (votable) poll; the constraint window and the
+    # per-player turn are timed by the tick sweep / lazy backstop, not a poll.
     if game.get("phase") != "VETO":
         return
     cur = game.get("current")
@@ -3196,12 +3199,9 @@ def on_message(mode, ev):
                 _handle_selection_reply(mode, chat_id, game, int(cur), text)
             return
         # Anyone else (or a no-text update) past the turn deadline -> the clock's up,
-        # skip the silent player. (Faster than the poll for an active chat; the poll's
-        # open_period close covers a fully silent one.)
-        if cur is not None and _now_epoch() >= (game.get("turn_deadline") or 0):
-            sel = game["selection"].get(str(cur), {})
-            if sel and not sel.get("locked"):
-                _timeout_player_turn(mode, chat_id, game, cur)
+        # auto-keep the silent player's dealt films and move on. (The tick sweep does the
+        # same on the clock when the chat is fully silent.)
+        _turn_backstop(mode, chat_id, game)
         return
     if not text:
         return
@@ -3320,9 +3320,12 @@ def _load_body(event):
 
 
 def lambda_handler(event, context):
-    # Scheduled (EventBridge) invocation: no Telegram path/secret — run the daily
-    # morning-after poll and return before the webhook-only checks below.
-    if _is_scheduled_event(event):
+    # Scheduled (EventBridge) invocation: no Telegram path/secret — dispatch by the
+    # top-level `task` marker and return before the webhook-only checks below.
+    task = _scheduled_task(event)
+    if task == "tick":
+        return run_tick()
+    if task == "morning_after":
         log.info("scheduled invocation -> morning-after poll")
         return run_morning_after()
 

@@ -159,12 +159,11 @@ def cards_for(game, user_id):
 
 
 def _skip_constraints():
-    """Constraints now ALWAYS run the full ~60s — there is no early 'go'. The window is
-    timed by its poll's open_period; to reach SELECTING in tests, fast-forward and fire
-    the poll-close update Telegram would send (the real close path, even on silence)."""
-    g = L.get_game(CHAT)
+    """Constraints run the full ~60s (no early 'go') and are closed by the tick sweep.
+    To reach SELECTING in tests, fast-forward past the deadline and fire a tick — the
+    real clock-driven close path, even on total silence."""
     NOW[0] += L._CONSTRAINTS_WINDOW + 1
-    L.handle_movie(MODE, poll_closed(g["constraints_poll_id"]))
+    L.run_tick()
 
 
 # ---- tests ---------------------------------------------------------------- #
@@ -556,20 +555,22 @@ def _two_player_to_selection():
     return g
 
 
-def test_turn_arms_a_timer_poll():
+def test_turn_sets_a_deadline_not_a_poll():
     g = _two_player_to_selection()
-    assert g["turn_poll_id"] and g["turn_deadline"]            # 60s clock is running
+    assert g["turn_deadline"] and not g.get("turn_poll_id")    # clock, no fake poll
+    assert not any("i'm choosing" in (t or "").lower() for t, _ in SENT)
 
 
-def test_turn_timer_skips_silent_player_on_poll_close():
+def test_turn_tick_keeps_dealt_films_for_silent_player():
     g = _two_player_to_selection()
-    tp = g["turn_poll_id"]
+    dealt = [s["slug"] for s in g["selection"]["1"]["slots"]]
     NOW[0] += L._TURN_WINDOW + 1
-    L.handle_movie(MODE, poll_closed(tp))                      # Telegram closes the poll
+    L.run_tick()                                              # clock-driven, no chat activity
     g = L.get_game(CHAT)
-    assert g["selection"]["1"]["locked"] and g["selection"]["1"]["slots"] == []  # sat out
-    assert L._current_selecting_uid(g) == 2                    # advanced, on the clock
-    assert any("didn't pick in time" in t.lower() for t, _ in SENT)
+    assert g["selection"]["1"]["locked"]                      # auto-kept, not stuck
+    assert [s["slug"] for s in g["selection"]["1"]["slots"]] == dealt   # films preserved
+    assert L._current_selecting_uid(g) == 2                   # advanced to next player
+    assert any("didn't reply" in t.lower() for t, _ in SENT)
 
 
 def test_turn_timer_backstop_fires_on_other_activity_past_deadline():
@@ -607,6 +608,40 @@ def test_new_game_works_mid_turn_from_any_player():
 
 def test_veto_window_is_sixty_seconds():
     assert L._VETO_WINDOW == 60
+
+
+def test_tick_task_routes_through_handler_and_is_noop_when_idle():
+    _reset()
+    assert L._scheduled_task({"task": "tick"}) == "tick"
+    assert L._scheduled_task({"task": "morning_after"}) == "morning_after"
+    assert L._scheduled_task({"source": "aws.events"}) == "morning_after"   # bare -> daily
+    assert L._scheduled_task({"rawPath": "/movie"}) is None                 # webhook
+    out = L.lambda_handler({"task": "tick"}, None)
+    assert out["statusCode"] == 200 and out["body"].endswith("0 advanced")
+
+
+def test_add_a_film_state_times_out_via_tick_keeping_films():
+    _short_pool_setup(["drama", "drama", "horror"])          # 2 qualify -> short pool
+    L.handle_movie(MODE, cb(1, "sp_add"))                     # awaiting a typed title
+    assert L.get_game(CHAT)["selection"]["1"]["awaiting_add"] is True
+    NOW[0] += L._TURN_WINDOW + 1
+    L.run_tick()                                             # silent -> auto-keep + advance
+    g = L.get_game(CHAT)
+    assert g["selection"]["1"]["locked"] and len(g["selection"]["1"]["slots"]) == 2
+    assert g["phase"] == "WILDCARD"                          # solo -> wildcard after lock
+
+
+def test_swap_redisplay_says_swapped_in_not_picked_these():
+    _reset()
+    for t in ["A", "B", "C", "D"]:
+        L.add_to_library(CHAT, 1, t)
+    L.start_game(MODE, CHAT, 1)
+    L.handle_movie(MODE, cb(1, "start"))
+    _skip_constraints()                                      # -> SELECTING, 3 of 4 dealt
+    SENT.clear()
+    L.handle_movie(MODE, message(1, "👎👍👍"))               # swap slot 1
+    assert any("swapped in" in t.lower() for t, _ in SENT)
+    assert not any("i picked these" in t.lower() for t, _ in SENT)   # preamble not repeated
 
 
 # ---- wildcard "one for the hat" ------------------------------------------- #
@@ -1202,9 +1237,9 @@ def test_constraints_window_parses_three_people_then_times_out():
         "owner_id": 1, "title": "Film A", "year": "1980", "genres": ["drama"],
         "runtime_min": 100, "watched": False}
     L.start_game(MODE, CHAT, 1)
-    L.handle_movie(MODE, cb(1, "start"))              # -> CONSTRAINTS, timer poll posted
+    L.handle_movie(MODE, cb(1, "start"))              # -> CONSTRAINTS, deadline set
     assert L.get_game(CHAT)["phase"] == "CONSTRAINTS"
-    assert L.get_game(CHAT).get("constraints_poll_id")
+    assert L.get_game(CHAT).get("constraints_deadline")
     mapping = {"no documentaries": {"exclude_genres": ["documentary"]},
                "under 2.5 hours": {"max_runtime_min": 150},
                "nothing earlier than 1960": {"min_year": 1960}}
@@ -1239,39 +1274,32 @@ def test_constraints_backstop_closes_after_deadline_on_next_update():
     assert L.get_game(CHAT)["phase"] == "SELECTING"
 
 
-def test_constraints_window_is_a_poll_with_open_period_timer():
-    # The window is timed by a Telegram poll's open_period (same mechanism as veto),
-    # not a scheduler — so it closes even on silence and shows a native countdown.
+def test_constraints_window_uses_a_deadline_not_a_poll():
+    # The window is just a chat message + a deadline — no fake timer poll.
     _reset()
     L.add_to_library(CHAT, 1, "Film A")
-    seen = {}
+    seen = []
     orig = L.send_poll
-
-    def spy(mode, chat_id, question, options, **kw):
-        seen.update(kw, question=question)
-        return orig(mode, chat_id, question, options, **kw)
-
-    L.send_poll = spy
+    L.send_poll = lambda *a, **k: seen.append(a) or orig(*a, **k)
     try:
         L.start_game(MODE, CHAT, 1)
         L.handle_movie(MODE, cb(1, "start"))
     finally:
         L.send_poll = orig
-    assert seen.get("open_period") == L._CONSTRAINTS_WINDOW
-    assert L.get_game(CHAT).get("constraints_poll_id")
+    assert seen == []                                 # no poll posted for the window
+    assert L.get_game(CHAT).get("constraints_deadline")
 
 
-def test_constraint_window_closes_on_poll_timer_even_when_silent():
-    # The whole point: Telegram auto-closes the poll and pushes a `poll` update that
-    # closes the window — no message in the chat required.
+def test_constraint_window_closes_on_tick_even_when_silent():
+    # The whole point: the tick sweep closes the window with no message in the chat.
     _reset()
     L.add_to_library(CHAT, 1, "Film A")
     L.start_game(MODE, CHAT, 1)
     L.handle_movie(MODE, cb(1, "start"))
     assert L.get_game(CHAT)["phase"] == "CONSTRAINTS"
-    pid = L.get_game(CHAT)["constraints_poll_id"]
     NOW[0] += L._CONSTRAINTS_WINDOW + 1
-    L.handle_movie(MODE, poll_closed(pid))            # Telegram open_period auto-close
+    out = L.run_tick()                                # clock-driven, no chat activity
+    assert out["body"].endswith("1 advanced")
     assert L.get_game(CHAT)["phase"] == "SELECTING"
 
 

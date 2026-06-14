@@ -116,6 +116,17 @@ exact 09:00 Kyiv year-round use EventBridge **Scheduler** with
 at most once per winner (a `morning_poll_posted` flag on the history row) and never
 re-posts once anyone has rated it.
 
+## 5c. Schedule the game "tick" sweep (EventBridge) — REQUIRED for movie
+A second rule drives the game clock. Create a `rate(1 minute)` EventBridge rule
+targeting the `gracia-bots` Lambda with constant input **`{"task": "tick"}`** (and the
+`lambda:InvokeFunction` permission, same as 5b). The handler routes it
+(`_scheduled_task` → `run_tick`) and sweeps active games, advancing anything past its
+deadline: the constraint window locks and proceeds; a silent per-player selection turn
+auto-keeps that player's dealt films (their veto still counts) and moves to the next
+player. It is a fast no-op when nothing is due. Without it, a game stalls if a player
+goes silent — only an incoming chat message (the lazy backstop) would unstick it.
+There is no fake "timer poll" anymore; players just reply with emoji in chat.
+
 ## 6. Verify end-to-end
 Two ways:
 
