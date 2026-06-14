@@ -1479,22 +1479,30 @@ def _begin_constraints(mode, chat_id, game):
 
 
 def parse_constraint_text(text):
-    """LLM parses a free-text reply into the filter schema. Code merges/applies."""
-    if not AI_ENABLED:
-        return {}
-    try:
-        resp = _bedrock.converse(
-            modelId=BEDROCK_MODEL_ID,
-            system=[{"text": _CONSTRAINTS_PARSE_SYSTEM}],
-            messages=[{"role": "user", "content": [{"text": text}]}],
-            inferenceConfig={"maxTokens": 200, "temperature": 0},
-        )
-        out = "".join(b.get("text", "") for b in resp["output"]["message"]["content"])
-        m = re.search(r"\{.*\}", out, re.DOTALL)
-        return json.loads(m.group(0)) if m else {}
-    except Exception as e:
-        log.warning("constraint parse failed: %s", e)
-        return {}
+    """LLM parses a free-text reply into the filter schema. Code merges/applies.
+    A bare year range ('1965-1980', '1920-1900', '1990 to 1999') is parsed
+    deterministically here (reversed ranges are swapped) — the LLM is unreliable on those."""
+    delta = {}
+    if AI_ENABLED:
+        try:
+            resp = _bedrock.converse(
+                modelId=BEDROCK_MODEL_ID,
+                system=[{"text": _CONSTRAINTS_PARSE_SYSTEM}],
+                messages=[{"role": "user", "content": [{"text": text}]}],
+                inferenceConfig={"maxTokens": 200, "temperature": 0},
+            )
+            out = "".join(b.get("text", "") for b in resp["output"]["message"]["content"])
+            m = re.search(r"\{.*\}", out, re.DOTALL)
+            delta = json.loads(m.group(0)) if m else {}
+        except Exception as e:
+            log.warning("constraint parse failed: %s", e)
+            delta = {}
+    rng = re.search(r"\b(1\d{3}|20\d{2})\s*(?:-|–|—|to|through|thru|until)\s*(1\d{3}|20\d{2})\b",
+                    text or "", re.I)
+    if rng:
+        a, b = int(rng.group(1)), int(rng.group(2))
+        delta["min_year"], delta["max_year"] = min(a, b), max(a, b)
+    return delta
 
 
 def _merge_filter(f, delta):
@@ -1641,6 +1649,16 @@ def _enrich_item(chat_id, item):
     """Fill missing genres/runtime/rating from the resolver and persist, so the
     constraint filter and the cards have real metadata. Best-effort: on failure
     the item is left as-is (and kept)."""
+    # Library items added before the Letterboxd fix kept a TMDB /10 rating; refresh
+    # to the Letterboxd /5 once we have a tmdb_id so cards show the right score.
+    if item.get("rating_scale") != 5 and item.get("tmdb_id"):
+        lb = _letterboxd_rating(item["tmdb_id"])
+        if lb is not None:
+            item["rating"], item["rating_scale"] = str(lb), 5
+            try:
+                ddb_put(item)
+            except Exception as e:
+                log.warning("lb rating refresh persist failed: %s", e)
     if (item.get("genres") and item.get("runtime_min") is not None
             and item.get("rating") is not None):
         return item
@@ -2292,6 +2310,8 @@ def _offer_wildcard(mode, chat_id, game):
 def _wildcard_accept(mode, chat_id, game):
     game["wildcard_open"] = False
     put_game(game)
+    wc = game.get("wildcard") or {}
+    send_message(mode, chat_id, f"Added “{wc.get('title', 'it')}” to the hat ✅")
     _begin_veto(mode, chat_id, game)               # _begin_veto folds in the wildcard
 
 
@@ -2364,6 +2384,10 @@ def _begin_veto(mode, chat_id, game):
         game["pool"] = list(pool_all)
         note = (f"🗳 Veto round! {len(pool_all)} films in the pool, one veto each. "
                 f"Vote 🚫 Veto within {_VETO_WINDOW}s to knock a pick out.")
+    if len(game["players"]) == 1 and game["pool"]:
+        # Solo game: nobody to veto anyone — just crown a random pick, skip the round.
+        _declare_winner(mode, chat_id, game, random.choice(game["pool"]))
+        return
     send_message(mode, chat_id, note)
     if not _present_candidate(mode, chat_id, game):   # may short-circuit to a winner
         put_game(game)
@@ -2468,6 +2492,14 @@ def get_rating_poll(poll_id):
 def _post_rating_poll(mode, chat_id, title, year, film_id=None,
                       session_id=None, participant_ids=None):
     """Post a 5★ rating poll for a film; register the lookup so votes resolve."""
+    # Dedupe: never re-post a poll for the same film in this chat within 10 minutes.
+    cut = _now_epoch() - 600
+    for r in ddb_scan():
+        if (r.get("PK") == "ratingpoll" and int(r.get("chat_id", 0)) == int(chat_id)
+                and _norm_title(r.get("film_title")) == _norm_title(title)
+                and _iso_to_epoch(r.get("posted_at")) >= cut):
+            log.info("rating poll for %r skipped (posted recently)", title)
+            return {}
     yr = str(year or "")
     label = f"{title} ({yr})" if yr else title
     pings = " ".join(mention_for(chat_id, p) for p in (participant_ids or []))
@@ -2532,27 +2564,28 @@ def _session_has_ratings(chat_id, session_id):
 
 
 def _morning_after_for_chat(chat_id):
-    """Post the rating poll for every recent un-rated, not-yet-polled winner in this
-    chat. Returns how many polls it posted (0 = nothing due — the clean skip)."""
+    """Post ONE rating poll — for the single most recent winner only (last night's
+    pick), and only if it's un-rated, not-yet-polled, and within the lookback.
+    Returns 1 if it posted, else 0. No back-filling older winners."""
     rows = [h for h in ddb_query(_pk("movie", chat_id))
             if str(h.get("SK", "")).startswith("history#") and h.get("winner_title")]
+    if not rows:
+        return 0
     rows.sort(key=lambda h: h.get("watched_date") or "", reverse=True)
-    cutoff = _now_epoch() - _MORNING_LOOKBACK_DAYS * 86400
-    posted = 0
-    for h in rows:
-        if _iso_to_epoch(h.get("watched_date")) < cutoff:
-            break                                    # older than the window -> stop
-        if h.get("morning_poll_posted") or _session_has_ratings(chat_id, h.get("session_id")):
-            continue                                 # already polled, or already rated
-        res = _post_rating_poll("movie", chat_id, h.get("winner_title"),
-                                h.get("winner_year"), film_id=h.get("winner_slug"),
-                                session_id=h.get("session_id"),
-                                participant_ids=h.get("participants") or [])
-        if res:
-            h["morning_poll_posted"] = True          # post exactly once per winner
-            ddb_put(h)
-            posted += 1
-    return posted
+    h = rows[0]
+    if _iso_to_epoch(h.get("watched_date")) < _now_epoch() - _MORNING_LOOKBACK_DAYS * 86400:
+        return 0
+    if h.get("morning_poll_posted") or _session_has_ratings(chat_id, h.get("session_id")):
+        return 0
+    res = _post_rating_poll("movie", chat_id, h.get("winner_title"),
+                            h.get("winner_year"), film_id=h.get("winner_slug"),
+                            session_id=h.get("session_id"),
+                            participant_ids=h.get("participants") or [])
+    if res:
+        h["morning_poll_posted"] = True
+        ddb_put(h)
+        return 1
+    return 0
 
 
 def run_morning_after():
@@ -2917,7 +2950,7 @@ MOVIE_TOOLS = [
                   "description": "Cancel/end the current movie-night game in this chat.",
                   "inputSchema": {"json": {"type": "object", "properties": {}}}}},
     {"toolSpec": {"name": "poll_film",
-                  "description": "Post a 5★ rating poll so the group can rate a film, e.g. 'poll Star Wars' / 'let's rate Dune'. Resolves the film (shows the year) and logs each person's stars. Pass year separately if the user gives one.",
+                  "description": "Post a 5★ rating poll for ONE film. Use ONLY when the user EXPLICITLY asks to rate or poll a specific film by name (e.g. 'poll Star Wars', 'let's rate Dune'). NEVER post a poll on your own initiative — not when starting a game, not when a film is merely mentioned or discussed, not to revisit an earlier film. If they didn't clearly ask for a poll, don't call this. Pass year separately if the user gives one.",
                   "inputSchema": {"json": {"type": "object",
                                            "properties": {"title": {"type": "string"},
                                                           "year": {"type": "integer"}},

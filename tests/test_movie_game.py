@@ -727,12 +727,14 @@ def test_wildcard_declined_via_thumbsdown_reaction():
 def test_wildcard_accepted_via_text_joins_pool():
     g = _two_player_to_wildcard()
     wc_slug = g["wildcard"]["slug"]
+    SENT.clear()
     L.handle_movie(MODE, message(2, "yes add it"))     # consent from anyone, in chat
     g = L.get_game(CHAT)
     assert g is not None and g["phase"] == "VETO"
     slugs = {e["slug"] for e in g["pool_all"]}
     assert wc_slug in slugs and {"film-a", "film-b"} <= slugs   # joined the hat
     assert any(e["owner"] == "0" for e in g["pool_all"])        # ownerless house item
+    assert any("hat" in t.lower() and "✅" in t for t, _ in SENT)   # acknowledged the add
 
 
 def test_wildcard_accepted_via_thumbsup_reaction():
@@ -742,6 +744,32 @@ def test_wildcard_accepted_via_thumbsup_reaction():
     g = L.get_game(CHAT)
     assert g is not None and g["phase"] == "VETO"
     assert wc_slug in {e["slug"] for e in g["pool_all"]}
+
+
+def test_solo_game_skips_veto_round():
+    _reset()
+    L.add_to_library(CHAT, 1, "Solo Film")
+    L.start_game(MODE, CHAT, 1)
+    L.handle_movie(MODE, cb(1, "start"))
+    _skip_constraints()
+    L.handle_movie(MODE, message(1, "👍"))             # lock -> wildcard offered
+    SENT.clear()
+    L.handle_movie(MODE, message(1, "pass"))           # decline -> solo: straight to winner
+    assert L.get_game(CHAT) is None                    # game ended (winner crowned)
+    assert not any("veto round" in t.lower() for t, _ in SENT)   # no veto round shown
+    assert any("winner" in t.lower() for t, _ in SENT)
+
+
+def test_year_range_reversed_is_swapped():
+    assert L.parse_constraint_text("1920-1900") == {"min_year": 1900, "max_year": 1920}
+    d = L.parse_constraint_text("films 1965 to 1980 please")
+    assert d["min_year"] == 1965 and d["max_year"] == 1980
+
+
+def test_rating_poll_deduped_within_window():
+    _reset()
+    assert L._post_rating_poll(MODE, CHAT, "Dune", "2021", session_id="s1")
+    assert L._post_rating_poll(MODE, CHAT, "dune", "2021", session_id="s2") == {}   # same film, skipped
 
 
 def test_wildcard_offered_in_solo_game():
