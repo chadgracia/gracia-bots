@@ -2382,21 +2382,31 @@ def _offer_wildcard(mode, chat_id, game):
 
 
 def _wildcard_accept(mode, chat_id, game):
+    """Add the wildcard to tonight's hat and proceed to the pick."""
+    wc = game.get("wildcard") or {}
     game["wildcard_open"] = False
     put_game(game)
-    wc = game.get("wildcard") or {}
-    send_message(mode, chat_id, f"Added “{wc.get('title', 'it')}” to the hat ✅")
-    _begin_veto(mode, chat_id, game)               # _begin_veto folds in the wildcard
+    if wc.get("title"):
+        send_message(mode, chat_id, f"Added “{wc['title']}” to the hat ✅")
+    _begin_veto(mode, chat_id, game)
 
 
-def _wildcard_decline(mode, chat_id, game):
+def _wildcard_decline(mode, chat_id, game, save_to_uid=None):
+    """Drop the wildcard from tonight's hat and proceed to the pick. If save_to_uid
+    is given, the house copy is added to THAT player's own library first (honoring
+    'not tonight, but add it to my library') instead of just being deleted."""
     wc = game.get("wildcard")
     if wc:
+        if save_to_uid is not None:
+            item, _info = add_to_library(chat_id, save_to_uid, wc["title"])
+            send_message(mode, chat_id,
+                         f"Kept it out of tonight's hat — added “{item['title']}” to "
+                         f"{mention_for(chat_id, save_to_uid)}'s library ✅")
         ddb_delete(_pk("movie", chat_id), f"lib#{wc['owner']}#{wc['slug']}")
     game["wildcard"] = None
     game["wildcard_open"] = False
     put_game(game)
-    _begin_veto(mode, chat_id, game)               # drop silently, proceed to the pick
+    _begin_veto(mode, chat_id, game)
 
 
 def _wildcard_backstop(mode, chat_id, game):
@@ -2409,20 +2419,51 @@ def _wildcard_backstop(mode, chat_id, game):
     return False
 
 
-def _wildcard_dissent(text):
-    if "👎" in (text or ""):
-        return True
-    words = set(re.findall(r"[a-z']+", (text or "").lower()))
-    return bool(words & {"no", "nope", "nah", "pass", "skip", "veto", "drop",
-                         "dont", "don't", "nay"})
-
-
-def _wildcard_consent(text):
-    if "👍" in (text or ""):
-        return True
-    words = set(re.findall(r"[a-z']+", (text or "").lower()))
-    return bool(words & {"yes", "yeah", "yep", "yup", "sure", "ok", "okay",
-                         "add", "include", "keep", "do", "please"})
+def _wildcard_intent(text, film_title):
+    """Classify a free-text reply to the wildcard pitch. Robust to negation and
+    compound asks ('not tonight but add to my library') that keyword lists miss.
+    Returns 'add_hat' (into tonight's hat), 'decline' (skip tonight, no save),
+    'library' (skip the hat but save to MY library), or 'other' (unclear — wait).
+    Emoji/keyword fallback when AI is off."""
+    t = (text or "").strip()
+    if not t:
+        return "other"
+    if "👎" in t:
+        return "decline"
+    if "👍" in t and "library" not in t.lower():
+        return "add_hat"
+    if not AI_ENABLED:
+        words = set(re.findall(r"[a-z']+", t.lower()))
+        if "library" in words:
+            return "library"
+        if words & {"no", "nope", "nah", "pass", "skip", "drop", "not", "dont", "don't"}:
+            return "decline"
+        if words & {"yes", "yeah", "yep", "sure", "ok", "okay", "add"}:
+            return "add_hat"
+        return "other"
+    try:
+        resp = _bedrock.converse(
+            modelId=BEDROCK_MODEL_ID,
+            system=[{"text": (
+                f"The movie-night bot offered the film \"{film_title}\" for TONIGHT'S hat "
+                "(the pool one film is drawn from). Classify the user's reply into exactly "
+                "one label:\n"
+                "add_hat — they want it in tonight's hat.\n"
+                "decline — they don't want it tonight (keep the hat human-only), no save.\n"
+                "library — do NOT put it in tonight's hat, but save it to THEIR OWN library "
+                "for later.\n"
+                "other — unclear or unrelated.\n"
+                "A reply can BOTH decline tonight AND ask to save it ('not tonight but add it "
+                "to my library') — that is 'library'. Answer with ONLY the label.")}],
+            messages=[{"role": "user", "content": [{"text": t}]}],
+            inferenceConfig={"maxTokens": 5, "temperature": 0})
+        out = "".join(b.get("text", "") for b in resp["output"]["message"]["content"]).strip().lower()
+        for label in ("add_hat", "library", "decline", "other"):
+            if label in out:
+                return label
+    except Exception as e:
+        log.warning("wildcard intent classify failed: %s", e)
+    return "other"
 
 
 def _begin_veto(mode, chat_id, game):
@@ -3447,14 +3488,19 @@ def on_message(mode, ev):
         return
     if _constraints_backstop(mode, chat_id, game):
         return
-    # Wildcard consent window: only a participant's 👎/"pass" (drop) or a clear
-    # yes (add now) acts; everything else just waits for the beat to lapse.
+    # Wildcard consent window: classify the reply (handles negation + 'add it to my
+    # library, not tonight'); emoji/keywords are the instant fallback. Only a game
+    # participant's reply acts; others wait for the beat to lapse.
     if game and game.get("phase") == "WILDCARD" and game.get("wildcard_open"):
-        if text:                                   # anyone in the chat can decide it
-            if _wildcard_dissent(text):
-                _wildcard_decline(mode, chat_id, game)
-            elif _wildcard_consent(text):
+        if uid is not None and int(uid) in [int(p) for p in game["players"]] and text:
+            intent = _wildcard_intent(text, (game.get("wildcard") or {}).get("title") or "")
+            if intent == "add_hat":
                 _wildcard_accept(mode, chat_id, game)
+            elif intent == "library":
+                _wildcard_decline(mode, chat_id, game, save_to_uid=int(uid))
+            elif intent == "decline":
+                _wildcard_decline(mode, chat_id, game)
+            # 'other' -> wait for the beat to lapse
         return
     # Empty-pool relax reply (within the window).
     if game and game.get("awaiting_relax"):

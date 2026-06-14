@@ -1624,6 +1624,17 @@ def test_scheduled_event_routes_to_morning_after():
     assert not L._is_scheduled_event({"rawPath": "/movie"})
 
 
+def test_wildcard_save_to_library_not_hat():
+    g = _two_player_to_wildcard()
+    wc_slug = g["wildcard"]["slug"]
+    L.handle_movie(MODE, message(1, "not tonight but add it to my library"))
+    g = L.get_game(CHAT)
+    assert g["phase"] == "VETO" and g["wildcard"] is None
+    assert wc_slug not in {e["slug"] for e in g["pool_all"]}          # not in tonight's hat
+    assert L.get_film(CHAT, 0, wc_slug) is None                       # house copy removed
+    assert any(f["slug"] == wc_slug for f in L.get_library(CHAT, 1))  # saved to player 1's library
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
