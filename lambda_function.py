@@ -474,6 +474,35 @@ def _extract_title(text):
     return t if re.search(r'\w', t) else None
 
 
+def _identify_film(text, min_year=None, max_year=None):
+    """Turn a messy add-loop reply into a concrete film {title, year}. Handles
+    'Title - Director', typos, and descriptions, and uses the active year window to
+    disambiguate (e.g. 'Sunrise' in 1925–1939 -> Murnau's Sunrise, 1927). Returns
+    (title, year|None); falls back to (text, None) when AI is off or it can't name one."""
+    if not AI_ENABLED:
+        return text, None
+    window = ""
+    if min_year or max_year:
+        window = f" The film must be one released between {min_year or 'any'} and {max_year or 'any'}."
+    resp = _bedrock.converse(
+        modelId=BEDROCK_MODEL_ID,
+        system=[{"text": (
+            "You identify the single film a user means from a short, possibly messy message "
+            "(it may include the director, a typo, or a description)." + window +
+            " Reply with ONLY a JSON object: {\"title\": \"<canonical film title>\", "
+            "\"year\": <4-digit year or null>}. Pick the most likely film given the year "
+            "window. If you truly cannot name one specific film, reply "
+            "{\"title\": null, \"year\": null}. No other text.")}],
+        messages=[{"role": "user", "content": [{"text": text}]}],
+        inferenceConfig={"maxTokens": 80, "temperature": 0})
+    raw = "".join(b.get("text","") for b in resp["output"]["message"]["content"]).strip()
+    try:
+        data = json.loads(raw)
+        return (data.get("title") or text), data.get("year")
+    except (ValueError, TypeError):
+        return text, None
+
+
 def _http_get(url, timeout=12):
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -1509,6 +1538,23 @@ def _describe_filter(f):
     return ", ".join(bits)
 
 
+def _looks_like_unsupported_constraint(text):
+    """True if the message tries to narrow the night by something we can't enforce
+    (director, language, cast, mood…) rather than year/length/genre."""
+    if not AI_ENABLED or not (text or "").strip():
+        return False
+    resp = _bedrock.converse(
+        modelId=BEDROCK_MODEL_ID,
+        system=[{"text": (
+            "A group is setting filters for movie night. We can ONLY filter by release "
+            "year, length, and genre. Does this message ask to narrow the films by "
+            "something OTHER than those three (e.g. director, language, country, cast, "
+            "mood/tone)? Answer with ONLY 'yes' or 'no'.")}],
+        messages=[{"role": "user", "content": [{"text": text}]}],
+        inferenceConfig={"maxTokens": 3, "temperature": 0})
+    return "".join(b.get("text","") for b in resp["output"]["message"]["content"]).strip().lower().startswith("y")
+
+
 def _handle_constraints_message(mode, chat_id, game, text):
     """A message during the open constraints window: accumulate it into the filter and
     acknowledge. There is NO early close — the full minute always runs so everyone gets
@@ -1519,7 +1565,15 @@ def _handle_constraints_message(mode, chat_id, game, text):
         put_game(game)
         send_message(mode, chat_id, f"Got it — {_describe_filter(game['filter'])} "
                                     "(still collecting until the timer ends).")
-    # anything that isn't a constraint just leaves the window open until it times out
+        return
+    # Nothing enforceable parsed. If they tried to filter on something we can't check
+    # (director, language, cast, mood…), say so plainly instead of silently ignoring it.
+    if _looks_like_unsupported_constraint(text):
+        send_message(mode, chat_id,
+            "I can only narrow tonight by release year, length, and genre — I can't "
+            "reliably filter by director, language, or cast. Send me one of those and "
+            "I'll tighten the list.")
+    # otherwise it's just chatter — leave the window open until it times out
 
 
 def _close_constraints(mode, chat_id, game, announce):
@@ -1763,7 +1817,11 @@ def _handle_short_pool_add(mode, chat_id, game, uid, text):
     if not title:
         send_message(mode, chat_id, "That doesn't look like a film title — just type the title (e.g. The Hand of God), or tap Play with these.")
         return
-    info = lookup_film_cached(title)
+    f = game.get("filter") or {}
+    ident, iyear = _identify_film(title, f.get("min_year"), f.get("max_year"))
+    info = lookup_film_cached(ident or title, iyear)
+    if not info.get("found") and ident and ident != title:
+        info = lookup_film_cached(title)          # last resort: the literal text
     if not info.get("found"):
         send_message(mode, chat_id, f"Couldn't find “{title}” — try another title, "
                                     "or tap Play with these.")
