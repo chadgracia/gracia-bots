@@ -536,6 +536,29 @@ def _letterboxd(title):
             "genres": genres, "description": desc}
 
 
+def _letterboxd_rating(tmdb_id):
+    """Letterboxd average rating (0–5) for a film by TMDB id. Resolves the
+    canonical page via the /tmdb/<id> redirect and reads the rating meta tag.
+    Sets a browser UA so Lambda isn't 403'd. Returns float or None."""
+    req = urllib.request.Request(f"{_LB_BASE}/tmdb/{tmdb_id}", headers={
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/124.0.0.0 Safari/537.36"),
+        "Accept": "text/html",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=8) as r:
+            html = r.read().decode("utf-8", "replace")
+    except Exception as e:
+        log.warning("letterboxd rating fetch failed for tmdb %s: %s", tmdb_id, e)
+        return None
+    m = re.search(r'twitter:data2"[^>]*content="([\d.]+) out of 5"', html)
+    if not m:
+        log.warning("letterboxd: no rating meta for tmdb %s", tmdb_id)
+        return None
+    return round(float(m.group(1)), 2)
+
+
 def _runtime_to_min(s):
     if not s or s == "N/A":
         return None
@@ -669,9 +692,15 @@ def lookup_film(title, year=None):
     canonical = pick("title") or title
     yr = pick("year") or str(year or "")
     # Rating baseline: TMDB vote_average (/10), else OMDb IMDb (/10), else Letterboxd (/5).
+    lb_rating = None
+    _tid = (tmdb or {}).get("tmdb_id")
+    if _tid:
+        lb_rating = _letterboxd_rating(_tid)
     rating = rating_scale = None
-    if tmdb and tmdb.get("rating_10") is not None:
-        rating, rating_scale = tmdb["rating_10"], 10
+    if lb_rating is not None:
+        rating, rating_scale = lb_rating, 5            # Letterboxd is the rating source
+    elif tmdb and tmdb.get("rating_10") is not None:
+        rating, rating_scale = tmdb["rating_10"], 10   # fallbacks only
     elif omdb and omdb.get("imdb_rating") is not None:
         rating, rating_scale = omdb["imdb_rating"], 10
     elif lb and lb.get("rating_5") is not None:
@@ -699,7 +728,7 @@ def lookup_film(title, year=None):
 def lookup_film_cached(title, year=None):
     """lookup_film with a DynamoDB cache (JSON, to dodge float/Decimal). Cache key
     includes the year so 'Dune' and 'Dune 1984' don't collide."""
-    key = f"filmcache#{title.strip().lower()}#{year or ''}"
+    key = f"filmcache#v2#{title.strip().lower()}#{year or ''}"
     try:
         cached = ddb_get(key, "ref")
         if cached and cached.get("json"):
