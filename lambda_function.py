@@ -638,26 +638,19 @@ def _scraperapi_get(target_url, ultra=False, timeout=35):
 
 
 def _letterboxd_rating(tmdb_id):
-    """Letterboxd average rating (0–5) for a film by TMDB id, fetched through
-    ScraperAPI (the Lambda's AWS IP is Cloudflare-blocked by Letterboxd).
-    Resolves the /tmdb/<id> redirect to the film page and reads the rating
-    meta tag. Tries a cheap plain request first; if Cloudflare blocks it (no
-    meta in the HTML), retries once with the anti-bot bypass. Returns float
-    or None."""
+    """Letterboxd average rating (0–5) for a film by TMDB id, via ScraperAPI.
+    Single plain attempt; ScraperAPI rotates IPs so bypass isn't needed at add time.
+    Returns float or None."""
     target = f"{_LB_BASE}/tmdb/{tmdb_id}"
-    for ultra in (False, True):
-        try:
-            html = _scraperapi_get(target, ultra=ultra, timeout=70 if ultra else 35)
-        except Exception as e:
-            log.warning("letterboxd via scraperapi failed for tmdb %s (ultra=%s): %s",
-                        tmdb_id, ultra, e)
-            continue
-        m = re.search(r'twitter:data2"[^>]*content="([\d.]+) out of 5"', html)
-        if m:
-            return round(float(m.group(1)), 2)
-        log.info("letterboxd: no rating meta for tmdb %s (ultra=%s)%s",
-                 tmdb_id, ultra, "" if ultra else " — retrying with bypass")
-    log.warning("letterboxd: giving up on tmdb %s after bypass", tmdb_id)
+    try:
+        html = _scraperapi_get(target, ultra=False, timeout=12)
+    except Exception as e:
+        log.warning("letterboxd via scraperapi failed for tmdb %s: %s", tmdb_id, e)
+        return None
+    m = re.search(r'twitter:data2"[^>]*content="([\d.]+) out of 5"', html)
+    if m:
+        return round(float(m.group(1)), 2)
+    log.warning("letterboxd: no rating meta for tmdb %s", tmdb_id)
     return None
 
 
@@ -759,11 +752,12 @@ def _tmdb(title, year=None):
     }
 
 
-def lookup_film(title, year=None):
+def lookup_film(title, year=None, skip_letterboxd=False):
     """Resolve a film independent of any one source. TMDB is the primary matcher
     (year is a separate param); OMDb then Letterboxd are fallbacks. Returns
     canonical title/year/id/genres/runtime + a rating (TMDB vote_average baseline).
     A missing rating NEVER blocks. found=False only when nothing resolves at all.
+    skip_letterboxd=True skips the _letterboxd_rating call (for hot-path enrichment).
     """
     tmdb = _tmdb(title, year)
     omdb = None
@@ -796,10 +790,10 @@ def lookup_film(title, year=None):
 
     canonical = pick("title") or title
     yr = pick("year") or str(year or "")
-    # Rating baseline: TMDB vote_average (/10), else OMDb IMDb (/10), else Letterboxd (/5).
+    # Rating: Letterboxd /5 is preferred unless skipped (hot path); fallbacks are TMDB/OMDb /10.
     lb_rating = None
     _tid = (tmdb or {}).get("tmdb_id")
-    if _tid:
+    if _tid and not skip_letterboxd:
         lb_rating = _letterboxd_rating(_tid)
     rating = rating_scale = None
     if lb_rating is not None:
@@ -1553,8 +1547,8 @@ def _begin_constraints(mode, chat_id, game):
     put_game(game)
     # No poll — just chat. The tick sweep / lazy backstop lock it on the deadline.
     send_message(mode, chat_id,
-                 "🎛 Any constraints tonight? Length, genre, or year range — anyone can "
-                 "chime in. Auto-locks in ~1 min if no reply.")
+                 "🎛 Any constraints tonight? Length, genre, year, language, or country — "
+                 "anyone can chime in. Auto-locks in ~1 min if no reply.")
 
 
 def parse_constraint_text(text):
@@ -1752,25 +1746,15 @@ def _begin_selection(mode, chat_id, game):
 
 
 def _enrich_item(chat_id, item):
-    """Fill missing genres/runtime/rating from the resolver and persist, so the
-    constraint filter and the cards have real metadata. Best-effort: on failure
-    the item is left as-is (and kept)."""
-    # Library items added before the Letterboxd fix kept a TMDB /10 rating; refresh
-    # to the Letterboxd /5 once we have a tmdb_id so cards show the right score.
-    if item.get("rating_scale") != 5 and item.get("tmdb_id"):
-        lb = _letterboxd_rating(item["tmdb_id"])
-        if lb is not None:
-            item["rating"], item["rating_scale"] = str(lb), 5
-            try:
-                ddb_put(item)
-            except Exception as e:
-                log.warning("lb rating refresh persist failed: %s", e)
+    """Fill missing genres/runtime/language/country from TMDB (no Letterboxd on the
+    hot path) and persist so each film pays this cost at most once. Best-effort:
+    on failure the item is left as-is (and kept by the filter)."""
     if (item.get("genres") and item.get("runtime_min") is not None
-            and item.get("rating") is not None and item.get("language")):
+            and item.get("language")):
         return item
     yr = (str(item.get("year") or "")[:4]) or None
     try:
-        info = lookup_film_cached(item["title"], yr)
+        info = lookup_film(item["title"], yr, skip_letterboxd=True)
     except Exception as e:
         log.warning("enrich failed for %s: %s", item.get("title"), e)
         return item
