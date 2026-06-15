@@ -751,6 +751,9 @@ def _tmdb(title, year=None):
         "genres": [g["name"] for g in (d.get("genres") or [])],
         "rating_10": round(float(rating), 1) if rating else None,
         "description": overview,
+        "language": (d.get("original_language") or top.get("original_language") or None),
+        "countries": [c.get("iso_3166_1") for c in (d.get("production_countries") or [])
+                      if c.get("iso_3166_1")],
         "alts": [{"title": r.get("title"), "year": (r.get("release_date") or "")[:4]}
                  for r in results[:4]],
     }
@@ -816,6 +819,8 @@ def lookup_film(title, year=None):
         "runtime_min": pick("runtime_min"),
         "genres": pick("genres") or [],
         "description": pick("description") or "",
+        "language": pick("language"),
+        "countries": pick("countries") or [],
         "rating": rating,
         "rating_scale": rating_scale,
         "rt_rating": (omdb or {}).get("rt_rating"),
@@ -830,7 +835,7 @@ def lookup_film(title, year=None):
 def lookup_film_cached(title, year=None):
     """lookup_film with a DynamoDB cache (JSON, to dodge float/Decimal). Cache key
     includes the year so 'Dune' and 'Dune 1984' don't collide."""
-    key = f"filmcache#v2#{title.strip().lower()}#{year or ''}"
+    key = f"filmcache#v3#{title.strip().lower()}#{year or ''}"
     try:
         cached = ddb_get(key, "ref")
         if cached and cached.get("json"):
@@ -892,6 +897,8 @@ def add_to_library(chat_id, user_id, title, year=None):
         "tmdb_id": info.get("tmdb_id"),
         "runtime_min": info.get("runtime_min"),
         "genres": info.get("genres") or [],
+        "language": info.get("language"),
+        "countries": info.get("countries") or [],
         "description": info.get("description") or "",
         # rating stored as a string (DDB resource rejects float); may be None
         "rating": (str(info["rating"]) if info.get("rating") is not None else None),
@@ -1246,7 +1253,9 @@ def _game_is_ongoing(chat_id, game):
 
 def _empty_filter():
     return {"exclude_genres": [], "include_genres": [], "max_runtime_min": None,
-            "min_runtime_min": None, "min_year": None, "max_year": None}
+            "min_runtime_min": None, "min_year": None, "max_year": None,
+            "include_languages": [], "exclude_languages": [],
+            "include_countries": [], "exclude_countries": []}
 
 
 def new_game(chat_id, initiator_id):
@@ -1516,13 +1525,23 @@ _CONSTRAINTS_PARSE_SYSTEM = (
     "Parse ONE chat message into movie-night filter constraints. Output ONLY a JSON "
     "object, including just the keys actually mentioned, from: exclude_genres (list of "
     "lowercase genre names), include_genres (list, for 'only X'), max_runtime_min (int), "
-    "min_runtime_min (int), min_year (int), max_year (int). Examples: 'no documentaries' "
-    "-> {\"exclude_genres\":[\"documentary\"]}; 'no horror' -> {\"exclude_genres\":[\"horror\"]}; "
-    "'only westerns' -> {\"include_genres\":[\"western\"]}; 'under 2.5 hours' -> "
-    "{\"max_runtime_min\":150}; 'at least 90 minutes' -> {\"min_runtime_min\":90}; "
-    "'nothing earlier than 1960' -> {\"min_year\":1960}; 'made after 2000' -> "
-    "{\"min_year\":2001}; 'something from the 90s' -> {\"min_year\":1990,\"max_year\":1999}. "
-    "If the message states no constraint, output {}."
+    "min_runtime_min (int), min_year (int), max_year (int), include_languages (list of "
+    "ISO 639-1 codes), exclude_languages (list of ISO 639-1 codes), include_countries "
+    "(list of ISO 3166-1 alpha-2 codes), exclude_countries (list of alpha-2 codes). "
+    "A nationality word ('French', 'Korean', 'Italian') means LANGUAGE by default "
+    "(include_languages); use include_countries/exclude_countries ONLY when the message "
+    "clearly means where a film was MADE ('made in France', 'from South Korea', "
+    "'nothing American'). Examples: 'no documentaries' -> {\"exclude_genres\":[\"documentary\"]}; "
+    "'no horror' -> {\"exclude_genres\":[\"horror\"]}; 'only westerns' -> "
+    "{\"include_genres\":[\"western\"]}; 'under 2.5 hours' -> {\"max_runtime_min\":150}; "
+    "'at least 90 minutes' -> {\"min_runtime_min\":90}; 'nothing earlier than 1960' -> "
+    "{\"min_year\":1960}; 'made after 2000' -> {\"min_year\":2001}; 'something from the "
+    "90s' -> {\"min_year\":1990,\"max_year\":1999}; 'only French films' -> "
+    "{\"include_languages\":[\"fr\"]}; 'in Japanese or Korean' -> "
+    "{\"include_languages\":[\"ja\",\"ko\"]}; 'nothing in English' -> "
+    "{\"exclude_languages\":[\"en\"]}; 'made in France' -> {\"include_countries\":[\"FR\"]}; "
+    "'nothing American' -> {\"exclude_countries\":[\"US\"]}. If the message states no "
+    "constraint, output {}."
 )
 
 
@@ -1567,7 +1586,9 @@ def parse_constraint_text(text):
 
 def _merge_filter(f, delta):
     """Combine a parsed delta into the running filter with AND (most restrictive)."""
-    for key in ("exclude_genres", "include_genres"):
+    for key in ("exclude_genres", "include_genres", "include_languages",
+                "exclude_languages", "include_countries", "exclude_countries"):
+        f.setdefault(key, [])
         for g in delta.get(key) or []:
             g = str(g).strip().lower()
             if g and g not in f[key]:
@@ -1583,10 +1604,27 @@ def _merge_filter(f, delta):
     return f
 
 
+_LANG_NAME = {
+    "en": "English", "fr": "French", "es": "Spanish", "de": "German",
+    "it": "Italian", "ja": "Japanese", "ko": "Korean", "zh": "Chinese",
+    "cn": "Chinese", "ru": "Russian", "sv": "Swedish", "da": "Danish",
+    "no": "Norwegian", "fi": "Finnish", "pl": "Polish", "cs": "Czech",
+    "pt": "Portuguese", "fa": "Persian", "hi": "Hindi", "ar": "Arabic",
+    "tr": "Turkish", "nl": "Dutch", "el": "Greek", "he": "Hebrew",
+    "uk": "Ukrainian", "th": "Thai", "hu": "Hungarian", "ro": "Romanian",
+}
+
+
+def _lang_label(code):
+    return _LANG_NAME.get(str(code).lower(), str(code).upper())
+
+
 def _filter_active(f):
     return bool(f and (f["exclude_genres"] or f["include_genres"]
                        or f["max_runtime_min"] or f["min_runtime_min"]
-                       or f["min_year"] or f["max_year"]))
+                       or f["min_year"] or f["max_year"]
+                       or f.get("include_languages") or f.get("exclude_languages")
+                       or f.get("include_countries") or f.get("exclude_countries")))
 
 
 def _describe_filter(f):
@@ -1603,6 +1641,14 @@ def _describe_filter(f):
         bits.append(f"≥{f['min_year']}")
     if f["max_year"]:
         bits.append(f"≤{f['max_year']}")
+    if f.get("include_languages"):
+        bits.append(", ".join(_lang_label(c) for c in f["include_languages"]) + "-language only")
+    if f.get("exclude_languages"):
+        bits.append("no " + ", ".join(_lang_label(c) for c in f["exclude_languages"]))
+    if f.get("include_countries"):
+        bits.append("from " + "/".join(c.upper() for c in f["include_countries"]))
+    if f.get("exclude_countries"):
+        bits.append("not from " + "/".join(c.upper() for c in f["exclude_countries"]))
     return ", ".join(bits)
 
 
@@ -1614,10 +1660,10 @@ def _looks_like_unsupported_constraint(text):
     resp = _bedrock.converse(
         modelId=BEDROCK_MODEL_ID,
         system=[{"text": (
-            "A group is setting filters for movie night. We can ONLY filter by release "
-            "year, length, and genre. Does this message ask to narrow the films by "
-            "something OTHER than those three (e.g. director, language, country, cast, "
-            "mood/tone)? Answer with ONLY 'yes' or 'no'.")}],
+            "A group is setting filters for movie night. We can filter by release year, "
+            "length, genre, language, and country of origin. Does this message ask to "
+            "narrow the films by something OTHER than those (e.g. director, a specific "
+            "actor/cast member, or mood/tone)? Answer with ONLY 'yes' or 'no'.")}],
         messages=[{"role": "user", "content": [{"text": text}]}],
         inferenceConfig={"maxTokens": 3, "temperature": 0})
     return "".join(b.get("text","") for b in resp["output"]["message"]["content"]).strip().lower().startswith("y")
@@ -1720,7 +1766,7 @@ def _enrich_item(chat_id, item):
             except Exception as e:
                 log.warning("lb rating refresh persist failed: %s", e)
     if (item.get("genres") and item.get("runtime_min") is not None
-            and item.get("rating") is not None):
+            and item.get("rating") is not None and item.get("language")):
         return item
     yr = (str(item.get("year") or "")[:4]) or None
     try:
@@ -1739,6 +1785,10 @@ def _enrich_item(chat_id, item):
         item["rt_rating"] = info["rt_rating"]; changed = True
     if item.get("tmdb_id") is None and info.get("tmdb_id") is not None:
         item["tmdb_id"] = info["tmdb_id"]; changed = True
+    if not item.get("language") and info.get("language"):
+        item["language"] = info["language"]; changed = True
+    if not item.get("countries") and info.get("countries"):
+        item["countries"] = info["countries"]; changed = True
     if not item.get("description") and info.get("description"):
         item["description"] = info["description"]; changed = True
     if changed:
@@ -1756,12 +1806,15 @@ def _draw_eligible(chat_id, uid, game, n, exclude_slugs):
     order, stops once n eligible are found; the chosen are enriched for the card."""
     f = game.get("filter") or _empty_filter()
     active = _filter_active(f)
+    want_lang = bool(f.get("include_languages") or f.get("exclude_languages")
+                     or f.get("include_countries") or f.get("exclude_countries"))
     lib = [x for x in get_library(chat_id, uid)
            if not x.get("watched") and x["slug"] not in exclude_slugs]
     random.shuffle(lib)
     chosen = []
     for item in lib:
-        if active and (not item.get("genres") or item.get("runtime_min") is None):
+        if active and (not item.get("genres") or item.get("runtime_min") is None
+                       or (want_lang and item.get("language") is None)):
             item = _enrich_item(chat_id, item)
         if not active or _passes_filter(item, f):
             chosen.append(item)
@@ -1801,6 +1854,18 @@ def _filter_reason(item, f):
         return f"it's ~{rt} min, over tonight's {f['max_runtime_min']}-min limit"
     if f["min_runtime_min"] is not None and rt is not None and rt < f["min_runtime_min"]:
         return f"it's ~{rt} min, under tonight's {f['min_runtime_min']}-min minimum"
+    lang = (item.get("language") or "").lower()
+    countries = [str(c).lower() for c in (item.get("countries") or [])]
+    if f.get("include_languages") and lang and lang not in f["include_languages"]:
+        only = "/".join(_lang_label(c) for c in f["include_languages"])
+        return f"it's in {_lang_label(lang)}, and tonight is {only} only"
+    if f.get("exclude_languages") and lang and lang in f["exclude_languages"]:
+        return f"it's in {_lang_label(lang)}, which tonight rules out"
+    if f.get("include_countries") and countries and not any(c in f["include_countries"] for c in countries):
+        return "it's not from " + "/".join(c.upper() for c in f["include_countries"])
+    if f.get("exclude_countries") and countries and any(c in f["exclude_countries"] for c in countries):
+        bad = next(c for c in countries if c in f["exclude_countries"])
+        return f"it's from {bad.upper()}, which tonight rules out"
     return None
 
 
@@ -2106,6 +2171,16 @@ def _passes_filter(item, f):
         return False
     if f["min_runtime_min"] is not None and rt is not None and rt < f["min_runtime_min"]:
         return False
+    lang = (item.get("language") or "").lower()
+    countries = [str(c).lower() for c in (item.get("countries") or [])]
+    if f.get("include_languages") and lang and lang not in f["include_languages"]:
+        return False
+    if f.get("exclude_languages") and lang and lang in f["exclude_languages"]:
+        return False
+    if f.get("include_countries") and countries and not any(c in f["include_countries"] for c in countries):
+        return False
+    if f.get("exclude_countries") and countries and any(c in f["exclude_countries"] for c in countries):
+        return False
     return True
 
 
@@ -2114,25 +2189,18 @@ def _eligible_pool(chat_id, game):
     genre/runtime constraints we lazily enrich thin metadata via lookup_film_cached
     (small pool, cached), and keep anything still unknown."""
     f = game["filter"]
+    want_lang = bool(f.get("include_languages") or f.get("exclude_languages")
+                     or f.get("include_countries") or f.get("exclude_countries"))
     need_meta = bool(f["exclude_genres"] or f["include_genres"]
-                     or f["max_runtime_min"] or f["min_runtime_min"])
+                     or f["max_runtime_min"] or f["min_runtime_min"] or want_lang)
     eligible, unknown = [], []
     for entry in game.get("pool_all", []):
         item = get_film(chat_id, int(entry["owner"]), entry["slug"])
         if not item:
             continue
-        if need_meta and (not item.get("genres") or item.get("runtime_min") is None):
-            try:
-                info = lookup_film_cached(item["title"])
-                changed = False
-                if not item.get("genres") and info.get("genres"):
-                    item["genres"] = info["genres"]; changed = True
-                if item.get("runtime_min") is None and info.get("runtime_min") is not None:
-                    item["runtime_min"] = info["runtime_min"]; changed = True
-                if changed:
-                    ddb_put(item)
-            except Exception as e:
-                log.warning("enrich for filter failed (%s): %s", entry.get("title"), e)
+        if need_meta and (not item.get("genres") or item.get("runtime_min") is None
+                          or (want_lang and item.get("language") is None)):
+            item = _enrich_item(chat_id, item)
         if _passes_filter(item, f):
             eligible.append(entry)
             if need_meta and (not item.get("genres") or item.get("runtime_min") is None):

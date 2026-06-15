@@ -1635,6 +1635,18 @@ def test_wildcard_save_to_library_not_hat():
     assert any(f["slug"] == wc_slug for f in L.get_library(CHAT, 1))  # saved to player 1's library
 
 
+def test_language_country_filter():
+    f = L._empty_filter()
+    L._merge_filter(f, {"include_languages": ["FR"]})       # codes lowercased on merge
+    L._merge_filter(f, {"exclude_countries": ["US"]})
+    assert f["include_languages"] == ["fr"] and f["exclude_countries"] == ["us"]
+    P = L._passes_filter
+    assert P({"language": "fr", "countries": ["FR"]}, f) is True
+    assert P({"language": "en", "countries": ["FR"]}, f) is False        # wrong language
+    assert P({"language": "fr", "countries": ["US", "FR"]}, f) is False  # excluded country
+    assert P({"language": None, "countries": []}, f) is True             # unknown -> kept
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
