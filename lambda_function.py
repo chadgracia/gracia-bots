@@ -1745,10 +1745,20 @@ def _begin_selection(mode, chat_id, game):
     _ask_player(mode, chat_id, game)
 
 
-def _enrich_item(chat_id, item):
+def _enrich_item(chat_id, item, want_rating=False):
     """Fill missing genres/runtime/language/country from TMDB (no Letterboxd on the
     hot path) and persist so each film pays this cost at most once. Best-effort:
-    on failure the item is left as-is (and kept by the filter)."""
+    on failure the item is left as-is (and kept by the filter).
+    want_rating=True fetches the Letterboxd /5 (single attempt) before the metadata
+    check; used only when building display cards, not during filtering."""
+    if want_rating and item.get("rating_scale") != 5 and item.get("tmdb_id"):
+        lb = _letterboxd_rating(item["tmdb_id"])
+        if lb is not None:
+            item["rating"], item["rating_scale"] = str(lb), 5
+            try:
+                ddb_put(item)
+            except Exception as e:
+                log.warning("lb rating persist failed: %s", e)
     if (item.get("genres") and item.get("runtime_min") is not None
             and item.get("language")):
         return item
@@ -1805,7 +1815,7 @@ def _draw_eligible(chat_id, uid, game, n, exclude_slugs):
             if len(chosen) >= n:
                 break
     for it in chosen:   # cards need genre/runtime/rating even with no filter
-        _enrich_item(chat_id, it)
+        _enrich_item(chat_id, it, want_rating=True)
     return chosen
 
 
