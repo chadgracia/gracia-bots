@@ -1638,9 +1638,9 @@ def _handle_constraints_message(mode, chat_id, game, text):
     # (director, language, cast, mood…), say so plainly instead of silently ignoring it.
     if _looks_like_unsupported_constraint(text):
         send_message(mode, chat_id,
-            "I can only narrow tonight by release year, length, and genre — I can't "
-            "reliably filter by director, language, or cast. Send me one of those and "
-            "I'll tighten the list.")
+            "I can narrow tonight by year, length, genre, language, and country — but "
+            "not by mood/tone, director, or cast. Send me one of those and I'll tighten "
+            "the list.")
     # otherwise it's just chatter — leave the window open until it times out
 
 
