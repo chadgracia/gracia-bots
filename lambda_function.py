@@ -1884,14 +1884,23 @@ def _post_short_pool(mode, chat_id, game, uid):
     sel["awaiting_add"] = False          # require a fresh "Add a film" tap to re-arm
     n = len(sel["slots"])
     who = mention_for(chat_id, uid)
+    active = _filter_active(game["filter"])
     desc = _describe_filter(game["filter"]) or "tonight's filter"
     if n:
         lst = ", ".join(f"{i + 1}) {s['title']}" for i, s in enumerate(sel["slots"]))
-        text = (f"{who} — tonight's filter is {desc}, and only these qualify from your "
-                f"library: {lst}. Play with these, or add another that fits?")
+        if active:
+            text = (f"{who} — tonight's filter is {desc}, and only these qualify from your "
+                    f"library: {lst}. Play with these, or add another that fits?")
+        else:
+            text = (f"{who} — you've only got {n} film{'' if n == 1 else 's'} in your "
+                    f"library: {lst}. Play with these, or add another?")
     else:
-        text = (f"{who} — nothing in your library fits tonight's filter ({desc}). "
-                "Add one that fits, or sit this round out (you keep your veto).")
+        if active:
+            text = (f"{who} — nothing in your library fits tonight's filter ({desc}). "
+                    "Add one that fits, or sit this round out (you keep your veto).")
+        else:
+            text = (f"{who} — there's nothing in your library yet. Add a film, or sit "
+                    "this round out (you keep your veto).")
     resp = send_message(mode, chat_id, text, reply_markup=_short_pool_keyboard(n))
     game["sel_msg_id"] = (resp.get("result") or {}).get("message_id")
     _set_turn_deadline(game)
@@ -2019,18 +2028,12 @@ def _ask_player(mode, chat_id, game):
         _post_player_slate(mode, chat_id, game, uid)
         put_game(game)
         return
-    if _filter_active(game["filter"]):
-        # the filter (not a tiny library) trimmed them below 3 — short-pool prompt
-        sel["short_pool"] = True
-        _post_short_pool(mode, chat_id, game, uid)   # persists the game
-        return
-    if not picks:
-        send_message(mode, chat_id, f"{mention_for(chat_id, uid)} has no films to add — skipping.")
-        sel["locked"] = True
-        _advance_player(mode, chat_id, game)
-        return
-    _post_player_slate(mode, chat_id, game, uid)   # no filter, small library: deal what's there
-    put_game(game)
+    # Fewer than 3 in play — whether the filter trimmed them or the library is just
+    # small. Don't deal a silent short slate: offer the buttons (play with these /
+    # add a film), naming the filter only when one is active.
+    sel["short_pool"] = True
+    _post_short_pool(mode, chat_id, game, uid)   # persists the game
+    return
 
 
 def _post_player_slate(mode, chat_id, game, uid, swapped_titles=None):
@@ -2824,7 +2827,10 @@ def run_tick():
         if chat_id is None:
             continue
         try:
-            if _constraints_backstop("movie", chat_id, g) or _turn_backstop("movie", chat_id, g):
+            if (_constraints_backstop("movie", chat_id, g)
+                    or _turn_backstop("movie", chat_id, g)
+                    or _veto_backstop("movie", chat_id, g)
+                    or _wildcard_backstop("movie", chat_id, g)):
                 advanced += 1
         except Exception as e:
             log.exception("tick advance failed for %s: %s", g.get("PK"), e)
