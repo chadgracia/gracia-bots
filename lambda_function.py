@@ -1481,10 +1481,28 @@ def on_callback(mode, ev):
     chat_id, uid = ev["chat_id"], ev.get("user_id")
     data, cqid, mid = ev.get("callback_data"), ev.get("callback_query_id"), ev.get("message_id")
     answer_callback(mode, cqid)
-    # Morning-after shelf buttons fire the next day, with no active game — handle them
-    # before the game lookup (which would otherwise return early).
+    # Morning-after buttons fire the next day, with no active game — handle them before
+    # the game lookup (which would otherwise return early).
     if data and (data.startswith("shelf_rm#") or data.startswith("shelf_keep#")):
         _handle_shelf_callback(mode, chat_id, uid, data, mid)
+        return
+    if data and data.startswith("watch_yes#"):
+        sid = data.split("#", 1)[1]
+        _confirm_watched_and_poll(mode, chat_id, sid)
+        if mid:
+            edit_message_text(mode, chat_id, mid, "Great — rate it below. 🍿")
+        return
+    if data and data.startswith("watch_no#"):
+        sid = data.split("#", 1)[1]
+        _set_watch_followup(chat_id, sid)
+        if mid:
+            edit_message_text(mode, chat_id, mid,
+                              "Ah — what did you end up watching instead? "
+                              "(or tell me you skipped it)")
+        else:
+            send_message(mode, chat_id,
+                         "Ah — what did you end up watching instead? "
+                         "(or tell me you skipped it)")
         return
     game = get_game(chat_id)
     if not game:
@@ -2755,14 +2773,23 @@ def _handle_rating_vote(mode, rp, ev):
              "username": ev.get("username"), "film_id": rp.get("film_id"),
              "film_title": rp.get("film_title"), "year": rp.get("year"),
              "stars": stars, "rated_at": _now_iso()})
+    # A vote confirms the film was actually watched -> ask the owner (once) whether to
+    # take it off their shelf. No-op for house picks / ad-hoc polls (no library owner).
+    try:
+        _maybe_prompt_shelf_after_vote(mode, rp)
+    except Exception as e:
+        log.warning("post-vote shelf prompt failed: %s", e)
 
 
-# ---- morning-after rating poll (daily scheduled job) ---------------------- #
+# ---- morning-after flow (daily scheduled job) ----------------------------- #
 # A once-a-day EventBridge invocation (see tools/setup_schedule.py) routes here.
-# For every movie chat it finds recent winners that never got rated and posts the
-# 5★ poll via _post_rating_poll, so votes feed get_ratings. Posts at most once per
-# winner (a flag on the history row), and never re-posts once anyone has rated it.
-_MORNING_LOOKBACK_DAYS = 3      # back-fill any un-rated winner this fresh, not ancient ones
+# For each movie chat it finds the most recent un-rated winner and ASKS whether the
+# group actually watched it (Yes/No buttons) — rather than assume. 'Yes' posts the 5★
+# rating poll; 'No' lets them say what they watched instead (the winner is rewritten,
+# or removed if nothing was watched). The first vote on a winner's poll then offers to
+# take that film off the owner's shelf. Asked at most once per winner (a flag on the
+# history row), and skipped once anyone has rated it.
+_MORNING_LOOKBACK_DAYS = 3      # ask about any un-rated winner this fresh, not ancient ones
 
 
 def _all_movie_chats():
@@ -2782,20 +2809,29 @@ def _session_has_ratings(chat_id, session_id):
                for r in ddb_query(_pk("movie", chat_id)))
 
 
-def correct_last_winner(chat_id, watched_title=None, watched_year=None):
+def _find_history(chat_id, session_id):
+    """The history row for one session, or None."""
+    if not session_id:
+        return None
+    return ddb_get(_pk("movie", chat_id), f"history#{session_id}")
+
+
+def correct_last_winner(chat_id, watched_title=None, watched_year=None, session_id=None):
     """Fix the record when the group didn't watch the film announced as the winner.
-    With watched_title, rewrites the most recent winner to the film actually watched
-    so tomorrow's rating poll is about the real film; with no title (watched nothing),
-    removes the winner entirely. Either way the announced pick is returned to its
-    owner's shelf (un-watched) so it can win again. The replacement is marked watched
-    if it's already in a participant's library. Code does the DB work; the model only
-    parses the intent and the film name."""
-    rows = [h for h in ddb_query(_pk("movie", chat_id))
-            if str(h.get("SK", "")).startswith("history#") and h.get("winner_title")]
-    if not rows:
-        return {"corrected": False, "reason": "no_recent_winner"}
-    rows.sort(key=lambda h: h.get("watched_date") or "", reverse=True)
-    h = rows[0]
+    With watched_title, rewrites the winner to the film actually watched so its rating
+    poll is about the real film; with no title (watched nothing), removes the winner
+    entirely. Either way the announced pick is returned to its owner's shelf (un-watched)
+    so it can win again. The replacement is marked watched if it's already in a
+    participant's library. Targets `session_id` when given, else the most recent winner.
+    Code does the DB work; the model only parses the intent and the film name."""
+    h = _find_history(chat_id, session_id) if session_id else None
+    if h is None:
+        rows = [r for r in ddb_query(_pk("movie", chat_id))
+                if str(r.get("SK", "")).startswith("history#") and r.get("winner_title")]
+        if not rows:
+            return {"corrected": False, "reason": "no_recent_winner"}
+        rows.sort(key=lambda r: r.get("watched_date") or "", reverse=True)
+        h = rows[0]
     old_title = h.get("winner_title")
     # The announced pick wasn't watched — return it to its owner's shelf.
     old_owner, old_slug = h.get("winner_owner_id"), h.get("winner_slug")
@@ -2893,10 +2929,17 @@ def _handle_shelf_callback(mode, chat_id, uid, data, mid):
     send_message(mode, chat_id, msg)
 
 
+def _watch_confirm_keyboard(session_id):
+    return {"inline_keyboard": [
+        [{"text": "✅ Yes, we watched it", "callback_data": f"watch_yes#{session_id}"}],
+        [{"text": "🙅 No, we didn't", "callback_data": f"watch_no#{session_id}"}]]}
+
+
 def _morning_after_for_chat(chat_id):
-    """Post ONE rating poll — for the single most recent winner only (last night's
-    pick), and only if it's un-rated, not-yet-polled, and within the lookback.
-    Returns 1 if it posted, else 0. No back-filling older winners."""
+    """Morning-after: for the single most recent winner (last night's pick), ASK whether
+    they actually watched it — rather than assume. 'Yes' posts the rating poll; 'No' lets
+    them tell us what they watched instead. Only for an un-rated, un-asked winner within
+    the lookback. Returns 1 if it asked, else 0. No back-filling older winners."""
     rows = [h for h in ddb_query(_pk("movie", chat_id))
             if str(h.get("SK", "")).startswith("history#") and h.get("winner_title")]
     if not rows:
@@ -2905,21 +2948,97 @@ def _morning_after_for_chat(chat_id):
     h = rows[0]
     if _iso_to_epoch(h.get("watched_date")) < _now_epoch() - _MORNING_LOOKBACK_DAYS * 86400:
         return 0
-    if h.get("morning_poll_posted") or _session_has_ratings(chat_id, h.get("session_id")):
+    if (h.get("watch_confirm_posted") or h.get("morning_poll_posted")
+            or _session_has_ratings(chat_id, h.get("session_id"))):
         return 0
-    res = _post_rating_poll("movie", chat_id, h.get("winner_title"),
-                            h.get("winner_year"), film_id=h.get("winner_slug"),
-                            session_id=h.get("session_id"),
+    yr = str(h.get("winner_year") or "")
+    label = f"{h.get('winner_title')} ({yr})" if yr else h.get("winner_title")
+    pings = " ".join(mention_for(chat_id, p) for p in (h.get("participants") or []))
+    lead = f"{pings} — " if pings else ""
+    resp = send_message("movie", chat_id,
+                        f"{lead}morning! Did you end up watching {label} last night?",
+                        reply_markup=_watch_confirm_keyboard(h.get("session_id")))
+    if resp:
+        h["watch_confirm_posted"] = True
+        ddb_put(h)
+        return 1
+    return 0
+
+
+def _confirm_watched_and_poll(mode, chat_id, session_id):
+    """'Yes, we watched it' -> post the rating poll for that winner (once)."""
+    h = _find_history(chat_id, session_id)
+    if not h or h.get("morning_poll_posted") or _session_has_ratings(chat_id, session_id):
+        return
+    res = _post_rating_poll(mode, chat_id, h.get("winner_title"), h.get("winner_year"),
+                            film_id=h.get("winner_slug"), session_id=session_id,
                             participant_ids=h.get("participants") or [])
     if res:
         h["morning_poll_posted"] = True
         ddb_put(h)
-        try:
-            _post_shelf_prompt("movie", chat_id, h)
-        except Exception as e:
-            log.warning("shelf prompt failed for chat %s: %s", chat_id, e)
-        return 1
-    return 0
+
+
+def _maybe_prompt_shelf_after_vote(mode, rp):
+    """First vote on a winner's rating poll confirms it was watched -> ask the owner
+    (once) whether to take it off their shelf. No-op for house picks and ad-hoc polls
+    (no history row / no library owner)."""
+    h = _find_history(rp.get("chat_id"), rp.get("session_id"))
+    if not h or h.get("shelf_prompt_posted"):
+        return
+    h["shelf_prompt_posted"] = True
+    ddb_put(h)
+    _post_shelf_prompt(mode, rp.get("chat_id"), h)
+
+
+_NOTHING_WATCHED_RE = re.compile(
+    r"\b(nothing|didn'?t|did not|skip|skipped|none|no film|nada|stayed in|"
+    r"went to bed|cancel)", re.I)
+
+
+def _set_watch_followup(chat_id, session_id):
+    ddb_put({"PK": _pk("movie", chat_id), "SK": "watch_followup",
+             "session_id": session_id, "ts": _now_epoch()})
+
+
+def _get_watch_followup(chat_id):
+    fu = ddb_get(_pk("movie", chat_id), "watch_followup")
+    if fu and _now_epoch() - int(fu.get("ts", 0)) <= 86400:   # valid for a day
+        return fu
+    return None
+
+
+def _clear_watch_followup(chat_id):
+    ddb_delete(_pk("movie", chat_id), "watch_followup")
+
+
+def _handle_watched_followup(mode, chat_id, fu, text):
+    """The free-text answer to 'what did you watch instead?'. 'nothing'/'we skipped it'
+    removes the winner; a film name rewrites the winner to it and posts that film's rating
+    poll (a vote on which will then offer the shelf cleanup)."""
+    sid = fu.get("session_id")
+    if _NOTHING_WATCHED_RE.search(text or ""):
+        correct_last_winner(chat_id, session_id=sid)        # no title -> removes the winner
+        send_message(mode, chat_id,
+                     "No worries — scrubbed it from the log. There's always next time. 🎬")
+        return
+    title, year = _identify_film(text)
+    res = correct_last_winner(chat_id, title, year, session_id=sid)
+    if not res.get("corrected"):
+        _set_watch_followup(chat_id, sid)                   # couldn't place it — ask again
+        send_message(mode, chat_id, "Hmm, I couldn't find that one — what did you watch?")
+        return
+    h = _find_history(chat_id, sid)
+    new_title = res.get("new_title") or title
+    new_year = res.get("new_year")
+    if h:
+        _post_rating_poll(mode, chat_id, h.get("winner_title"), h.get("winner_year"),
+                          film_id=h.get("winner_slug"), session_id=sid,
+                          participant_ids=h.get("participants") or [])
+        h["morning_poll_posted"] = True
+        h["watch_confirm_posted"] = True
+        ddb_put(h)
+    label = f"{new_title} ({new_year})" if new_year else new_title
+    send_message(mode, chat_id, f"Ah, {label} — noted. I'll remember that's the one. 🎬")
 
 
 def run_morning_after():
@@ -3765,6 +3884,14 @@ def on_message(mode, ev):
         # same on the clock when the chat is fully silent.)
         _turn_backstop(mode, chat_id, game)
         return
+    # Morning-after "what did you watch instead?" follow-up (after a 'No' on the
+    # did-you-watch-it prompt). Capture the next reply as the film actually watched.
+    if text:
+        fu = _get_watch_followup(chat_id)
+        if fu:
+            _clear_watch_followup(chat_id)
+            _handle_watched_followup(mode, chat_id, fu, text)
+            return
     if not text:
         return
     # Confirm -> save: a bare affirmative binds to the pending film (deterministic,

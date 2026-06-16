@@ -95,12 +95,15 @@ In BotFather, also set the bot's **group privacy** as you intend: privacy ON
 (default) means the bot only sees commands and replies/mentions in groups — which
 is what the free-form handler comment assumes.
 
-## 5b. Schedule the morning-after rating poll (EventBridge)
+## 5b. Schedule the morning-after check-in (EventBridge)
 The deploy pipeline only updates Lambda **code**, so the daily trigger is created
 once by hand — the same way the webhook is. It invokes the Lambda each morning with
 `{"task": "morning_after"}`; the handler (`_is_scheduled_event` → `run_morning_after`)
-scans the chat registry, finds recent un-rated winners, and posts the 5★ rating poll
-so votes feed `get_ratings`.
+scans the chat registry, finds the most recent un-rated winner, and **asks whether the
+group actually watched it** (Yes/No buttons). "Yes" posts the 5★ rating poll so votes
+feed `get_ratings`; "No" lets them say what they watched instead (the winner is
+rewritten, or removed if nothing was watched). The first vote on a winner's poll then
+offers to take that film off the owner's shelf, now that they've seen it.
 
 ```
 python tools/setup_schedule.py set       # create the rule + target + invoke permission
@@ -112,9 +115,9 @@ python tools/setup_schedule.py console    # print exact Console/CLI steps to do 
 Rule `gracia-bots-morning-after`, `cron(0 6 * * ? *)` = 06:00 UTC ≈ 09:00 Kyiv
 (summer). Classic rules fire on fixed UTC, so local time drifts ~1h across DST — for
 exact 09:00 Kyiv year-round use EventBridge **Scheduler** with
-`ScheduleExpressionTimezone="Europe/Kyiv"` (see `setup_schedule.py console`). It posts
-at most once per winner (a `morning_poll_posted` flag on the history row) and never
-re-posts once anyone has rated it.
+`ScheduleExpressionTimezone="Europe/Kyiv"` (see `setup_schedule.py console`). It asks
+at most once per winner (a `watch_confirm_posted` flag on the history row) and never
+re-asks once anyone has rated it.
 
 ## 5c. Schedule the game "tick" sweep (EventBridge) — REQUIRED for movie
 A second rule drives the game clock. Create a `rate(1 minute)` EventBridge rule
