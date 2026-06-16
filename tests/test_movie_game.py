@@ -1647,6 +1647,21 @@ def test_language_country_filter():
     assert P({"language": None, "countries": []}, f) is True             # unknown -> kept
 
 
+def test_win_history_weights():
+    _reset()
+    L.ddb_put({"PK": L._pk(MODE, CHAT), "SK": "history#a", "winner_owner_id": 3,
+               "watched_date": "2026-01-01T00:00:00+00:00"})
+    L.ddb_put({"PK": L._pk(MODE, CHAT), "SK": "history#b", "winner_owner_id": 1,
+               "watched_date": "2026-02-01T00:00:00+00:00"})   # player 1 won most recently
+    last, ever = L._win_weight_context(CHAT)
+    assert last == 1 and ever == {1, 3}
+    players = [1, 2, 3]
+    assert L._pick_weight(1, last, ever, players) == 0.85   # won last game
+    assert L._pick_weight(2, last, ever, players) == 1.15   # never won
+    assert L._pick_weight(3, last, ever, players) == 1.0    # won before, but not last
+    assert L._pick_weight(0, last, ever, players) == 1.0    # house/wildcard neutral
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

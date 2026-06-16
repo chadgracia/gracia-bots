@@ -2618,6 +2618,31 @@ _CONSTRAINTS_WINDOW = 60  # constraint-collection window (deadline; tick / lazy 
 _TURN_WINDOW = 60         # per-player selection turn (deadline; tick / lazy backstop)
 
 
+def _win_weight_context(chat_id):
+    """From history: (most-recent winner's owner_id, set of all owner_ids who have
+    EVER won here) — used to gently weight the candidate draw by win history."""
+    hist = [h for h in ddb_query(_pk("movie", chat_id))
+            if str(h.get("SK", "")).startswith("history#")
+            and h.get("winner_owner_id") is not None]
+    ever = {int(h["winner_owner_id"]) for h in hist}
+    last = int(max(hist, key=lambda h: h.get("watched_date") or "")["winner_owner_id"]) if hist else None
+    return last, ever
+
+
+def _pick_weight(owner, last_winner, ever_won, players):
+    """Draw weight for one candidate from its owner's win history. Players only —
+    the house/wildcard owner (0) stays neutral. Won last game -> 0.85 (15% less
+    likely); never won -> 1.15 (15% more likely); otherwise 1.0."""
+    owner = int(owner)
+    if owner not in {int(p) for p in players}:
+        return 1.0
+    if last_winner is not None and owner == last_winner:
+        return 0.85
+    if owner not in ever_won:
+        return 1.15
+    return 1.0
+
+
 def _present_candidate(mode, chat_id, game):
     """Draw and present the next candidate. Returns True if it RESOLVED the game
     (winner declared / pool empty -> cleared) so callers skip put_game; False if a
@@ -2627,7 +2652,9 @@ def _present_candidate(mode, chat_id, game):
         send_message(mode, chat_id, "Pool's empty — no winner.")
         clear_game(chat_id)
         return True
-    cand = random.choice(pool)        # random pick, in code
+    last_winner, ever_won = _win_weight_context(chat_id)
+    weights = [_pick_weight(e["owner"], last_winner, ever_won, game["players"]) for e in pool]
+    cand = random.choices(pool, weights=weights, k=1)[0]   # weighted by win history
     pool.remove(cand)
     item = get_film(chat_id, int(cand["owner"]), cand["slug"])
     card = _film_card(item) if item else cand["title"]
