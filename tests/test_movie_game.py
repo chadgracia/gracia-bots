@@ -1662,6 +1662,106 @@ def test_win_history_weights():
     assert L._pick_weight(0, last, ever, players) == 1.0    # house/wildcard neutral
 
 
+def test_correct_last_winner_swaps_film_and_unwatches_original():
+    _reset()
+    L.add_to_library(CHAT, 1, "Film A")
+    L.mark_watched(CHAT, 1, L._slugify("Film A"))     # crowned + marked watched
+    pk = L._pk(MODE, CHAT)
+    L.ddb_put({"PK": pk, "SK": "history#s1", "session_id": "s1",
+               "winner_title": "Film A", "winner_slug": L._slugify("Film A"),
+               "winner_owner_id": 1, "winner_year": "1950",
+               "watched_date": _iso_at(NOW[0]), "participants": [1, 2],
+               "pool": [], "ratings": {}, "morning_poll_posted": True})
+    res = L.correct_last_winner(CHAT, "Forrest Gump")
+    assert res["corrected"] and not res["removed"]
+    assert res["new_title"] == "Forrest Gump" and res["in_library"] is False
+    h = L.ddb_get(pk, "history#s1")
+    assert h["winner_title"] == "Forrest Gump"
+    assert h["winner_owner_id"] == 0                   # not on anyone's shelf
+    assert h["morning_poll_posted"] is False           # corrected film gets a fresh poll
+    # the announced pick is returned to player 1's shelf, un-watched
+    assert L.get_film(CHAT, 1, L._slugify("Film A"))["watched"] is False
+
+
+def test_correct_last_winner_in_a_players_library_marks_watched():
+    _reset()
+    pk = L._pk(MODE, CHAT)
+    L.add_to_library(CHAT, 2, "Forrest Gump")          # player 2 already owns it
+    L.ddb_put({"PK": pk, "SK": "history#s1", "session_id": "s1",
+               "winner_title": "Film A", "winner_slug": L._slugify("Film A"),
+               "winner_owner_id": 0, "winner_year": "1950",
+               "watched_date": _iso_at(NOW[0]), "participants": [1, 2],
+               "pool": [], "ratings": {}})
+    res = L.correct_last_winner(CHAT, "Forrest Gump")
+    assert res["in_library"] is True
+    h = L.ddb_get(pk, "history#s1")
+    assert h["winner_owner_id"] == 2
+    assert L.get_film(CHAT, 2, L._slugify("Forrest Gump"))["watched"] is True
+
+
+def test_correct_last_winner_no_replacement_removes_winner():
+    _reset()
+    pk = L._pk(MODE, CHAT)
+    L.ddb_put({"PK": pk, "SK": "history#s1", "session_id": "s1",
+               "winner_title": "Film A", "winner_slug": L._slugify("Film A"),
+               "winner_owner_id": 0, "winner_year": "1950",
+               "watched_date": _iso_at(NOW[0]), "participants": [1], "ratings": {}})
+    res = L.correct_last_winner(CHAT)                   # watched nothing
+    assert res["removed"] is True
+    assert L.ddb_get(pk, "history#s1") is None          # winner dropped, no poll tomorrow
+
+
+def test_morning_after_shelf_prompt_and_removal():
+    _reset()
+    pk = L._pk(MODE, CHAT)
+    STORE[(pk, "chat")] = {"PK": pk, "SK": "chat", "mode": "movie", "chat_id": CHAT}
+    L.remember_member(CHAT, 1, "U1", None)
+    L.add_to_library(CHAT, 1, "Film A")
+    slug = L._slugify("Film A")
+    L.mark_watched(CHAT, 1, slug)
+    L.ddb_put({"PK": pk, "SK": "history#s1", "session_id": "s1",
+               "winner_title": "Film A", "winner_slug": slug, "winner_owner_id": 1,
+               "winner_year": "1950", "watched_date": _iso_at(NOW[0]),
+               "participants": [1], "ratings": {}})
+    assert L._morning_after_for_chat(CHAT) == 1
+    assert len(_rating_polls()) == 1
+    assert any("take it off your shelf" in t for t, _m in SENT)   # the prompt went out
+    # owner taps "remove" -> film is gone from their shelf
+    L.handle_movie(MODE, cb(1, f"shelf_rm#1#{slug}"))
+    assert L.get_film(CHAT, 1, slug) is None
+
+
+def test_morning_after_shelf_prompt_keep_and_non_owner_ignored():
+    _reset()
+    pk = L._pk(MODE, CHAT)
+    STORE[(pk, "chat")] = {"PK": pk, "SK": "chat", "mode": "movie", "chat_id": CHAT}
+    L.remember_member(CHAT, 1, "U1", None)
+    L.add_to_library(CHAT, 1, "Film A")
+    slug = L._slugify("Film A")
+    L.mark_watched(CHAT, 1, slug)
+    L.ddb_put({"PK": pk, "SK": "history#s1", "session_id": "s1",
+               "winner_title": "Film A", "winner_slug": slug, "winner_owner_id": 1,
+               "winner_year": "1950", "watched_date": _iso_at(NOW[0]),
+               "participants": [1], "ratings": {}})
+    L._morning_after_for_chat(CHAT)
+    L.handle_movie(MODE, cb(2, f"shelf_rm#1#{slug}"))   # someone else taps -> ignored
+    assert L.get_film(CHAT, 1, slug) is not None
+    L.handle_movie(MODE, cb(1, f"shelf_keep#1#{slug}"))  # owner keeps it
+    assert L.get_film(CHAT, 1, slug) is not None
+
+
+def test_morning_after_no_shelf_prompt_for_house_winner():
+    _reset()
+    pk = L._pk(MODE, CHAT)
+    STORE[(pk, "chat")] = {"PK": pk, "SK": "chat", "mode": "movie", "chat_id": CHAT}
+    L.ddb_put({"PK": pk, "SK": "history#s1", "session_id": "s1",
+               "winner_title": "House Pick", "winner_slug": L._slugify("House Pick"),
+               "winner_owner_id": 0, "winner_year": "1950", "watched_date": _iso_at(NOW[0]),
+               "participants": [1], "ratings": {}})
+    assert L._morning_after_for_chat(CHAT) == 1
+    assert not any("take it off your shelf" in t for t, _m in SENT)
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

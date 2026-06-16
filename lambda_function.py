@@ -1481,6 +1481,11 @@ def on_callback(mode, ev):
     chat_id, uid = ev["chat_id"], ev.get("user_id")
     data, cqid, mid = ev.get("callback_data"), ev.get("callback_query_id"), ev.get("message_id")
     answer_callback(mode, cqid)
+    # Morning-after shelf buttons fire the next day, with no active game — handle them
+    # before the game lookup (which would otherwise return early).
+    if data and (data.startswith("shelf_rm#") or data.startswith("shelf_keep#")):
+        _handle_shelf_callback(mode, chat_id, uid, data, mid)
+        return
     game = get_game(chat_id)
     if not game:
         return
@@ -2777,6 +2782,117 @@ def _session_has_ratings(chat_id, session_id):
                for r in ddb_query(_pk("movie", chat_id)))
 
 
+def correct_last_winner(chat_id, watched_title=None, watched_year=None):
+    """Fix the record when the group didn't watch the film announced as the winner.
+    With watched_title, rewrites the most recent winner to the film actually watched
+    so tomorrow's rating poll is about the real film; with no title (watched nothing),
+    removes the winner entirely. Either way the announced pick is returned to its
+    owner's shelf (un-watched) so it can win again. The replacement is marked watched
+    if it's already in a participant's library. Code does the DB work; the model only
+    parses the intent and the film name."""
+    rows = [h for h in ddb_query(_pk("movie", chat_id))
+            if str(h.get("SK", "")).startswith("history#") and h.get("winner_title")]
+    if not rows:
+        return {"corrected": False, "reason": "no_recent_winner"}
+    rows.sort(key=lambda h: h.get("watched_date") or "", reverse=True)
+    h = rows[0]
+    old_title = h.get("winner_title")
+    # The announced pick wasn't watched — return it to its owner's shelf.
+    old_owner, old_slug = h.get("winner_owner_id"), h.get("winner_slug")
+    if old_owner is not None and old_slug:
+        try:
+            of = get_film(chat_id, int(old_owner), old_slug)
+        except (TypeError, ValueError):
+            of = None
+        if of and of.get("watched"):
+            of["watched"] = False
+            ddb_put(of)
+    if not watched_title:
+        # Nothing was watched -> drop the winner so no morning poll fires for it.
+        ddb_delete(_pk("movie", chat_id), h["SK"])
+        return {"corrected": True, "removed": True, "old_title": old_title}
+    info = lookup_film_cached(watched_title, watched_year)
+    new_title = info.get("title") or watched_title
+    new_year = str(info.get("year") or watched_year or "")
+    new_slug = info.get("slug") or _slugify(new_title)
+    new_owner = 0                       # 0 = house pick (not on anyone's shelf)
+    for p in h.get("participants") or []:
+        if get_film(chat_id, int(p), new_slug):
+            new_owner = int(p)
+            mark_watched(chat_id, int(p), new_slug)   # they've now seen it
+            break
+    h["winner_title"] = new_title
+    h["winner_slug"] = new_slug
+    h["winner_owner_id"] = new_owner
+    h["winner_year"] = new_year
+    h["ratings"] = {}
+    h["morning_poll_posted"] = False    # let the corrected film get its own poll
+    h.pop("shelf_prompt_posted", None)
+    ddb_put(h)
+    return {"corrected": True, "removed": False, "new_title": new_title,
+            "new_year": new_year, "in_library": new_owner > 0, "old_title": old_title}
+
+
+def _shelf_prompt_keyboard(owner, slug):
+    return {"inline_keyboard": [
+        [{"text": "🗑 Take it off my shelf", "callback_data": f"shelf_rm#{owner}#{slug}"}],
+        [{"text": "📌 Keep it", "callback_data": f"shelf_keep#{owner}#{slug}"}]]}
+
+
+def _post_shelf_prompt(mode, chat_id, h):
+    """If the winner came from a player's own library, ask that owner — now that they've
+    seen it — whether to take it off their shelf. House/wildcard winners (owner 0, not a
+    personal shelf) and films already gone from the shelf get no prompt. Best-effort."""
+    owner, slug = h.get("winner_owner_id"), h.get("winner_slug")
+    if owner is None or not slug:
+        return
+    try:
+        owner = int(owner)
+    except (TypeError, ValueError):
+        return
+    if owner <= 0:                              # house / wildcard pick — not anyone's shelf
+        return
+    if not get_film(chat_id, owner, slug):      # already removed — nothing to ask
+        return
+    yr = str(h.get("winner_year") or "")
+    label = f"{h.get('winner_title')} ({yr})" if yr else h.get("winner_title")
+    send_message(mode, chat_id,
+                 f"{mention_for(chat_id, owner)} — now that you've seen {label}, want me to "
+                 "take it off your shelf?",
+                 reply_markup=_shelf_prompt_keyboard(owner, slug))
+
+
+def _handle_shelf_callback(mode, chat_id, uid, data, mid):
+    """The morning-after 'take it off your shelf?' buttons. Only the shelf's owner can
+    decide. 'remove' deletes the library item; 'keep' leaves it (already marked watched,
+    so it won't be re-dealt). Fires with no active game, so on_callback routes it here
+    before the game lookup."""
+    try:
+        action, owner_s, slug = data.split("#", 2)
+    except ValueError:
+        return
+    try:
+        owner = int(owner_s)
+    except ValueError:
+        return
+    if uid is None or int(uid) != owner:        # only the owner acts; ignore others
+        return
+    item = get_film(chat_id, owner, slug)
+    title = (item or {}).get("title") or "that one"
+    if action == "shelf_rm":
+        ddb_delete(_pk("movie", chat_id), f"lib#{owner}#{slug}")
+        msg = f"Done — took “{title}” off your shelf. 🗑"
+    else:
+        msg = f"Kept “{title}” on your shelf. 📌"
+    if mid:
+        try:
+            edit_message_text(mode, chat_id, mid, msg)
+            return
+        except Exception as e:
+            log.warning("shelf prompt edit failed: %s", e)
+    send_message(mode, chat_id, msg)
+
+
 def _morning_after_for_chat(chat_id):
     """Post ONE rating poll — for the single most recent winner only (last night's
     pick), and only if it's un-rated, not-yet-polled, and within the lookback.
@@ -2798,6 +2914,10 @@ def _morning_after_for_chat(chat_id):
     if res:
         h["morning_poll_posted"] = True
         ddb_put(h)
+        try:
+            _post_shelf_prompt("movie", chat_id, h)
+        except Exception as e:
+            log.warning("shelf prompt failed for chat %s: %s", chat_id, e)
         return 1
     return 0
 
@@ -3191,6 +3311,11 @@ MOVIE_TOOLS = [
                   "description": "Past movie-night WINNERS for this chat, most recent first — each with title, year, date, who played, and the pool that night. Call this whenever someone asks what you've watched, last week's/last time's winner, how many nights you've had, or makes a claim about a pattern ('we always pick X', 'do we ever watch comedies'). Answer ONLY from what it returns; never claim you keep no log.",
                   "inputSchema": {"json": {"type": "object",
                                            "properties": {"limit": {"type": "integer"}}}}}},
+    {"toolSpec": {"name": "correct_last_winner",
+                  "description": "Fix the record when the group says they did NOT watch the film you announced as the winner. If they watched a DIFFERENT film instead, pass watched_title (and watched_year if they give one); if they watched nothing at all, omit watched_title. This rewrites the most recent movie-night winner so tomorrow's rating poll is about the film actually watched, and returns the announced pick to its owner's shelf. Use ONLY for a clear correction of what was actually watched ('we didn't end up watching that, we watched Forrest Gump instead', 'we skipped it', 'we actually put on Z') — NEVER for someone merely mentioning or discussing another film.",
+                  "inputSchema": {"json": {"type": "object",
+                                           "properties": {"watched_title": {"type": "string"},
+                                                          "watched_year": {"type": "integer"}}}}}},
 ]
 
 MOVIE_SYSTEM = (
@@ -3261,6 +3386,12 @@ MOVIE_SYSTEM = (
     "watched, last time's / last week's winner, how many nights you've had, or any claim about "
     "a pattern ('we always pick X', 'do we ever watch anything funny'), call get_history and "
     "answer only from it — never say you keep no record.\n"
+    "- CORRECTIONS: if the group says they did NOT actually watch the film you crowned — they "
+    "put on something else, or skipped the night — call correct_last_winner so tomorrow's "
+    "rating poll is about what they really watched. Pass the new film's title (and year if "
+    "given); omit the title if they watched nothing. Then confirm warmly in your own voice. "
+    "Do this ONLY for a genuine 'we didn't watch that / we watched X instead', never for "
+    "someone merely mentioning another film.\n"
     "- Starting movie night: just start it; don't announce it yourself (the game posts its "
     "own card). If someone wants a FRESH game ('new game', 'start over', 'restart it') start "
     "it anew. Never lecture that a game is 'already going' — quietly do what they asked.\n"
@@ -3437,6 +3568,9 @@ def _dispatch_tool(name, tool_input, ctx):
     if name == "get_history":
         hist = get_history(chat_id, (tool_input or {}).get("limit") or 10)
         return {"count": len(hist), "history": hist}
+    if name == "correct_last_winner":
+        return correct_last_winner(chat_id, (tool_input or {}).get("watched_title"),
+                                   (tool_input or {}).get("watched_year"))
     return {"error": f"unknown tool {name}"}
 
 
