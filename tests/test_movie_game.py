@@ -1569,40 +1569,44 @@ def _rating_polls():
     return [v for (p, _s), v in STORE.items() if p == "ratingpoll"]
 
 
-def test_morning_after_asks_then_yes_posts_poll():
+def test_morning_after_asks_open_question_no_assumption():
     _reset()
     _seed_winner()
     res = L.run_morning_after()
     assert res["body"].endswith("1 posted")
-    # it ASKS first (no poll yet), and flags the row so it won't re-ask
+    # it asks openly, without naming/assuming the winner, and no poll yet
     assert _rating_polls() == []
-    assert any("Did you end up watching" in t for t, _m in SENT)
+    assert any("What did you end up watching" in t for t, _m in SENT)
+    assert not any("The Overnighters" in t for t, _m in SENT)
     assert STORE[(L._pk(MODE, CHAT), "history#s1")]["watch_confirm_posted"] is True
-    # 'Yes, we watched it' -> the rating poll goes out
-    L.handle_movie(MODE, cb(1, "watch_yes#s1"))
-    rp = _rating_polls()
-    assert len(rp) == 1 and rp[0]["session_id"] == "s1"
-    assert rp[0]["film_title"] == "The Overnighters"
-    assert STORE[(L._pk(MODE, CHAT), "history#s1")]["morning_poll_posted"] is True
 
 
-def test_morning_after_no_then_names_film_corrects_and_polls():
+def test_morning_after_naming_the_winner_posts_its_poll():
     _reset()
     _seed_winner()
     L.run_morning_after()
-    L.handle_movie(MODE, cb(1, "watch_no#s1"))               # they didn't watch it
-    L.handle_movie(MODE, message(1, "Forrest Gump"))          # what they did watch
+    L.handle_movie(MODE, message(1, "The Overnighters"))     # they DID watch the winner
     h = L.ddb_get(L._pk(MODE, CHAT), "history#s1")
-    assert h["winner_title"] == "Forrest Gump"                # winner rewritten
+    assert h["winner_title"] == "The Overnighters"           # unchanged
+    rp = _rating_polls()
+    assert len(rp) == 1 and rp[0]["film_title"] == "The Overnighters"
+
+
+def test_morning_after_naming_a_different_film_corrects_and_polls():
+    _reset()
+    _seed_winner()
+    L.run_morning_after()
+    L.handle_movie(MODE, message(1, "Forrest Gump"))   # AI off -> answer taken verbatim
+    h = L.ddb_get(L._pk(MODE, CHAT), "history#s1")
+    assert h["winner_title"] == "Forrest Gump"               # winner rewritten
     rp = _rating_polls()
     assert len(rp) == 1 and rp[0]["film_title"] == "Forrest Gump"
 
 
-def test_morning_after_no_then_nothing_removes_winner():
+def test_morning_after_nothing_watched_removes_winner():
     _reset()
     _seed_winner()
     L.run_morning_after()
-    L.handle_movie(MODE, cb(1, "watch_no#s1"))
     L.handle_movie(MODE, message(1, "nope, we skipped it"))
     assert L.ddb_get(L._pk(MODE, CHAT), "history#s1") is None  # winner dropped
     assert _rating_polls() == []
@@ -1645,7 +1649,7 @@ def test_scheduled_event_routes_to_morning_after():
     _seed_winner()
     out = L.lambda_handler({"task": "morning_after"}, None)   # cron event, no path/secret
     assert out["statusCode"] == 200 and "morning-after" in out["body"]
-    assert any("Did you end up watching" in t for t, _m in SENT)   # asks, not polls yet
+    assert any("What did you end up watching" in t for t, _m in SENT)   # asks, not polls yet
     # the native EventBridge shape is recognised too
     assert L._is_scheduled_event({"source": "aws.events", "detail-type": "Scheduled Event"})
     assert not L._is_scheduled_event({"rawPath": "/movie"})
@@ -1757,7 +1761,7 @@ def test_shelf_prompt_fires_on_first_vote_then_removal():
     _reset()
     slug = _seed_library_winner()
     L._morning_after_for_chat(CHAT)
-    L.handle_movie(MODE, cb(1, "watch_yes#s1"))          # confirms -> poll posts
+    L.handle_movie(MODE, message(1, "Film A"))           # confirm winner -> poll posts
     assert not any("take it off your shelf" in t for t, _m in SENT)   # not yet — no votes
     pid = _rating_polls()[0]["SK"]
     L.handle_movie(MODE, poll_answer(1, pid, [4]))        # a vote confirms it was watched
@@ -1771,7 +1775,7 @@ def test_shelf_prompt_keep_and_non_owner_ignored():
     _reset()
     slug = _seed_library_winner()
     L._morning_after_for_chat(CHAT)
-    L.handle_movie(MODE, cb(1, "watch_yes#s1"))
+    L.handle_movie(MODE, message(1, "Film A"))
     pid = _rating_polls()[0]["SK"]
     L.handle_movie(MODE, poll_answer(1, pid, [3]))
     L.handle_movie(MODE, cb(2, f"shelf_rm#1#{slug}"))    # someone else taps -> ignored
@@ -1784,7 +1788,7 @@ def test_shelf_prompt_only_once_per_winner():
     _reset()
     slug = _seed_library_winner()
     L._morning_after_for_chat(CHAT)
-    L.handle_movie(MODE, cb(1, "watch_yes#s1"))
+    L.handle_movie(MODE, message(1, "Film A"))
     pid = _rating_polls()[0]["SK"]
     L.handle_movie(MODE, poll_answer(1, pid, [4]))
     L.handle_movie(MODE, poll_answer(1, pid, [5]))        # a second/changed vote
@@ -1801,7 +1805,7 @@ def test_no_shelf_prompt_for_house_winner_on_vote():
                "winner_owner_id": 0, "winner_year": "1950", "watched_date": _iso_at(NOW[0]),
                "participants": [1], "ratings": {}})
     L._morning_after_for_chat(CHAT)
-    L.handle_movie(MODE, cb(1, "watch_yes#s1"))
+    L.handle_movie(MODE, message(1, "House Pick"))
     pid = _rating_polls()[0]["SK"]
     L.handle_movie(MODE, poll_answer(1, pid, [4]))
     assert not any("take it off your shelf" in t for t, _m in SENT)

@@ -99,11 +99,12 @@ is what the free-form handler comment assumes.
 The deploy pipeline only updates Lambda **code**, so the daily trigger is created
 once by hand — the same way the webhook is. It invokes the Lambda each morning with
 `{"task": "morning_after"}`; the handler (`_is_scheduled_event` → `run_morning_after`)
-scans the chat registry, finds the most recent un-rated winner, and **asks whether the
-group actually watched it** (Yes/No buttons). "Yes" posts the 5★ rating poll so votes
-feed `get_ratings`; "No" lets them say what they watched instead (the winner is
-rewritten, or removed if nothing was watched). The first vote on a winner's poll then
-offers to take that film off the owner's shelf, now that they've seen it.
+scans the chat registry, finds the most recent un-rated winner, and **asks — without
+assuming — "What did you end up watching last night?"** The free-text answer drives it:
+naming the winner posts its 5★ rating poll (votes feed `get_ratings`); a different film
+rewrites the winner and polls that; "nothing/we skipped it" drops the winner. The first
+vote on a winner's poll then offers to take that film off the owner's shelf, now that
+they've seen it.
 
 ```
 python tools/setup_schedule.py set       # create the rule + target + invoke permission

@@ -1481,28 +1481,10 @@ def on_callback(mode, ev):
     chat_id, uid = ev["chat_id"], ev.get("user_id")
     data, cqid, mid = ev.get("callback_data"), ev.get("callback_query_id"), ev.get("message_id")
     answer_callback(mode, cqid)
-    # Morning-after buttons fire the next day, with no active game — handle them before
-    # the game lookup (which would otherwise return early).
+    # Morning-after shelf buttons fire the next day, with no active game — handle them
+    # before the game lookup (which would otherwise return early).
     if data and (data.startswith("shelf_rm#") or data.startswith("shelf_keep#")):
         _handle_shelf_callback(mode, chat_id, uid, data, mid)
-        return
-    if data and data.startswith("watch_yes#"):
-        sid = data.split("#", 1)[1]
-        _confirm_watched_and_poll(mode, chat_id, sid)
-        if mid:
-            edit_message_text(mode, chat_id, mid, "Great — rate it below. 🍿")
-        return
-    if data and data.startswith("watch_no#"):
-        sid = data.split("#", 1)[1]
-        _set_watch_followup(chat_id, sid)
-        if mid:
-            edit_message_text(mode, chat_id, mid,
-                              "Ah — what did you end up watching instead? "
-                              "(or tell me you skipped it)")
-        else:
-            send_message(mode, chat_id,
-                         "Ah — what did you end up watching instead? "
-                         "(or tell me you skipped it)")
         return
     game = get_game(chat_id)
     if not game:
@@ -2929,17 +2911,12 @@ def _handle_shelf_callback(mode, chat_id, uid, data, mid):
     send_message(mode, chat_id, msg)
 
 
-def _watch_confirm_keyboard(session_id):
-    return {"inline_keyboard": [
-        [{"text": "✅ Yes, we watched it", "callback_data": f"watch_yes#{session_id}"}],
-        [{"text": "🙅 No, we didn't", "callback_data": f"watch_no#{session_id}"}]]}
-
-
 def _morning_after_for_chat(chat_id):
-    """Morning-after: for the single most recent winner (last night's pick), ASK whether
-    they actually watched it — rather than assume. 'Yes' posts the rating poll; 'No' lets
-    them tell us what they watched instead. Only for an un-rated, un-asked winner within
-    the lookback. Returns 1 if it asked, else 0. No back-filling older winners."""
+    """Morning-after: for the single most recent winner (last night's pick), ask — without
+    assuming — what the group actually watched. The free-text answer drives everything:
+    naming the winner posts its rating poll; a different film rewrites the winner and polls
+    that; 'nothing/we skipped it' drops the winner. Only for an un-rated, un-asked winner
+    within the lookback. Returns 1 if it asked, else 0. No back-filling older winners."""
     rows = [h for h in ddb_query(_pk("movie", chat_id))
             if str(h.get("SK", "")).startswith("history#") and h.get("winner_title")]
     if not rows:
@@ -2951,27 +2928,24 @@ def _morning_after_for_chat(chat_id):
     if (h.get("watch_confirm_posted") or h.get("morning_poll_posted")
             or _session_has_ratings(chat_id, h.get("session_id"))):
         return 0
-    yr = str(h.get("winner_year") or "")
-    label = f"{h.get('winner_title')} ({yr})" if yr else h.get("winner_title")
     pings = " ".join(mention_for(chat_id, p) for p in (h.get("participants") or []))
     lead = f"{pings} — " if pings else ""
     resp = send_message("movie", chat_id,
-                        f"{lead}morning! Did you end up watching {label} last night?",
-                        reply_markup=_watch_confirm_keyboard(h.get("session_id")))
+                        f"{lead}morning! What did you end up watching last night?")
     if resp:
         h["watch_confirm_posted"] = True
         ddb_put(h)
+        _set_watch_followup(chat_id, h.get("session_id"))   # next reply is the answer
         return 1
     return 0
 
 
-def _confirm_watched_and_poll(mode, chat_id, session_id):
-    """'Yes, we watched it' -> post the rating poll for that winner (once)."""
-    h = _find_history(chat_id, session_id)
-    if not h or h.get("morning_poll_posted") or _session_has_ratings(chat_id, session_id):
+def _poll_winner(mode, chat_id, h):
+    """Post the 5★ rating poll for a winner (once)."""
+    if not h or h.get("morning_poll_posted") or _session_has_ratings(chat_id, h.get("session_id")):
         return
     res = _post_rating_poll(mode, chat_id, h.get("winner_title"), h.get("winner_year"),
-                            film_id=h.get("winner_slug"), session_id=session_id,
+                            film_id=h.get("winner_slug"), session_id=h.get("session_id"),
                             participant_ids=h.get("participants") or [])
     if res:
         h["morning_poll_posted"] = True
@@ -3012,33 +2986,29 @@ def _clear_watch_followup(chat_id):
 
 
 def _handle_watched_followup(mode, chat_id, fu, text):
-    """The free-text answer to 'what did you watch instead?'. 'nothing'/'we skipped it'
-    removes the winner; a film name rewrites the winner to it and posts that film's rating
-    poll (a vote on which will then offer the shelf cleanup)."""
+    """The free-text answer to 'what did you end up watching?'. 'nothing/we skipped it'
+    drops the winner; naming the announced winner just posts its rating poll; naming a
+    DIFFERENT film rewrites the winner to it and polls that. A vote on the poll later
+    offers the shelf cleanup."""
     sid = fu.get("session_id")
+    h = _find_history(chat_id, sid)
     if _NOTHING_WATCHED_RE.search(text or ""):
         correct_last_winner(chat_id, session_id=sid)        # no title -> removes the winner
         send_message(mode, chat_id,
                      "No worries — scrubbed it from the log. There's always next time. 🎬")
         return
     title, year = _identify_film(text)
+    # They named the film we crowned — it was watched after all; just poll it.
+    if h and _norm_title(title) == _norm_title(h.get("winner_title")):
+        _poll_winner(mode, chat_id, h)
+        return
+    # A different film — rewrite the winner to it, then poll that.
     res = correct_last_winner(chat_id, title, year, session_id=sid)
     if not res.get("corrected"):
         _set_watch_followup(chat_id, sid)                   # couldn't place it — ask again
         send_message(mode, chat_id, "Hmm, I couldn't find that one — what did you watch?")
         return
-    h = _find_history(chat_id, sid)
-    new_title = res.get("new_title") or title
-    new_year = res.get("new_year")
-    if h:
-        _post_rating_poll(mode, chat_id, h.get("winner_title"), h.get("winner_year"),
-                          film_id=h.get("winner_slug"), session_id=sid,
-                          participant_ids=h.get("participants") or [])
-        h["morning_poll_posted"] = True
-        h["watch_confirm_posted"] = True
-        ddb_put(h)
-    label = f"{new_title} ({new_year})" if new_year else new_title
-    send_message(mode, chat_id, f"Ah, {label} — noted. I'll remember that's the one. 🎬")
+    _poll_winner(mode, chat_id, _find_history(chat_id, sid))
 
 
 def run_morning_after():
@@ -3505,12 +3475,14 @@ MOVIE_SYSTEM = (
     "watched, last time's / last week's winner, how many nights you've had, or any claim about "
     "a pattern ('we always pick X', 'do we ever watch anything funny'), call get_history and "
     "answer only from it — never say you keep no record.\n"
-    "- CORRECTIONS: if the group says they did NOT actually watch the film you crowned — they "
-    "put on something else, or skipped the night — call correct_last_winner so tomorrow's "
-    "rating poll is about what they really watched. Pass the new film's title (and year if "
-    "given); omit the title if they watched nothing. Then confirm warmly in your own voice. "
-    "Do this ONLY for a genuine 'we didn't watch that / we watched X instead', never for "
-    "someone merely mentioning another film.\n"
+    "- CORRECTIONS: you CAN and DO fix the winner record — when the group says they did NOT "
+    "watch the film you crowned (they put on something else, or skipped the night), call "
+    "correct_last_winner. Pass the new film's title (and year if given); omit the title if "
+    "they watched nothing. This is one of your abilities, so NEVER reply that you 'can't edit "
+    "the log' or that 'a winner stays put' — just do it and confirm warmly in your own voice. "
+    "'We watched X instead', 'remove that as the winner', 'we didn't end up watching it' all "
+    "mean call this. Do it ONLY for a real correction of what was watched, never for someone "
+    "merely mentioning another film.\n"
     "- Starting movie night: just start it; don't announce it yourself (the game posts its "
     "own card). If someone wants a FRESH game ('new game', 'start over', 'restart it') start "
     "it anew. Never lecture that a game is 'already going' — quietly do what they asked.\n"
