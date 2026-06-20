@@ -3453,6 +3453,12 @@ MOVIE_SYSTEM = (
     "- When you add a film, pass the year as a SEPARATE argument if the user named one; "
     "never glue the year into the title. The resolver picks ONE film — don't ask 'which "
     "version?' unless it genuinely found nothing.\n"
+    "- After an add, if the result has no_letterboxd_rating=true, Letterboxd has no average "
+    "for what you matched — usually an obscure title or the wrong film for a popular name. "
+    "Still save it, but DON'T just confirm: say plainly there's no Letterboxd rating, and if "
+    "`alts` lists a better-known film of that title, name it and ask if THAT's the one they "
+    "meant — offer to swap (remove this, add that) or keep it. A gentle check, never a "
+    "refusal.\n"
     "- Showing or changing a shelf is about WHOSE shelf it is. For another person pass their "
     "name; for the asker's own, leave it off. If you don't recognise the person yet (they "
     "haven't claimed a shelf), say so plainly — never show someone else's films under the "
@@ -3569,6 +3575,10 @@ def _tool_result_for_add(item, info):
             "runtime_min": item.get("runtime_min"), "genres": item.get("genres"),
             "description": info.get("description"), "rating": info.get("rating"),
             "rating_scale": info.get("rating_scale"), "rt_rating": info.get("rt_rating"),
+            # rating_scale 5 == a Letterboxd average. Anything else (a /10 fallback or
+            # no rating) means Letterboxd has no average — a strong tell for an obscure
+            # title or a wrong match to a popular namesake. Flag it so the agent checks.
+            "no_letterboxd_rating": info.get("rating_scale") != 5,
             "alts": info.get("alts")}
 
 
