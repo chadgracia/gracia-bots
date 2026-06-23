@@ -639,18 +639,22 @@ def _scraperapi_get(target_url, ultra=False, timeout=35):
 
 def _letterboxd_rating(tmdb_id):
     """Letterboxd average rating (0–5) for a film by TMDB id, via ScraperAPI.
-    Single plain attempt; ScraperAPI rotates IPs so bypass isn't needed at add time.
+    Tries plain first; retries with ultra_premium bypass if Cloudflare blocks the response.
     Returns float or None."""
     target = f"{_LB_BASE}/tmdb/{tmdb_id}"
-    try:
-        html = _scraperapi_get(target, ultra=False, timeout=12)
-    except Exception as e:
-        log.warning("letterboxd via scraperapi failed for tmdb %s: %s", tmdb_id, e)
-        return None
-    m = re.search(r'twitter:data2"[^>]*content="([\d.]+) out of 5"', html)
-    if m:
-        return round(float(m.group(1)), 2)
-    log.warning("letterboxd: no rating meta for tmdb %s", tmdb_id)
+    for ultra in (False, True):
+        try:
+            html = _scraperapi_get(target, ultra=ultra, timeout=30 if ultra else 15)
+        except Exception as e:
+            log.warning("letterboxd via scraperapi failed for tmdb %s (ultra=%s): %s",
+                        tmdb_id, ultra, e)
+            continue
+        m = re.search(r'twitter:data2"[^>]*content="([\d.]+) out of 5"', html)
+        if m:
+            return round(float(m.group(1)), 2)
+        if not ultra:
+            log.info("letterboxd: no rating meta for tmdb %s — retrying with bypass", tmdb_id)
+    log.warning("letterboxd: giving up on tmdb %s after bypass", tmdb_id)
     return None
 
 
