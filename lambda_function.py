@@ -2305,6 +2305,9 @@ def _wildcard_via_llm(chat_id, players, filter_desc=""):
         resp = _bedrock.converse(
             modelId=BEDROCK_MODEL_ID,
             system=[{"text": (
+                "Reply with ONLY a single JSON object — {\"title\": ..., \"year\": ..., "
+                "\"reason\": ...}. Your reply must START with '{'. No reasoning, no preamble, "
+                "no markdown fences. Think silently; output only the JSON. "
                 "You are SirWatchAlot, a warm film-essayist host, choosing ONE wildcard film "
                 "'for the hat' on movie night — built from each player's data, and HONEST about "
                 "what that data really tells you. A film in a player's 'library' was only SAVED "
@@ -2333,7 +2336,7 @@ def _wildcard_via_llm(chat_id, players, filter_desc=""):
             messages=[{"role": "user", "content": [{"text": json.dumps(
                 {"players": digest, "already_won_here": won,
                  "constraints": filter_desc or None})}]}],
-            inferenceConfig={"maxTokens": 280, "temperature": 0.8},
+            inferenceConfig={"maxTokens": 600, "temperature": 0.8},
         )
         raw = "".join(b.get("text", "") for b in resp["output"]["message"]["content"]).strip()
         m = re.search(r"\{.*\}", raw, re.S)
@@ -2398,15 +2401,19 @@ def _build_wildcard(chat_id, game):
         log.info("wildcard: no library/rating data for players -> skipping tier1")
 
     for ev in _film_almanac(_now_iso()[:10]):       # tier 3 (deferred stub -> [])
-        v, _why = verify(ev.get("title", ""), ev.get("year"), None, "almanac")
-        if v:
-            return v
+        v, why = verify(ev.get("title", ""), ev.get("year"), None, "almanac")
+        if not v:
+            log.info("wildcard almanac: %r rejected (%s)", ev.get("title"), why)
+            continue
+        return v
 
     for title, year in _WILDCARD_CANON:             # tier 4: last-resort canonical
-        v, _why = verify(title, year, None, "canon")
-        if v:
-            log.warning("wildcard: fell through to CANONICAL pick %r", title)
-            return v
+        v, why = verify(title, year, None, "canon")
+        if not v:
+            log.info("wildcard canon: %r rejected (%s)", title, why)
+            continue
+        log.warning("wildcard: fell through to CANONICAL pick %r", title)
+        return v
     log.error("wildcard: ladder fully exhausted — nothing to offer")
     return None
 
