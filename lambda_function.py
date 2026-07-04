@@ -625,48 +625,44 @@ def _letterboxd(title):
             "genres": genres, "description": desc}
 
 
-def _scraperapi_get(target_url, ultra=False, timeout=35):
+def _scraperapi_get(target_url, timeout=35):
     """GET target_url through ScraperAPI so the request leaves a non-AWS IP
-    (Letterboxd's Cloudflare blocks the Lambda's own AWS IP). ultra=True turns
-    on the anti-bot/Cloudflare bypass, which costs more credits."""
+    (Letterboxd's Cloudflare blocks the Lambda's own AWS IP)."""
     params = {"api_key": SCRAPER_API_KEY, "url": target_url}
-    if ultra:
-        params["ultra_premium"] = "true"
     api_url = "https://api.scraperapi.com/?" + urllib.parse.urlencode(params)
-    with urllib.request.urlopen(api_url, timeout=timeout) as r:
-        return r.read().decode("utf-8", "replace")
+    try:
+        with urllib.request.urlopen(api_url, timeout=timeout) as r:
+            return r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        body = e.read()[:300]
+        log.warning("scraperapi HTTP %s for %s: %s", e.code, target_url, body)
+        raise
 
 
 def _letterboxd_rating(tmdb_id):
     """Letterboxd average rating (0–5) for a film by TMDB id, via ScraperAPI.
-    Tries plain first; retries with ultra_premium bypass if Cloudflare blocks the response.
     Returns float or None."""
     target = f"{_LB_BASE}/tmdb/{tmdb_id}"
-    for ultra in (False, True):
+    try:
+        html = _scraperapi_get(target, timeout=20)
+    except Exception as e:
+        log.warning("letterboxd via scraperapi failed for tmdb %s: %s", tmdb_id, e)
+        return None
+    m = re.search(r'twitter:data2"[^>]*content="([\d.]+) out of 5"', html)
+    if m:
+        return round(float(m.group(1)), 2)
+    block = re.search(r'<script type="application/ld\+json">(.*?)</script>',
+                      html, re.DOTALL)
+    if block:
+        raw = (block.group(1).replace("/* <![CDATA[ */", "")
+               .replace("/* ]]> */", "").strip())
         try:
-            html = _scraperapi_get(target, ultra=ultra, timeout=30 if ultra else 15)
-        except Exception as e:
-            log.warning("letterboxd via scraperapi failed for tmdb %s (ultra=%s): %s",
-                        tmdb_id, ultra, e)
-            continue
-        m = re.search(r'twitter:data2"[^>]*content="([\d.]+) out of 5"', html)
-        if m:
-            return round(float(m.group(1)), 2)
-        block = re.search(r'<script type="application/ld\+json">(.*?)</script>',
-                          html, re.DOTALL)
-        if block:
-            raw = (block.group(1).replace("/* <![CDATA[ */", "")
-                   .replace("/* ]]> */", "").strip())
-            try:
-                agg = (json.loads(raw).get("aggregateRating") or {})
-                if agg.get("ratingValue") is not None:
-                    return round(float(agg["ratingValue"]), 2)
-            except (ValueError, TypeError):
-                pass
-        if not ultra:
-            log.info("letterboxd: no rating found for tmdb %s — retrying with bypass"
-                     "; html head: %r", tmdb_id, html[:200])
-    log.warning("letterboxd: giving up on tmdb %s after bypass", tmdb_id)
+            agg = (json.loads(raw).get("aggregateRating") or {})
+            if agg.get("ratingValue") is not None:
+                return round(float(agg["ratingValue"]), 2)
+        except (ValueError, TypeError):
+            pass
+    log.info("letterboxd: no rating found for tmdb %s; html head: %r", tmdb_id, html[:200])
     return None
 
 
@@ -1317,7 +1313,7 @@ def _add_player(game, user_id):
     uid = str(user_id)
     if uid not in [str(p) for p in game["players"]]:
         game["players"].append(int(user_id))
-        game["vetoes_remaining"][uid] = 1
+        game["vetoes_remaining"][uid] = 2
         return True
     return False
 
@@ -2592,12 +2588,12 @@ def _begin_veto(mode, chat_id, game):
                          "(e.g. 'drop the year limit').")
             return
         game["pool"] = eligible
-        note = f"🗳 Veto round! {len(eligible)} films fit ({_describe_filter(game['filter'])}), one veto each."
+        note = f"🗳 Veto round! {len(eligible)} films fit ({_describe_filter(game['filter'])}), two vetoes each."
         if unknown:
             note += f"\n(Kept despite unknown genre/length: {', '.join(unknown[:5])}.)"
     else:
         game["pool"] = list(pool_all)
-        note = (f"🗳 Veto round! {len(pool_all)} films in the pool, one veto each. "
+        note = (f"🗳 Veto round! {len(pool_all)} films in the pool, two vetoes each. "
                 f"Vote 🚫 Veto within {_VETO_WINDOW}s to knock a pick out.")
     if len(game["players"]) == 1 and game["pool"]:
         # Solo game: nobody to veto anyone — just crown a random pick, skip the round.

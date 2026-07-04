@@ -240,22 +240,37 @@ def test_owner_blocked_then_nonowner_veto_consumes_and_repicks():
     game = _veto_setup([1, 2, 3], [(1, "a", "A"), (2, "b", "B"), (3, "c", "C")])
     cur = game["current"]
     owner, poll, slug = int(cur["film"]["owner"]), cur["poll_id"], cur["film"]["slug"]
-    # Fix 2: the owner voting Veto is ignored, veto not consumed, pick stands
+    # owner voting Veto is ignored, veto not consumed, pick stands
     L.handle_movie(MODE, poll_answer(owner, poll, [0]))
     g = L.get_game(CHAT)
-    assert g["current"]["poll_id"] == poll and g["vetoes_remaining"][str(owner)] == 1
-    # Fix 1: a non-owner with a veto -> pick vetoed, their veto consumed, re-pick
+    assert g["current"]["poll_id"] == poll and g["vetoes_remaining"][str(owner)] == 2
+    # non-owner with a veto -> pick vetoed, first veto consumed (2->1), re-pick
     voter = next(p for p in (1, 2, 3) if p != owner)
     L.handle_movie(MODE, poll_answer(voter, poll, [0]))
     g = L.get_game(CHAT)
-    assert g["vetoes_remaining"][str(voter)] == 0
+    assert g["vetoes_remaining"][str(voter)] == 1
     assert g["current"]["poll_id"] != poll and g["current"]["film"]["slug"] != slug
-    # that voter is now spent -> a second veto from them is ignored
+
+
+def test_voter_exhausts_both_vetoes_then_blocked():
+    # All films owned by player 1 so voter=2 never owns the candidate and can
+    # always attempt. Verifies both vetoes are consumed then the third is blocked.
+    game = _veto_setup([1, 2, 3], [(1, "a", "A"), (1, "b", "B"), (1, "c", "C")])
+    voter = 2
+    g = L.get_game(CHAT)
+    poll1 = g["current"]["poll_id"]
+    L.handle_movie(MODE, poll_answer(voter, poll1, [0]))   # first veto (2->1)
+    g = L.get_game(CHAT)
+    assert g["vetoes_remaining"][str(voter)] == 1
     poll2 = g["current"]["poll_id"]
-    L.handle_movie(MODE, poll_answer(voter, poll2, [0]))
-    g2 = L.get_game(CHAT)
-    assert g2.get("current") and g2["current"]["poll_id"] == poll2
-    assert g2["vetoes_remaining"][str(voter)] == 0
+    L.handle_movie(MODE, poll_answer(voter, poll2, [0]))   # second veto (1->0)
+    g = L.get_game(CHAT)
+    assert g["vetoes_remaining"][str(voter)] == 0
+    poll3 = g["current"]["poll_id"]
+    L.handle_movie(MODE, poll_answer(voter, poll3, [0]))   # blocked — no vetoes left
+    g = L.get_game(CHAT)
+    assert g.get("current") and g["current"]["poll_id"] == poll3
+    assert g["vetoes_remaining"][str(voter)] == 0
 
 
 # ---- Phase 1 fixes: roster-validated veto resolution + clarifying note ----- #
@@ -284,7 +299,7 @@ def test_participant_veto_removes_pick_and_repicks():
     voter = next(p for p in (1, 2, 3) if p != owner)
     L.handle_movie(MODE, poll_answer(voter, pid, [0]))
     g = L.get_game(CHAT)
-    assert g is not None and g["vetoes_remaining"][str(voter)] == 0
+    assert g is not None and g["vetoes_remaining"][str(voter)] == 1
     assert g["current"]["film"]["slug"] != slug and g["current"]["poll_id"] != pid
 
 
@@ -465,7 +480,7 @@ def test_veto_consumes_and_repicks():
     voter = next(p for p in (1, 2, 3) if p != owner)
     L.handle_movie(MODE, poll_answer(voter, first_poll, [0]))
     g = L.get_game(CHAT)
-    assert g["vetoes_remaining"][str(voter)] == 0
+    assert g["vetoes_remaining"][str(voter)] == 1
     assert g["current"]["poll_id"] != first_poll and g["current"]["film"]["slug"] != first_film
 
 
@@ -981,7 +996,7 @@ def test_rating_vote_does_not_disturb_veto_poll():
     owner = int(game["current"]["film"]["owner"])
     voter = next(p for p in (1, 2, 3) if p != owner)
     L.handle_movie(MODE, poll_answer(voter, pid, [0]))
-    assert L.get_game(CHAT)["vetoes_remaining"][str(voter)] == 0
+    assert L.get_game(CHAT)["vetoes_remaining"][str(voter)] == 1
 
 
 def _short_pool_setup(genres):
