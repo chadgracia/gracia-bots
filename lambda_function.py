@@ -652,8 +652,20 @@ def _letterboxd_rating(tmdb_id):
         m = re.search(r'twitter:data2"[^>]*content="([\d.]+) out of 5"', html)
         if m:
             return round(float(m.group(1)), 2)
+        block = re.search(r'<script type="application/ld\+json">(.*?)</script>',
+                          html, re.DOTALL)
+        if block:
+            raw = (block.group(1).replace("/* <![CDATA[ */", "")
+                   .replace("/* ]]> */", "").strip())
+            try:
+                agg = (json.loads(raw).get("aggregateRating") or {})
+                if agg.get("ratingValue") is not None:
+                    return round(float(agg["ratingValue"]), 2)
+            except (ValueError, TypeError):
+                pass
         if not ultra:
-            log.info("letterboxd: no rating meta for tmdb %s — retrying with bypass", tmdb_id)
+            log.info("letterboxd: no rating found for tmdb %s — retrying with bypass"
+                     "; html head: %r", tmdb_id, html[:200])
     log.warning("letterboxd: giving up on tmdb %s after bypass", tmdb_id)
     return None
 
