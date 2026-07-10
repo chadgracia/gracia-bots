@@ -854,17 +854,23 @@ def test_force_new_supersedes_active_game():
     assert not any("already going" in t.lower() for t, _ in SENT)
 
 
-def test_soft_prompt_once_then_restarts():
+def test_soft_prompt_once_then_stays_quiet():
+    # Without force_new, start_game nudges exactly once then stays silent.
+    # Restarting requires an explicit force_new=True (via _meta_command "new game").
     _reset()
     L.add_to_library(CHAT, 1, "Film A")
     L.start_game(MODE, CHAT, 1)
     s1 = L.get_game(CHAT)["session_id"]
     SENT.clear()
-    L.start_game(MODE, CHAT, 1)                   # ambiguous nudge while live -> prompt once
+    L.start_game(MODE, CHAT, 1)                   # first implicit call -> nudge once
     assert L.get_game(CHAT)["session_id"] == s1
     assert L.get_game(CHAT)["soft_prompted"] is True
     assert sum("Join" in t for t, _ in SENT) == 1
-    L.start_game(MODE, CHAT, 1)                   # pushed again -> just restart, no repeat line
+    SENT.clear()
+    L.start_game(MODE, CHAT, 1)                   # second implicit call -> silent, game unchanged
+    assert L.get_game(CHAT)["session_id"] == s1
+    assert not SENT                                # no repeat nudge, no restart
+    L.start_game(MODE, CHAT, 1, force_new=True)   # explicit new game -> restarts
     assert L.get_game(CHAT)["session_id"] != s1
 
 

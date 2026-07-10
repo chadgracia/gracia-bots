@@ -1472,14 +1472,16 @@ def start_game(mode, chat_id, initiator_id, force_new=False):
     game = get_game(chat_id)
     if _game_is_ongoing(chat_id, game):
         # A real, same-day game is live (stale ones were just auto-abandoned).
-        if not force_new and not game.get("soft_prompted"):
-            game["soft_prompted"] = True
-            put_game(game)
-            send_message(mode, chat_id,
-                         "🎬 There's a movie night going — tap 🎬 Join on the card above, "
-                         "or say \"start a new game\" to scrap it and begin fresh.")
+        if not force_new:
+            # Only nudge once; after that stay quiet. Explicit "start a new game"
+            # always arrives via _meta_command with force_new=True, not here.
+            if not game.get("soft_prompted"):
+                game["soft_prompted"] = True
+                put_game(game)
+                send_message(mode, chat_id,
+                             "🎬 There's a movie night going — tap 🎬 Join on the card above, "
+                             "or say \"start a new game\" to scrap it and begin fresh.")
             return
-        # force_new, or they've pushed back after the one nudge -> end it and restart.
         _abandon_game(chat_id, game)
     game = new_game(chat_id, initiator_id)
     _add_player(game, initiator_id)
@@ -3391,7 +3393,7 @@ MOVIE_TOOLS = [
                                            "properties": {"name": {"type": "string"}},
                                            "required": ["name"]}}}},
     {"toolSpec": {"name": "start_movie_night",
-                  "description": "Start a movie-night game (posts the Join/Start card). Set force_new=true when the user explicitly wants a NEW game ('start a new game', 'new game', 'start over') or insists there's no game / to restart — that scraps any current game and begins fresh. NEVER call this when someone is adding, removing, or looking up a film — even if the message mentions another user's shelf or name.",
+                  "description": "Start a movie-night game (posts the Join/Start card). ONLY call this when the message explicitly requests a game or movie night — it must contain words like 'movie night', 'game', 'let's watch', 'let's play', 'start the game', 'pick a film tonight'. Set force_new=true when they want a NEW/fresh game. NEVER call this for any add/remove/lookup/library request, and NEVER call it when the message begins with 'add' or is about a specific film title.",
                   "inputSchema": {"json": {"type": "object",
                                            "properties": {"force_new": {"type": "boolean"}}}}}},
     {"toolSpec": {"name": "cancel_game",
