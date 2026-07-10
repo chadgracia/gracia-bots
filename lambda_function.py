@@ -3391,7 +3391,7 @@ MOVIE_TOOLS = [
                                            "properties": {"name": {"type": "string"}},
                                            "required": ["name"]}}}},
     {"toolSpec": {"name": "start_movie_night",
-                  "description": "Start a movie-night game (posts the Join/Start card). Set force_new=true when the user explicitly wants a NEW game ('start a new game', 'new game', 'start over') or insists there's no game / to restart — that scraps any current game and begins fresh.",
+                  "description": "Start a movie-night game (posts the Join/Start card). Set force_new=true when the user explicitly wants a NEW game ('start a new game', 'new game', 'start over') or insists there's no game / to restart — that scraps any current game and begins fresh. NEVER call this when someone is adding, removing, or looking up a film — even if the message mentions another user's shelf or name.",
                   "inputSchema": {"json": {"type": "object",
                                            "properties": {"force_new": {"type": "boolean"}}}}}},
     {"toolSpec": {"name": "cancel_game",
@@ -3482,6 +3482,9 @@ MOVIE_SYSTEM = (
     "name; for the asker's own, leave it off. If you don't recognise the person yet (they "
     "haven't claimed a shelf), say so plainly — never show someone else's films under the "
     "wrong name.\n"
+    "- 'Add X to @user's shelf' or 'put X on Jason's shelf': you can only add to the "
+    "SENDER's own shelf — call add_to_library for X and tell them it went on their shelf; "
+    "suggest they ask @user to add it themselves. This is still an add, NEVER a game start.\n"
     "- 'Recommend something', 'what should I watch', 'something like my shelf' → reach for "
     "real titles in your own words, with a point of view. Never refuse, and never punt to "
     "'add some films first' if they already have a shelf.\n"
