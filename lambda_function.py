@@ -3916,8 +3916,17 @@ def on_message(mode, ev):
            "username": ev.get("username"), "mode": mode, "suppress_reply": False}
     speaker = ev.get("user_name") or "Someone"
     prior = _convo_messages(_convo_load(chat_id))   # rolling window for referents
+    # Only offer start_movie_night when the message contains an explicit game-start
+    # keyword. Without this guard the LLM calls it for any ambient chat.
+    _tl = text.lower()
+    _game_kw = any(kw in _tl for kw in ("movie night", "movie-night", "movienight",
+                                          "start game", "start the game", "new game",
+                                          "start a game", "let's play", "lets play"))
+    _tools = MOVIE_TOOLS if _game_kw else [
+        t for t in MOVIE_TOOLS if t["toolSpec"]["name"] != "start_movie_night"
+    ]
     try:
-        reply = converse(MOVIE_SYSTEM, f"{speaker}: {text}", ctx, prior=prior)
+        reply = converse(MOVIE_SYSTEM, f"{speaker}: {text}", ctx, tools=_tools, prior=prior)
     except Exception as e:
         log.error("bedrock movie failed: %s", e)
         return
