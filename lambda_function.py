@@ -3919,9 +3919,10 @@ def on_message(mode, ev):
     # Only offer start_movie_night when the message contains an explicit game-start
     # keyword. Without this guard the LLM calls it for any ambient chat.
     _tl = text.lower()
-    _game_kw = any(kw in _tl for kw in ("movie night", "movie-night", "movienight",
-                                          "start game", "start the game", "new game",
-                                          "start a game", "let's play", "lets play"))
+    _tl_words = set(_tl.split())
+    _game_kw = "game" in _tl_words or any(kw in _tl for kw in (
+        "movie night", "movie-night", "movienight",
+        "let's play", "lets play", "start a game", "play a game"))
     _tools = MOVIE_TOOLS if _game_kw else [
         t for t in MOVIE_TOOLS if t["toolSpec"]["name"] != "start_movie_night"
     ]
