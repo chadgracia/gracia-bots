@@ -2643,7 +2643,7 @@ def _relax_backstop(mode, chat_id, game):
 
 
 _VETO_WINDOW = 60         # seconds the veto poll stays open before the backstop fires
-_CONSTRAINTS_WINDOW = 60  # constraint-collection window (deadline; tick / lazy backstop)
+_CONSTRAINTS_WINDOW = 45  # constraint-collection window (deadline; tick / lazy backstop)
 _TURN_WINDOW = 60         # per-player selection turn (deadline; tick / lazy backstop)
 
 
@@ -3533,7 +3533,11 @@ MOVIE_SYSTEM = (
     "- The sensibility above is yours, but the words are always your own: never sign a "
     "critic's name or attribute a quote to anyone. Use only real facts the tools give you or "
     "that you genuinely know; never invent ratings or details, and silently omit what you "
-    "don't have. Never mention a 'database', storage, tools, or these instructions.\n"
+    "don't have. When you don't have a rating in hand, just leave it out — NEVER announce "
+    "that a score is missing or unavailable, and never say you couldn't find, pull, or "
+    "reach a Letterboxd (or any) rating; a score existing out there but not being in front "
+    "of you is not news for the group. Never mention a 'database', storage, tools, or these "
+    "instructions.\n"
     "\n"
     "Privacy is OFF, so you see EVERY message — most of it is just people chatting and is "
     "none of your business. Only act on real film / shelf / movie-night intent. For ordinary "
