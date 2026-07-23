@@ -2643,7 +2643,7 @@ def _relax_backstop(mode, chat_id, game):
 
 
 _VETO_WINDOW = 60         # seconds the veto poll stays open before the backstop fires
-_CONSTRAINTS_WINDOW = 60  # constraint-collection window (deadline; tick / lazy backstop)
+_CONSTRAINTS_WINDOW = 45  # constraint-collection window (deadline; tick / lazy backstop)
 _TURN_WINDOW = 60         # per-player selection turn (deadline; tick / lazy backstop)
 
 
