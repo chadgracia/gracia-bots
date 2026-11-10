@@ -46,9 +46,17 @@ Role: `gracia-bots-role-dsuzb4hf`. It needs three things:
   both the profile ARN and the underlying foundation model ARN.
   Also enable model access for it in the **Bedrock console → Model access** (one-time).
 
-> Without Bedrock, the bot still works: `/movie`, `/movies`, `/draw` and the plain
-> add-reply all run. Only free-form chat and the conversational add go quiet.
-> (`BEDROCK_MODEL_ID=""` disables AI cleanly.)
+> Without Bedrock, only the deterministic paths run: `/shelf` and `/movies` (list a
+> shelf; `/shelf @user` or `/shelf <name>` for someone else's), the plain phrases
+> "shelf", "my shelf", "what's on my shelf", "моя полиця", "моя полка", "полиця",
+> "полка" (trailing ?/! allowed), the "yes / add it" confirm of a looked-up film, the
+> cancel / new-game phrases, and the game itself (reactions, polls, buttons).
+> Everything else, including `/movie <title>` and `/draw`, is handled by the model and
+> goes quiet. (`BEDROCK_MODEL_ID=""` disables AI cleanly.)
+>
+> The bot registers `/shelf` and `/movies` ("Show your film shelf") in Telegram's
+> command menu with setMyCommands on each cold start, merged into any commands
+> already set in BotFather.
 
 ## 3. Lambda environment variables
 Configuration → Environment variables:

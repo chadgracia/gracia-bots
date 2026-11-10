@@ -279,9 +279,40 @@ def verify_token(mode):
     if resp.get("ok"):
         u = resp.get("result") or {}
         log.info("healthcheck %s: getMe ok -> @%s (id %s)", mode, u.get("username"), u.get("id"))
+        _register_commands(mode)
     else:
         log.error("healthcheck %s: getMe FAILED -> %s — token bad or truncated.",
                   mode, resp.get("description"))
+
+
+# Commands each bot advertises in Telegram's "/" menu. Merged into whatever is
+# already registered (setMyCommands replaces the list), so BotFather entries stay.
+_BOT_COMMANDS = {"movie": [{"command": "shelf", "description": "Show your film shelf"},
+                          {"command": "movies", "description": "Show your film shelf"}]}
+
+
+def _register_commands(mode):
+    """Best effort, once per cold start: ensure _BOT_COMMANDS[mode] are registered."""
+    wanted = _BOT_COMMANDS.get(mode) or []
+    if not wanted:
+        return
+    try:
+        token = _token_for(mode)
+        cur = _tg_request(token, "getMyCommands", {})
+        existing = (cur.get("result") or []) if cur.get("ok") else []
+        names = {c["command"] for c in wanted}
+        merged = [c for c in existing if c.get("command") not in names] + wanted
+        if [(c.get("command"), c.get("description")) for c in existing] == \
+                [(c["command"], c["description"]) for c in merged]:
+            log.info("commands %s: already registered", mode)
+            return
+        resp = _tg_request(token, "setMyCommands", {"commands": merged})
+        if resp.get("ok"):
+            log.info("commands %s: registered %s", mode, [c["command"] for c in merged])
+        else:
+            log.error("commands %s: setMyCommands failed -> %s", mode, resp.get("description"))
+    except Exception:
+        log.exception("commands %s: registration failed", mode)
 
 
 def send_message(mode, chat_id, text, **kwargs):
@@ -3664,7 +3695,7 @@ MOVIE_TOOLS = [
                   "inputSchema": {"json": {"type": "object",
                                            "properties": {"force_new": {"type": "boolean"}}}}}},
     {"toolSpec": {"name": "cancel_game",
-                  "description": "Cancel/end the current movie-night game in this chat.",
+                  "description": "Cancel/end the current movie-night game in this chat. ONLY when the CURRENT message explicitly asks to cancel, stop or end the game; never because of an earlier message. Returns status forbidden otherwise — then just answer the message.",
                   "inputSchema": {"json": {"type": "object", "properties": {}}}}},
     {"toolSpec": {"name": "poll_film",
                   "description": "Post a 5★ rating poll for ONE film. Use ONLY when the user EXPLICITLY asks to rate or poll a specific film by name (e.g. 'poll Star Wars', 'let's rate Dune'). NEVER post a poll on your own initiative — not when starting a game, not when a film is merely mentioned or discussed, not to revisit an earlier film. If they didn't clearly ask for a poll, don't call this. Pass year separately if the user gives one.",
@@ -4033,6 +4064,11 @@ def _dispatch_other_tool(name, tool_input, ctx):
         ctx["suppress_reply"] = True   # the bot posts its own card/prompt; no LLM echo
         return {"started": True}
     if name == "cancel_game":
+        if not _has_cancel_intent(ctx.get("text")):
+            log.info("cancel_game rejected: no cancel intent in %r", (ctx.get("text") or "")[:60])
+            return {"status": "forbidden", "changed": 0,
+                    "reason": "this message does not ask to cancel the game; do not cancel, "
+                              "just answer what was actually asked"}
         g = get_game(chat_id)
         if g and g.get("status") not in _TERMINAL_STATUS:
             _abandon_game(chat_id, g)
@@ -4229,6 +4265,137 @@ def _meta_command(text):
     return None
 
 
+# --------------------------------------------------------------------------- #
+# /shelf — deterministic shelf listing straight from lib# rows (no LLM).
+# --------------------------------------------------------------------------- #
+_SHELF_PHRASES = {"shelf", "my shelf", "what's on my shelf", "whats on my shelf",
+                  "моя полиця", "моя полка", "полиця", "полка"}
+_SHELF_COMMANDS = ("shelf", "movies")
+_TG_MAX_CHARS = 4096
+
+
+def _shelf_request(text):
+    """(True, target_or_None) if the message asks for a shelf listing, else (False, None).
+    /shelf, /shelf@<this bot>, '/shelf @user' / '/shelf Name', or an exact short phrase."""
+    t = (text or "").strip()
+    if t.startswith("/"):
+        head = t.split(None, 1)[0]
+        bot = head.split("@", 1)[1].lower() if "@" in head else ""
+        if bot and not bot.startswith("sirwatch"):
+            return False, None                      # a command for some other bot
+        cmd, rest = parse_command(t)
+        if cmd not in _SHELF_COMMANDS:
+            return False, None
+        return True, (rest or None)
+    norm = " ".join(t.lower().replace("’", "'").split())
+    norm = norm.rstrip("?!").strip()
+    return (norm in _SHELF_PHRASES), None
+
+
+def _shelf_rating(f):
+    def num(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+    lb = num(f.get("lb_rating"))
+    if lb is None and str(f.get("rating_scale")) == "5":
+        lb = num(f.get("rating"))
+    if lb is not None:
+        return f"{lb:.1f}★ LB"
+    r = num(f.get("rating"))
+    if r is not None and str(f.get("rating_scale")) == "10":
+        return f"TMDB {r:.1f}/10"
+    return None
+
+
+def _shelf_line(f):
+    title = f.get("title") or f.get("slug") or "?"
+    yr = str(f.get("year") or "").strip()
+    line = f"{title} ({yr})" if yr else title
+    rating = _shelf_rating(f)
+    if rating:
+        line += f" · {rating}"
+    if f.get("watched"):
+        line += " ✓"
+    return line
+
+
+def _split_for_telegram(lines, limit=_TG_MAX_CHARS):
+    """Pack lines into messages of at most `limit` chars, breaking only between lines."""
+    out, cur = [], ""
+    for ln in lines:
+        while len(ln) > limit:                      # a single absurd line: hard-wrap it
+            if cur:
+                out.append(cur)
+                cur = ""
+            out.append(ln[:limit])
+            ln = ln[limit:]
+        cand = f"{cur}\n{ln}" if cur else ln
+        if len(cand) > limit:
+            out.append(cur)
+            cur = ln
+        else:
+            cur = cand
+    if cur:
+        out.append(cur)
+    return out
+
+
+def shelf_messages(chat_id, caller_uid, target=None):
+    """The message(s) /shelf sends. Never truncates; splits at Telegram's limit."""
+    if target:
+        owner_key, name = resolve_owner(chat_id, target.strip())
+        if not owner_key:
+            return [f"I don't know anyone called {target.strip()} in this group."]
+    else:
+        owner_key, name = str(caller_uid), None
+    is_self = str(owner_key) == str(caller_uid)
+    if is_self and not name:
+        name = (_canonical_for_user(chat_id, caller_uid)
+                or (get_member(chat_id, caller_uid) or {}).get("display_name"))
+    films = get_library(chat_id, owner_key)          # sorted by added_at
+    if not films:
+        if not is_self:
+            return [f"{name or target.strip()}'s shelf is empty."]
+        msg = "Your shelf is empty — add a film with /movie <title>"
+        seed = _unclaimed_seed_for(chat_id, caller_uid)
+        if seed:
+            msg += f"\nThere's an unclaimed starter shelf for {seed}: say \"I'm {seed}\" to link it."
+        return [msg]
+    n = len(films)
+    owner = f"{name}'s" if name else "Your"
+    head = f"{owner} shelf — {n} film{'s' if n != 1 else ''}"
+    return _split_for_telegram([head] + [_shelf_line(f) for f in films])
+
+
+def _game_expects_input_from(game, uid):
+    """True while a live game is waiting on this sender's reply."""
+    if not game or game.get("status") in _TERMINAL_STATUS or uid is None:
+        return False
+    if game.get("phase") == "SELECTING":
+        cur = _current_selecting_uid(game)
+        return cur is not None and int(cur) == int(uid)
+    if game.get("phase") == "CONSTRAINTS" and game.get("constraints_open"):
+        return True
+    if game.get("awaiting_relax"):
+        return True
+    if game.get("phase") == "WILDCARD" and game.get("wildcard_open"):
+        return int(uid) in [int(p) for p in game.get("players") or []]
+    return False
+
+
+# cancel_game may only run when the CURRENT message asks to cancel/stop/end (code-enforced).
+_CANCEL_INTENT_RE = re.compile(
+    r"(\b(cancel\w*|stop\w*|end|ending|abort\w*|scrap|quit|call it off|kill)\b"
+    r"|скас|відмін|зупин|заверш|закінч|стоп"
+    r"|отмен|останов|прекрат|законч)", re.I)
+
+
+def _has_cancel_intent(text):
+    return bool(_CANCEL_INTENT_RE.search(text or ""))
+
+
 def _addressed_to_bot(text):
     """An @mention of the movie bot or a slash command — someone explicitly wants it."""
     t = (text or "").strip().lower()
@@ -4257,6 +4424,16 @@ def on_message(mode, ev):
         log.warning("game in %s/%s idle since %s: not gating a message addressed to the bot",
                     game.get("phase"), game.get("status"), game.get("last_activity_at"))
         game = None
+    # Deterministic shelf listing (/shelf, /movies, "shelf?"): read-only, before the LLM
+    # and the phase gates. A plain phrase still goes to the game when the game is waiting
+    # on THIS sender (their turn / an open window); a slash command always lists.
+    want_shelf, shelf_target = _shelf_request(text)
+    if want_shelf and not text.startswith("/") and _game_expects_input_from(game, uid):
+        want_shelf = False
+    if want_shelf:
+        for part in shelf_messages(chat_id, uid, shelf_target):
+            send_message(mode, chat_id, part)
+        return "handled:shelf"
     # Escape hatch FIRST: cancel / new game must work in ANY phase, including while we're
     # waiting on a player mid-turn (the phase branches below otherwise swallow the text).
     if text and game and game.get("status") not in _TERMINAL_STATUS:
@@ -4342,7 +4519,8 @@ def on_message(mode, ev):
     if not AI_ENABLED:
         return "ignored: AI disabled"
     ctx = {"chat_id": chat_id, "user_id": uid, "user_name": ev["user_name"],
-           "username": ev.get("username"), "mode": mode, "suppress_reply": False}
+           "username": ev.get("username"), "mode": mode, "suppress_reply": False,
+           "text": text}
     speaker = ev.get("user_name") or "Someone"
     prior = _convo_messages(_convo_load(chat_id))   # rolling window for referents
     # Only offer start_movie_night when the message contains an explicit game-start

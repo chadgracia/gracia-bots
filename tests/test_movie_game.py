@@ -2436,11 +2436,15 @@ def test_backfill_only_from_direct_invoke():
 _WEBHOOK_SECRET = "test-secret"
 
 
+_TEST_NAMES = {393306645: ("Dariia", "dariuozy"), 5: ("Khimka", "khimka")}
+
+
 def _furl_event(text, uid=1, update_id=1, secret=_WEBHOOK_SECRET):
+    first, uname = _TEST_NAMES.get(uid, ("Chad", "chad"))
     body = {"update_id": update_id, "message": {
         "message_id": update_id, "date": 0, "text": text,
         "chat": {"id": CHAT, "type": "group", "title": "MovieNight"},
-        "from": {"id": uid, "first_name": "Chad", "username": "chad"}}}
+        "from": {"id": uid, "first_name": first, "username": uname}}}
     return {"version": "2.0", "rawPath": "/movie", "rawQueryString": "",
             "headers": {"content-type": "application/json",
                         "x-telegram-bot-api-secret-token": secret},
@@ -2479,7 +2483,7 @@ def test_webhook_slash_command_replies_through_lambda_handler():
     _reset()
     out, sent, fb = _webhook("/movies", 501)
     assert out["statusCode"] == 200
-    assert fb.calls >= 1 and sent and sent[0][0] == "I'm here."
+    assert fb.calls == 0 and sent and sent[0][0].startswith("Your shelf is empty")
 
 
 def test_webhook_mention_replies_through_lambda_handler():
@@ -2592,6 +2596,190 @@ def test_history_names_participants():
     L.ddb_put({"PK": pk, "SK": "history#s1", "winner_title": "Mirror", "watched_date": "2026-11-01",
                "participants": [393306645]})
     assert L.get_history(CHAT)[0]["participant_names"] == ["Dariia"]
+
+
+
+# ---- /shelf, /movies and plain "shelf?" (deterministic, no LLM) ------------ #
+DARIIA = 393306645
+
+
+def _rated_shelf(uid, n, name="Dariia", username="dariuozy"):
+    _reset()
+    L.remember_member(CHAT, uid, name, username)
+    pk = L._pk(MODE, CHAT)
+    for i in range(n):
+        row = {"PK": pk, "SK": f"lib#{uid}#film-{i:03d}", "slug": f"film-{i:03d}",
+               "owner_id": uid, "title": f"Film number {i:03d} with a longish title",
+               "year": str(1950 + i % 70), "added_at": f"2026-01-01T00:{i // 60:02d}:{i % 60:02d}",
+               "watched": i % 7 == 0}
+        if i % 3 == 0:
+            row.update(rating="3.9", rating_scale=5, lb_rating="3.9")
+        elif i % 3 == 1:
+            row.update(rating="7.2", rating_scale=10)
+        STORE[(pk, row["SK"])] = row
+
+
+def _say(text, uid, update_id):
+    """Through lambda_handler; returns (sent texts, bedrock calls)."""
+    out, sent, fb = _webhook(text, update_id, uid=uid)
+    assert out["statusCode"] == 200
+    return [t for t, _m in sent], fb.calls
+
+
+def test_shelf_and_movies_list_28_rows_without_seedclaim():
+    for i, cmd in enumerate(("/shelf", "/movies", "/shelf@SirWatchedALot_bot",
+                             "/movies@SirWatchedALot_bot")):
+        _rated_shelf(DARIIA, 28)
+        assert not any(sk.startswith("seedclaim#") for (_p, sk) in STORE)
+        sent, calls = _say(cmd, DARIIA, 600 + i)
+        assert calls == 0, cmd
+        assert len(sent) == 1 and sent[0].startswith("Dariia's shelf — 28 films"), (cmd, sent)
+        lines = sent[0].split("\n")[1:]
+        assert len(lines) == 28
+        assert lines[0] == "Film number 000 with a longish title (1950) · 3.9★ LB ✓"
+        assert lines[1] == "Film number 001 with a longish title (1951) · TMDB 7.2/10"
+        assert lines[2] == "Film number 002 with a longish title (1952)"
+
+
+def test_plain_shelf_phrases_are_deterministic():
+    for i, phrase in enumerate(("Shelf?", "shelf", "MY SHELF!", "my shelf?",
+                                "What's on my shelf", "what’s on my shelf?",
+                                "моя полиця", "Моя полка?", "полиця?", "полка")):
+        _rated_shelf(DARIIA, 3)
+        sent, calls = _say(phrase, DARIIA, 620 + i)
+        assert calls == 0 and sent and sent[0].startswith("Dariia's shelf — 3 films"), phrase
+    for i, longer in enumerate(("what's on my shelf this week?", "shelf life of milk")):
+        _rated_shelf(DARIIA, 3)
+        sent, calls = _say(longer, DARIIA, 640 + i)
+        assert calls == 1, longer                         # goes to the model as before
+
+
+def test_shelf_for_another_member_by_username():
+    _rated_shelf(DARIIA, 28)
+    L.remember_member(CHAT, 1, "Chad", "chad")
+    for i, cmd in enumerate(("/shelf @dariuozy", "/shelf dariuozy", "/shelf Dariia")):
+        sent, calls = _say(cmd, 1, 660 + i)
+        assert calls == 0 and sent[0].startswith("Dariia's shelf — 28 films"), (cmd, sent)
+    sent, _ = _say("/shelf @nobody_here", 1, 670)
+    assert sent == ["I don't know anyone called @nobody_here in this group."]
+
+
+def test_142_film_shelf_splits_without_truncating():
+    _rated_shelf(1, 142, name="Chad", username="chad")
+    msgs = L.shelf_messages(CHAT, 1)
+    assert len(msgs) >= 2 and all(len(m) <= 4096 for m in msgs)
+    lines = "\n".join(msgs).split("\n")
+    assert lines[0] == "Chad's shelf — 142 films" and len(lines) == 143
+    assert lines[-1].startswith("Film number 141")
+    sent, calls = _say("/shelf", 1, 680)
+    assert sent == msgs and calls == 0
+
+
+def test_empty_shelf_offers_starter_only_when_unclaimed_seed_exists():
+    _reset()
+    L.remember_member(CHAT, 5, "Khimka", "khimka")
+    sent, _ = _say("/shelf", 5, 690)
+    assert sent == ["Your shelf is empty — add a film with /movie <title>"]
+    L.seed_starter_libraries(CHAT)
+    sent, _ = _say("/shelf", 5, 691)
+    assert sent[0].startswith("Your shelf is empty — add a film with /movie <title>")
+    assert "I'm Khimka" in sent[0]
+
+
+def test_game_waiting_on_sender_gets_plain_phrase_but_slash_still_lists():
+    _rated_shelf(DARIIA, 2)
+    g = L.new_game(CHAT, DARIIA)
+    g.update(phase="CONSTRAINTS", status="collecting", constraints_open=True,
+             constraints_deadline=10**12, players=[DARIIA])
+    STORE[(L._pk(MODE, CHAT), "game#current")] = g
+    assert L._game_expects_input_from(g, DARIIA)
+    assert L._shelf_request("/shelf") == (True, None)
+    sent, _ = _say("/shelf", DARIIA, 700)
+    assert sent and sent[0].startswith("Dariia's shelf — 2 films")
+    seen = []
+    saved = L._handle_constraints_message
+    L._handle_constraints_message = lambda mode, chat_id, game, text: seen.append(text)
+    try:
+        sent, calls = _say("shelf?", DARIIA, 701)     # the open window expects their reply
+    finally:
+        L._handle_constraints_message = saved
+    assert seen == ["shelf?"] and sent == [] and calls == 0
+
+
+def test_cancel_game_needs_cancel_intent_in_current_message():
+    _reset()
+    g = L.new_game(CHAT, 1)
+    STORE[(L._pk(MODE, CHAT), "game#current")] = g
+    ctx = {"chat_id": CHAT, "user_id": 1, "mode": MODE, "suppress_reply": False,
+           "text": "what's on tonight?"}
+    r = L._dispatch_tool("cancel_game", {}, ctx)
+    assert r["status"] == "forbidden" and not ctx["suppress_reply"]
+    assert STORE[(L._pk(MODE, CHAT), "game#current")]["status"] not in L._TERMINAL_STATUS
+    for t in ("Cancel the game", "stop the game pls", "скасуй гру", "отмени игру",
+              "зупини гру", "останови игру", "end it"):
+        assert L._has_cancel_intent(t), t
+    for t in ("/movies", "what's on my shelf", "add Mirror", "who won last week?"):
+        assert not L._has_cancel_intent(t), t
+
+
+def test_movies_after_cancel_message_never_calls_cancel_game():
+    _rated_shelf(1, 2, name="Chad", username="chad")
+    called = []
+    saved = L._abandon_game
+    L._abandon_game = lambda *a, **k: called.append(a)
+    try:
+        _say("Cancel the game", 1, 710)          # no game running -> model path
+        n_before = len(called)
+        sent, calls = _say("/movies", 1, 711)
+    finally:
+        L._abandon_game = saved
+    assert calls == 0 and len(called) == n_before
+    assert sent and sent[0].startswith("Chad's shelf — 2 films")
+    # and if the model tries cancel_game on a non-cancel message, code refuses it
+    _reset()
+    STORE[(L._pk(MODE, CHAT), "game#current")] = L.new_game(CHAT, 1)
+
+    class ToolBedrock:
+        def __init__(self):
+            self.n = 0
+
+        def converse(self, **kw):
+            self.n += 1
+            if self.n == 1:
+                return {"stopReason": "tool_use", "output": {"message": {
+                    "role": "assistant", "content": [{"toolUse": {
+                        "toolUseId": "c1", "name": "cancel_game", "input": {}}}]}}}
+            return {"stopReason": "end_turn", "output": {"message": {
+                "role": "assistant", "content": [{"text": "Here's what's on."}]}}}
+    ctx = {"chat_id": CHAT, "user_id": 1, "mode": MODE, "suppress_reply": False,
+           "text": "what are we watching?"}
+    saved_b = L._bedrock
+    L._bedrock = ToolBedrock()
+    try:
+        out = L.converse("sys", "Chad: what are we watching?", ctx)
+    finally:
+        L._bedrock = saved_b
+    assert out == "Here's what's on." and not ctx["suppress_reply"]
+    assert STORE[(L._pk(MODE, CHAT), "game#current")]["status"] not in L._TERMINAL_STATUS
+
+
+def test_register_commands_merges_shelf_and_movies():
+    calls = []
+
+    def fake_tg(token, method, payload):
+        calls.append((method, payload))
+        if method == "getMyCommands":
+            return {"ok": True, "result": [{"command": "draw", "description": "Draw"}]}
+        return {"ok": True}
+    saved = (L._tg_request, L._token_for)
+    L._tg_request, L._token_for = fake_tg, (lambda mode: "t")
+    try:
+        L._register_commands("movie")
+    finally:
+        L._tg_request, L._token_for = saved
+    setc = [p for m, p in calls if m == "setMyCommands"][0]["commands"]
+    assert [c["command"] for c in setc] == ["draw", "shelf", "movies"]
+    assert all(c["description"] == "Show your film shelf" for c in setc[1:])
 
 
 if __name__ == "__main__":

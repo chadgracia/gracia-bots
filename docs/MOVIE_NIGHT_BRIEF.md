@@ -42,9 +42,21 @@ the game selects **3 films from each participating player**. Concrete changes:
 
 - `/movie <title>` now adds to the **sender's own library** within this chat (attributed to the
   sender), not a shared group list.
-- Add `/library [@user]` (or `/movies`) to show the sender's library, or another player's if named.
-- A library can be large; never dump it all into one message — paginate or summarize. Selection of
-  3 happens at game time, in code.
+- `/shelf [@user | name]` and `/movies [@user | name]` (also with `@SirWatchedALot_bot`) list the
+  sender's library, or another member's if named (same member matching as `resolve_owner`:
+  @username, display name, first name, nickname alias). The plain messages "shelf", "my shelf",
+  "what's on my shelf", "моя полиця", "моя полка", "полиця", "полка" (case-insensitive, trailing
+  ?/! allowed) do the same. All of this is deterministic code, never the LLM, and runs before the
+  game-phase gates, except that a plain phrase goes to the game when the game is waiting on that
+  sender (their selection turn or an open window). Logged as `handled:shelf`.
+- Output: `<Name>'s shelf — N films`, then one line per film in `added_at` order:
+  `Title (Year) · 3.9★ LB`, `Title (Year) · TMDB 7.2/10`, or no rating; watched films end in ✓.
+  The full shelf is always listed, split across several messages at Telegram's 4096-character
+  limit (never truncated). An empty shelf replies "Your shelf is empty — add a film with
+  /movie <title>", plus a starter-shelf claim offer only if an unclaimed matching seed exists.
+- `cancel_game` may run only when the current message itself asks to cancel / stop / end
+  (English, Ukrainian or Russian keywords, checked in code); otherwise the tool returns
+  `forbidden` and the model answers normally. Selection of 3 films happens at game time, in code.
 - The game is a new, stateful, multi-message flow (sections 3–5).
 
 Keep `/draw` semantics (random pick **in code**, never the LLM) — the game's selection and pick
