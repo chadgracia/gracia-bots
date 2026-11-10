@@ -829,6 +829,10 @@ def lookup_film(title, year=None, skip_letterboxd=False):
         "countries": pick("countries") or [],
         "rating": rating,
         "rating_scale": rating_scale,
+        "rating_source": _rating_source(lb_rating, tmdb, omdb, lb, rating),
+        "lb_rating": lb_rating if lb_rating is not None else (lb or {}).get("rating_5"),
+        "tmdb_rating": (tmdb or {}).get("rating_10"),
+        "lb_checked_at": None if skip_letterboxd or not _tid else _now_epoch(),
         "rt_rating": (omdb or {}).get("rt_rating"),
         "alts": (tmdb or {}).get("alts") or [],
     }
@@ -838,23 +842,71 @@ def lookup_film(title, year=None, skip_letterboxd=False):
     return out
 
 
-def lookup_film_cached(title, year=None):
-    """lookup_film with a DynamoDB cache (JSON, to dodge float/Decimal). Cache key
-    includes the year so 'Dune' and 'Dune 1984' don't collide."""
-    key = f"filmcache#v3#{title.strip().lower()}#{year or ''}"
+def _rating_source(lb_rating, tmdb, omdb, lb, rating):
+    if rating is None:
+        return None
+    if lb_rating is not None:
+        return "letterboxd"
+    if tmdb and tmdb.get("rating_10") is not None:
+        return "tmdb"
+    if omdb and omdb.get("imdb_rating") is not None:
+        return "imdb"
+    return "letterboxd" if lb and lb.get("rating_5") is not None else None
+
+
+def _film_cache_key(title, year=None):
+    return f"filmcache#v3#{title.strip().lower()}#{year or ''}"
+
+
+def _film_cache_get(title, year=None):
+    """Cached lookup_film result for (title, year), or None. Read-only."""
     try:
-        cached = ddb_get(key, "ref")
+        cached = ddb_get(_film_cache_key(title, year), "ref")
         if cached and cached.get("json"):
             return json.loads(cached["json"])
     except Exception as e:
         log.warning("film cache read failed: %s", e)
+    return None
+
+
+def _film_cache_put(title, year, info):
+    try:
+        ddb_put({"PK": _film_cache_key(title, year), "SK": "ref",
+                 "json": json.dumps(info), "cached_at": _now_iso()})
+    except Exception as e:
+        log.warning("film cache write failed: %s", e)
+
+
+def _apply_lb_rating(info, lb):
+    """Make a Letterboxd average (0-5) the rating of a lookup result, in place."""
+    info["rating"], info["rating_scale"] = lb, 5
+    info["lb_rating"], info["rating_source"] = lb, "letterboxd"
+    return info
+
+
+# A cached /10 fallback (Letterboxd missed at first lookup) gets ONE more plain
+# Letterboxd fetch when someone actually asks about the film, at most once a day.
+_LB_RECHECK_SEC = 86400
+
+
+def lookup_film_cached(title, year=None, refresh_lb=False):
+    """lookup_film with a DynamoDB cache (JSON, to dodge float/Decimal). Cache key
+    includes the year so 'Dune' and 'Dune 1984' don't collide. refresh_lb=True (the
+    agent's lookup tool) retries Letterboxd once for a cached entry without a /5."""
+    info = _film_cache_get(title, year)
+    if info is not None:
+        if (refresh_lb and info.get("found") and info.get("rating_scale") != 5
+                and info.get("tmdb_id")
+                and _now_epoch() - int(info.get("lb_checked_at") or 0) >= _LB_RECHECK_SEC):
+            lb = _letterboxd_rating(info["tmdb_id"])
+            if lb is not None:
+                _apply_lb_rating(info, lb)
+            info["lb_checked_at"] = _now_epoch()
+            _film_cache_put(title, year, info)
+        return info
     info = lookup_film(title, year)
     if info.get("found"):
-        try:
-            ddb_put({"PK": key, "SK": "ref", "json": json.dumps(info),
-                     "cached_at": _now_iso()})
-        except Exception as e:
-            log.warning("film cache write failed: %s", e)
+        _film_cache_put(title, year, info)
     return info
 
 
@@ -3502,7 +3554,7 @@ def winner_note(title, year):
 # --------------------------------------------------------------------------- #
 MOVIE_TOOLS = [
     {"toolSpec": {"name": "lookup_film",
-                  "description": "Resolve a film via TMDB and return canonical title, year, genres, runtime, synopsis and a rating (★/10). Pass year separately when the user gives one; NEVER put the year inside title.",
+                  "description": "Look up ANY film — on a shelf or not — and return its canonical title, year, genres, runtime, synopsis and rating. The rating is the Letterboxd average out of 5 whenever Letterboxd has one (rating_source='letterboxd'), else TMDB out of 10 (rating_source='tmdb'); rating_label is the exact wording to use. ALWAYS call this for any question about a film's Letterboxd score, rating, runtime, year or details. Pass year separately when the user gives one; NEVER put the year inside title.",
                   "inputSchema": {"json": {"type": "object",
                                            "properties": {"title": {"type": "string"},
                                                           "year": {"type": "integer"}},
@@ -3638,6 +3690,12 @@ MOVIE_SYSTEM = (
     "- 'Recommend something', 'what should I watch', 'something like my shelf' → reach for "
     "real titles in your own words, with a point of view. Never refuse, and never punt to "
     "'add some films first' if they already have a shelf.\n"
+    "- FILM FACTS: any question about a film's Letterboxd score, rating, score, runtime, "
+    "length, year or details — ANY film, on a shelf or not — means you MUST call lookup_film "
+    "first and answer from its result, never from memory. Quote rating_label exactly as "
+    "returned: a Letterboxd average out of 5 when there is one, otherwise the TMDB score "
+    "clearly labelled as TMDB. You DO have Letterboxd: never say you can't pull, reach or "
+    "don't have Letterboxd scores. (Group star polls are different: see RATINGS.)\n"
     "- RATINGS: when anyone asks what they or someone rated a film, how a film was rated, "
     "about a score, or 'the poll we just did', you MUST call get_ratings and answer only from "
     "what it returns — never from memory. Pick whose by the question: 'what did I rate / my "
@@ -3866,13 +3924,29 @@ def _dispatch_shelf_tool(name, tool_input, ctx):
     return {"status": "error", "changed": 0, "error": f"unknown tool {name}"}
 
 
+def _rating_label(info):
+    """The rating exactly as the agent must say it — code labels the source."""
+    r, scale = info.get("rating"), info.get("rating_scale")
+    if r in (None, ""):
+        return None
+    try:
+        r = float(r)
+    except (TypeError, ValueError):
+        return None
+    if scale == 5:
+        return f"{r:.1f}/5 on Letterboxd"
+    src = {"tmdb": "TMDB", "imdb": "IMDb"}.get(info.get("rating_source") or "tmdb", "TMDB")
+    return f"{src} {r:.1f}/10"
+
+
 def _dispatch_other_tool(name, tool_input, ctx):
     chat_id, uid, mode = ctx["chat_id"], ctx.get("user_id"), ctx["mode"]
     if name == "lookup_film":
-        info = lookup_film_cached(tool_input["title"], tool_input.get("year"))
+        info = lookup_film_cached(tool_input["title"], tool_input.get("year"),
+                                  refresh_lb=True)
         if info.get("found"):   # remember it so a follow-up "yes/add it" can bind
             _set_pending(chat_id, uid, info["title"], info.get("year"))
-        return info
+        return {**info, "rating_label": _rating_label(info)}
     if name == "list_library":
         whose = (tool_input or {}).get("whose")
         if whose:                                  # another person, by name/handle
@@ -4008,7 +4082,23 @@ def recommend_films(chat_id, owner_key, owner_label):
             "candidates": candidates}
 
 
-def converse(system_prompt, user_text, ctx, tools=MOVIE_TOOLS, max_turns=6, prior=None):
+# A film-fact question addressed to the bot (or naming a rating site) must be
+# answered from lookup_film, never model memory. If the model answers without any
+# tool on the first round, code re-asks once with a tool call required.
+_FILM_FACT_RE = re.compile(
+    r"\b(letterboxd|imdb|tmdb|rating|rated|score|runtime|how long|what year|"
+    r"which year|released|who directed|director)\b", re.I)
+
+
+def _needs_film_lookup(text):
+    t = (text or "").lower()
+    if not _FILM_FACT_RE.search(t):
+        return False
+    return any(k in t for k in ("letterboxd", "imdb", "tmdb", "@sirwatch"))
+
+
+def converse(system_prompt, user_text, ctx, tools=MOVIE_TOOLS, max_turns=6, prior=None,
+             require_tool=False):
     """Run the Bedrock tool-use loop; return the model's final text. `prior` is the
     rolling conversation window (alternating messages) prepended for context; the
     current user turn is merged onto it so roles stay strictly alternating."""
@@ -4018,12 +4108,19 @@ def converse(system_prompt, user_text, ctx, tools=MOVIE_TOOLS, max_turns=6, prio
         messages[-1]["content"].extend(cur["content"])
     else:
         messages.append(cur)
-    for _ in range(max_turns):
+    for turn in range(max_turns):
         resp = _bedrock.converse(
             modelId=BEDROCK_MODEL_ID, system=[{"text": system_prompt}],
             messages=messages, inferenceConfig={"maxTokens": 1000, "temperature": 0.5},
             toolConfig={"tools": tools},
         )
+        if turn == 0 and require_tool and resp.get("stopReason") != "tool_use":
+            log.info("film-fact question answered without a tool; re-asking with toolChoice=any")
+            resp = _bedrock.converse(
+                modelId=BEDROCK_MODEL_ID, system=[{"text": system_prompt}],
+                messages=messages, inferenceConfig={"maxTokens": 1000, "temperature": 0.5},
+                toolConfig={"tools": tools, "toolChoice": {"any": {}}},
+            )
         out = resp["output"]["message"]
         messages.append(out)
         if resp.get("stopReason") != "tool_use":
@@ -4166,7 +4263,8 @@ def on_message(mode, ev):
         t for t in MOVIE_TOOLS if t["toolSpec"]["name"] != "start_movie_night"
     ]
     try:
-        reply = converse(MOVIE_SYSTEM, f"{speaker}: {text}", ctx, tools=_tools, prior=prior)
+        reply = converse(MOVIE_SYSTEM, f"{speaker}: {text}", ctx, tools=_tools, prior=prior,
+                         require_tool=_needs_film_lookup(text))
     except Exception as e:
         log.error("bedrock movie failed: %s", e)
         return
@@ -4434,6 +4532,118 @@ def migrate_group(old_chat=None, new_chat=None, uid_map=None, dry_run=True, **_i
     return report
 
 
+# --------------------------------------------------------------------------- #
+# Letterboxd backfill (admin only). Direct console invoke, same gate as
+# admin_migrate: {"admin_backfill_lb": {"chat": -5160106592, "limit": 50,
+# "dry_run": true}}. Shelf rows whose rating isn't a Letterboxd /5 get ONE plain
+# ScraperAPI fetch each (no premium params, no retries — free plan). A failure
+# leaves the row untouched. Re-run until remaining == 0; pass start_after (the
+# previous report's next_start_after) to skip past titles that keep failing.
+# --------------------------------------------------------------------------- #
+_BACKFILL_TIME_RESERVE_MS = 30000   # stop before a fetch could outlive the Lambda
+
+
+def ddb_update_fields(pk, sk, fields):
+    """SET only the given attributes on an existing row (nothing else is rewritten)."""
+    names = {f"#k{i}": k for i, k in enumerate(fields)}
+    values = {f":v{i}": v for i, v in enumerate(fields.values())}
+    _table.update_item(
+        Key={"PK": pk, "SK": sk},
+        UpdateExpression="SET " + ", ".join(f"#k{i} = :v{i}" for i in range(len(fields))),
+        ExpressionAttributeNames=names, ExpressionAttributeValues=values,
+        ConditionExpression="attribute_exists(PK)")
+
+
+def _lb_backfill_candidate(row):
+    if not str(row.get("SK", "")).startswith("lib#"):
+        return False
+    if row.get("rating") in (None, ""):
+        return True
+    try:
+        return int(row.get("rating_scale")) != 5
+    except (TypeError, ValueError):
+        return True
+
+
+def _lb_backfill_one(row):
+    """(rating, None) on success or (None, reason). At most ONE Letterboxd fetch."""
+    title, year = row.get("title") or "", (row.get("year") or None)
+    cached = _film_cache_get(title, year)
+    if cached and cached.get("rating_scale") == 5 and cached.get("rating") is not None:
+        return float(cached["rating"]), None               # cache already has the /5
+    tmdb_id = row.get("tmdb_id") or (cached or {}).get("tmdb_id")
+    if not tmdb_id:
+        info = lookup_film(title, year, skip_letterboxd=True)   # TMDB/OMDb only
+        tmdb_id = info.get("tmdb_id") if info.get("found") else None
+    if not tmdb_id:
+        return None, "no TMDB match"
+    lb = _letterboxd_rating(tmdb_id)                         # the one plain fetch
+    if lb is None:
+        return None, "no Letterboxd rating"
+    if cached:                                               # keep the cache in step
+        cached["tmdb_id"] = cached.get("tmdb_id") or tmdb_id
+        cached["lb_checked_at"] = _now_epoch()
+        _film_cache_put(title, year, _apply_lb_rating(cached, lb))
+    return lb, None
+
+
+def backfill_lb(chat=None, limit=50, dry_run=True, start_after=None, context=None,
+                **_ignored):
+    """Give shelf rows in one group their Letterboxd /5. Returns a report dict."""
+    if chat is None:
+        return {"error": "chat is required"}
+    try:
+        limit = max(1, min(int(limit), 200))
+    except (TypeError, ValueError):
+        limit = 50
+    pk = _pk("movie", int(chat))
+    cands = sorted((r for r in ddb_query(pk) if _lb_backfill_candidate(r)),
+                   key=lambda r: str(r["SK"]))
+    total = len(cands)
+    queue = [r for r in cands if not start_after or str(r["SK"]) > str(start_after)]
+    if dry_run is not False:
+        return {"dry_run": True, "chat": int(chat), "candidates_total": total,
+                "would_attempt": min(limit, len(queue)),
+                "candidates": [{"title": r.get("title"), "year": r.get("year"),
+                                "sk": r["SK"], "rating": r.get("rating"),
+                                "rating_scale": r.get("rating_scale")} for r in queue]}
+    attempted, updated, failed, last_sk, out_of_time = 0, 0, [], None, False
+    for row in queue[:limit]:
+        if (context is not None and hasattr(context, "get_remaining_time_in_millis")
+                and context.get_remaining_time_in_millis() < _BACKFILL_TIME_RESERVE_MS):
+            out_of_time = True
+            break
+        attempted += 1
+        last_sk = row["SK"]
+        try:
+            lb, reason = _lb_backfill_one(row)
+        except Exception as e:  # noqa: BLE001 — one bad row never stops the run
+            lb, reason = None, f"error: {e}"
+        if lb is None:
+            failed.append({"title": row.get("title"), "year": row.get("year"),
+                           "reason": reason})
+            continue
+        try:
+            ddb_update_fields(pk, row["SK"], {"rating": str(lb), "rating_scale": 5,
+                                              "lb_rating": str(lb)})
+            updated += 1
+        except Exception as e:  # noqa: BLE001
+            failed.append({"title": row.get("title"), "year": row.get("year"),
+                           "reason": f"write failed: {e}"})
+    report = {"dry_run": False, "chat": int(chat), "candidates_total": total,
+              "attempted": attempted, "updated": updated, "failed": len(failed),
+              "failed_titles": failed, "remaining": total - updated,
+              "next_start_after": last_sk, "stopped_for_time": out_of_time}
+    log.info("backfill_lb report: %s", json.dumps(report, default=str)[:4000])
+    return report
+
+
+def _admin_backfill_event(event):
+    """True only for a direct (IAM-gated) console invoke — never a Function URL call."""
+    return (isinstance(event, dict) and "admin_backfill_lb" in event
+            and "rawPath" not in event and "requestContext" not in event)
+
+
 def _admin_migrate_event(event):
     """True only for a direct (IAM-gated) console invoke — never a Function URL call."""
     return (isinstance(event, dict) and "admin_migrate" in event
@@ -4460,6 +4670,10 @@ def lambda_handler(event, context):
     if _admin_migrate_event(event):
         params = event.get("admin_migrate")
         report = migrate_group(**(params if isinstance(params, dict) else {}))
+        return {"statusCode": 200, "body": json.dumps(report, default=str)}
+    if _admin_backfill_event(event):
+        params = event.get("admin_backfill_lb")
+        report = backfill_lb(**(params if isinstance(params, dict) else {}), context=context)
         return {"statusCode": 200, "body": json.dumps(report, default=str)}
     # Scheduled (EventBridge) invocation: no Telegram path/secret — dispatch by the
     # top-level `task` marker and return before the webhook-only checks below.

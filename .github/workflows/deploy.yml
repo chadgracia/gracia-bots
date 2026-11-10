@@ -17,4 +17,11 @@ jobs:
       - run: |
           zip -j function.zip lambda_function.py
           aws lambda update-function-code --function-name gracia-bots --zip-file fileb://function.zip \
-            --query '{State:State,LastUpdateStatus:LastUpdateStatus,Runtime:Runtime,MemorySize:MemorySize,Timeout:Timeout}' --output json
+            --query '{State:State,LastUpdateStatus:LastUpdateStatus,Runtime:Runtime,MemorySize:MemorySize,Timeout:Timeout,CodeSha256:CodeSha256}' --output json | tee deploy.json
+          # Prove the deployed package is byte-for-byte this commit's lambda_function.py.
+          LOCAL_SHA=$(openssl dgst -sha256 -binary function.zip | base64)
+          REMOTE_SHA=$(python3 -c "import json;print(json.load(open('deploy.json'))['CodeSha256'])")
+          echo "local  CodeSha256: $LOCAL_SHA"
+          echo "remote CodeSha256: $REMOTE_SHA"
+          echo "commit lambda_function.py sha256: $(sha256sum lambda_function.py | cut -d' ' -f1)"
+          test "$LOCAL_SHA" = "$REMOTE_SHA"

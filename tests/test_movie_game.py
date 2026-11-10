@@ -2185,6 +2185,252 @@ def test_correct_film_not_on_shelf_is_not_found():
     assert r["status"] == "not_found" and r["changed"] == 0
 
 
+
+# ---- Letterboxd: film-fact lookups + admin_backfill_lb --------------------- #
+def _lb_stub(results):
+    """Stub the single Letterboxd fetch; records every tmdb_id fetched."""
+    calls = []
+
+    def fake(tmdb_id):
+        calls.append(tmdb_id)
+        return results.get(tmdb_id)
+    return fake, calls
+
+
+def _real_cached():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "lf_real", os.path.join(os.path.dirname(__file__), "..", "lambda_function.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.lookup_film_cached
+
+
+_REAL_CACHED_FN = _real_cached()
+
+
+def _with_real_cached(fn):
+    """Run fn with the module's real lookup_film_cached bound to L's globals."""
+    real = types.FunctionType(_REAL_CACHED_FN.__code__, L.__dict__, "lookup_film_cached",
+                              _REAL_CACHED_FN.__defaults__)
+    saved = L.lookup_film_cached
+    L.lookup_film_cached = real
+    try:
+        return fn()
+    finally:
+        L.lookup_film_cached = saved
+
+
+def test_lookup_tool_is_offered_and_demands_lookup_for_film_facts():
+    names = [t["toolSpec"]["name"] for t in L.MOVIE_TOOLS]
+    assert "lookup_film" in names
+    desc = next(t for t in L.MOVIE_TOOLS if t["toolSpec"]["name"] == "lookup_film")
+    d = desc["toolSpec"]["description"]
+    assert "Letterboxd" in d and "ALWAYS call" in d
+    assert "FILM FACTS" in L.MOVIE_SYSTEM and "MUST call lookup_film" in L.MOVIE_SYSTEM
+    assert "never say you can't pull" in L.MOVIE_SYSTEM
+
+
+def test_film_fact_question_detection():
+    q = "@SirWatchedALot_bot can you give Letterboxd score for varda's vagabond?"
+    assert L._needs_film_lookup(q)
+    assert L._needs_film_lookup("what's the imdb rating on Heat")
+    assert not L._needs_film_lookup("what did I rate Persona")      # star polls: get_ratings
+    assert not L._needs_film_lookup("anyone free saturday?")
+
+
+def test_converse_forces_a_tool_when_film_fact_answered_from_memory():
+    _reset()
+    seen = []
+    replies = [
+        {"stopReason": "end_turn", "output": {"message": {"role": "assistant", "content": [
+            {"text": "I don't have Letterboxd scores to hand"}]}}},
+        {"stopReason": "tool_use", "output": {"message": {"role": "assistant", "content": [
+            {"toolUse": {"toolUseId": "t1", "name": "lookup_film",
+                         "input": {"title": "Vagabond", "year": 1985}}}]}}},
+        {"stopReason": "end_turn", "output": {"message": {"role": "assistant", "content": [
+            {"text": "Vagabond (1985) sits at 4.1/5 on Letterboxd."}]}}},
+    ]
+
+    class FakeBedrock:
+        def converse(self, **kw):
+            seen.append(kw["toolConfig"].get("toolChoice"))
+            return replies[len(seen) - 1]
+    saved_b, saved_l = L._bedrock, L.lookup_film_cached
+    L._bedrock = FakeBedrock()
+    L.lookup_film_cached = lambda t, y=None, refresh_lb=False: {
+        "found": True, "title": "Vagabond", "year": "1985", "tmdb_id": 44018,
+        "rating": 4.1, "rating_scale": 5, "rating_source": "letterboxd"}
+    try:
+        ctx = {"chat_id": CHAT, "user_id": 1, "mode": MODE}
+        out = L.converse("sys", "Chad: letterboxd score for vagabond?", ctx,
+                         require_tool=True)
+    finally:
+        L._bedrock, L.lookup_film_cached = saved_b, saved_l
+    assert seen[0] is None and seen[1] == {"any": {}}
+    assert "4.1/5 on Letterboxd" in out
+
+
+def test_lookup_tool_labels_letterboxd_and_tmdb_fallback():
+    _reset()
+    saved = L.lookup_film_cached
+    try:
+        L.lookup_film_cached = lambda t, y=None, refresh_lb=False: {
+            "found": True, "title": "Vagabond", "year": "1985", "rating": 4.05,
+            "rating_scale": 5, "rating_source": "letterboxd"}
+        r = L._dispatch_tool("lookup_film", {"title": "Vagabond"},
+                             {"chat_id": CHAT, "user_id": 1, "mode": MODE})
+        assert r["rating_label"].endswith("/5 on Letterboxd")
+        L.lookup_film_cached = lambda t, y=None, refresh_lb=False: {
+            "found": True, "title": "Obscure", "year": "1999", "rating": 7.2,
+            "rating_scale": 10, "rating_source": "tmdb"}
+        r = L._dispatch_tool("lookup_film", {"title": "Obscure"},
+                             {"chat_id": CHAT, "user_id": 1, "mode": MODE})
+        assert r["rating_label"] == "TMDB 7.2/10"
+    finally:
+        L.lookup_film_cached = saved
+
+
+def test_cached_tmdb_fallback_gets_one_letterboxd_retry_then_daily_cap():
+    _reset()
+    key = L._film_cache_key("vagabond", None)
+    STORE[(key, "ref")] = {"PK": key, "SK": "ref", "json": json.dumps({
+        "found": True, "title": "Vagabond", "year": "1985", "tmdb_id": 44018,
+        "rating": 7.6, "rating_scale": 10, "rating_source": "tmdb"})}
+    fake, calls = _lb_stub({44018: 4.1})
+    saved = L._letterboxd_rating
+    L._letterboxd_rating = fake
+    try:
+        info = _with_real_cached(lambda: L.lookup_film_cached("vagabond", refresh_lb=True))
+        assert info["rating"] == 4.1 and info["rating_scale"] == 5
+        assert info["rating_source"] == "letterboxd" and calls == [44018]
+        again = _with_real_cached(lambda: L.lookup_film_cached("vagabond", refresh_lb=True))
+        assert again["rating_scale"] == 5 and calls == [44018]       # cached now, no fetch
+        # a miss is not refetched again within the day
+        STORE[(key, "ref")]["json"] = json.dumps({
+            "found": True, "title": "Vagabond", "tmdb_id": 1, "rating": 7.0,
+            "rating_scale": 10})
+        L._letterboxd_rating, calls2 = _lb_stub({})
+        _with_real_cached(lambda: L.lookup_film_cached("vagabond", refresh_lb=True))
+        _with_real_cached(lambda: L.lookup_film_cached("vagabond", refresh_lb=True))
+        assert calls2 == [1]
+    finally:
+        L._letterboxd_rating = saved
+
+
+BF_CHAT = -5160106592
+
+
+def _bf_rows():
+    pk = L._pk(MODE, BF_CHAT)
+    rows = [
+        {"SK": "lib#1#vagabond", "title": "Vagabond", "year": "1985", "tmdb_id": 44018,
+         "rating": "7.6", "rating_scale": 10},
+        {"SK": "lib#1#heat", "title": "Heat", "year": "1995", "tmdb_id": 949,
+         "rating": None, "rating_scale": None},
+        {"SK": "lib#2#obscure", "title": "Obscure", "year": "1999", "tmdb_id": 7,
+         "rating": "6.0", "rating_scale": 10},
+        {"SK": "lib#2#done", "title": "Done", "year": "2000", "tmdb_id": 8,
+         "rating": "4.2", "rating_scale": 5},
+        {"SK": "history#x", "title": "Not a shelf row"},
+    ]
+    for r in rows:
+        STORE[(pk, r["SK"])] = {"PK": pk, **r}
+    return pk
+
+
+def _bf_update(pk, sk, fields):
+    STORE[(pk, sk)].update(fields)
+
+
+def test_backfill_dry_run_lists_candidates_without_fetching():
+    _reset()
+    _bf_rows()
+    fake, calls = _lb_stub({44018: 4.1})
+    saved = L._letterboxd_rating
+    L._letterboxd_rating = fake
+    try:
+        out = L.lambda_handler({"admin_backfill_lb": {"chat": BF_CHAT, "dry_run": True}}, None)
+    finally:
+        L._letterboxd_rating = saved
+    rep = json.loads(out["body"])
+    assert rep["dry_run"] is True and rep["candidates_total"] == 3
+    assert sorted(c["title"] for c in rep["candidates"]) == ["Heat", "Obscure", "Vagabond"]
+    assert calls == []
+
+
+def test_backfill_updates_successes_and_leaves_failures_untouched():
+    _reset()
+    pk = _bf_rows()
+    before_obscure = copy.deepcopy(STORE[(pk, "lib#2#obscure")])
+    fake, calls = _lb_stub({44018: 4.1, 949: 4.3})
+    saved = (L._letterboxd_rating, L.ddb_update_fields)
+    L._letterboxd_rating, L.ddb_update_fields = fake, _bf_update
+    try:
+        out = L.lambda_handler({"admin_backfill_lb": {"chat": BF_CHAT, "limit": 50,
+                                                       "dry_run": False}}, None)
+    finally:
+        L._letterboxd_rating, L.ddb_update_fields = saved
+    rep = json.loads(out["body"])
+    assert rep["candidates_total"] == 3 and rep["attempted"] == 3
+    assert rep["updated"] == 2 and rep["failed"] == 1 and rep["remaining"] == 1
+    assert rep["failed_titles"][0]["title"] == "Obscure"
+    assert sorted(calls) == [7, 949, 44018]                 # exactly one fetch per title
+    v = STORE[(pk, "lib#1#vagabond")]
+    assert v["rating"] == "4.1" and v["rating_scale"] == 5 and v["lb_rating"] == "4.1"
+    assert STORE[(pk, "lib#2#obscure")] == before_obscure
+    assert STORE[(pk, "lib#2#done")]["rating"] == "4.2"     # non-candidate untouched
+
+
+def test_backfill_respects_limit_and_reports_remaining():
+    _reset()
+    _bf_rows()
+    fake, calls = _lb_stub({44018: 4.1, 949: 4.3, 7: 3.0})
+    saved = (L._letterboxd_rating, L.ddb_update_fields)
+    L._letterboxd_rating, L.ddb_update_fields = fake, _bf_update
+    try:
+        rep = L.backfill_lb(chat=BF_CHAT, limit=1, dry_run=False)
+    finally:
+        L._letterboxd_rating, L.ddb_update_fields = saved
+    assert rep["attempted"] == 1 and rep["updated"] == 1 and rep["remaining"] == 2
+    assert len(calls) == 1 and rep["next_start_after"]
+
+
+def test_backfill_uses_cached_letterboxd_rating_without_fetching():
+    _reset()
+    pk = _bf_rows()
+    key = L._film_cache_key("Vagabond", "1985")
+    STORE[(key, "ref")] = {"PK": key, "SK": "ref", "json": json.dumps(
+        {"found": True, "tmdb_id": 44018, "rating": 4.1, "rating_scale": 5})}
+    fake, calls = _lb_stub({949: 4.3})
+    saved = (L._letterboxd_rating, L.ddb_update_fields)
+    L._letterboxd_rating, L.ddb_update_fields = fake, _bf_update
+    try:
+        rep = L.backfill_lb(chat=BF_CHAT, limit=50, dry_run=False)
+    finally:
+        L._letterboxd_rating, L.ddb_update_fields = saved
+    assert 44018 not in calls                                # served from filmcache
+    assert STORE[(pk, "lib#1#vagabond")]["rating"] == "4.1"
+    assert rep["updated"] == 2 and rep["failed"] == 1
+
+
+def test_backfill_only_from_direct_invoke():
+    _reset()
+    _bf_rows()
+    called = []
+    saved = L.backfill_lb
+    L.backfill_lb = lambda **k: called.append(k) or {}
+    try:
+        for ev in ({"admin_backfill_lb": {"chat": BF_CHAT}, "rawPath": "/movie"},
+                   {"admin_backfill_lb": {"chat": BF_CHAT}, "requestContext": {}}):
+            L.lambda_handler(ev, None)
+        assert called == []
+        L.lambda_handler({"admin_backfill_lb": {"chat": BF_CHAT}}, None)
+        assert len(called) == 1
+    finally:
+        L.backfill_lb = saved
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
