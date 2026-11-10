@@ -1497,9 +1497,9 @@ def test_unanimous_fine_finalizes_without_clock():
 
 
 def test_token_regex_catches_truncation():
-    assert L._TOKEN_RE.match("8846476802:AAEGfNsuU8hTTcM31ZiNJSmygDBmoaBVzTk")
-    assert not L._TOKEN_RE.match(":AAEGfNsuU8hTTcM31ZiNJSmygDBmoaBVzTk")   # lost bot-id
-    assert not L._TOKEN_RE.match("8846476802AAEGfNsuU8hTTcM31ZiNJSmygDB")  # lost colon
+    assert L._TOKEN_RE.match("1234567890:AAFakeTokenForTestsOnly000000000000")
+    assert not L._TOKEN_RE.match(":AAFakeTokenForTestsOnly000000000000")   # lost bot-id
+    assert not L._TOKEN_RE.match("1234567890AAFakeTokenForTestsOnly000")  # lost colon
     assert not L._TOKEN_RE.match("123:short")                              # too short
 
 
@@ -1830,6 +1830,239 @@ def test_no_shelf_prompt_for_house_winner_on_vote():
     pid = _rating_polls()[0]["SK"]
     L.handle_movie(MODE, poll_answer(1, pid, [4]))
     assert not any("take it off your shelf" in t for t, _m in SENT)
+
+
+# ---- one-off group migration (admin_migrate) ------------------------------ #
+from decimal import Decimal as _D  # noqa: E402
+
+OLD, NEW, CHAD_OLD, CHAD_NEW = -5184764745, -5160106592, 537834437, 8999003543
+L._ddb_query_raw = fake_query
+L._ddb_scan_raw = fake_scan
+
+
+def _mig_seed():
+    _reset()
+    opk, npk = L._pk(MODE, OLD), L._pk(MODE, NEW)
+    rows = [
+        {"PK": opk, "SK": "chat", "chat_id": OLD},
+        {"PK": opk, "SK": "dedupe#1"},
+        {"PK": opk, "SK": "convo#log", "turns": []},
+        {"PK": opk, "SK": "pending#1", "title": "x"},
+        {"PK": opk, "SK": "watch_followup", "session_id": "s"},
+        {"PK": opk, "SK": "game#current", "players": [CHAD_OLD]},
+        {"PK": opk, "SK": f"member#{CHAD_OLD}", "user_id": CHAD_OLD},
+        {"PK": opk, "SK": "member#42", "user_id": 42, "display_name": "Asa"},
+        {"PK": opk, "SK": f"lib#{CHAD_OLD}#rear-window", "slug": "rear-window",
+         "owner_id": _D(CHAD_OLD), "added_by_id": str(CHAD_OLD), "title": "Rear Window",
+         "rating": "4.1"},
+        {"PK": opk, "SK": f"lib#{CHAD_OLD}#mirror", "slug": "mirror",
+         "owner_id": CHAD_OLD, "title": "Mirror"},
+        {"PK": opk, "SK": "lib#42#poetry", "slug": "poetry", "owner_id": 42, "title": "Poetry"},
+        {"PK": opk, "SK": "history#s1", "winner_owner_id": CHAD_OLD,
+         "participants": [CHAD_OLD, 42], "players": {str(CHAD_OLD), "42"},
+         "ratings": {str(CHAD_OLD): 5, "42": 3},
+         "pool": [{"owner": str(CHAD_OLD), "slug": "mirror"}],
+         "initiator": "1537834437"},                       # not an exact match: untouched
+        {"PK": opk, "SK": f"rating#s1#{CHAD_OLD}", "user_id": CHAD_OLD, "stars": 5},
+        {"PK": opk, "SK": "seedclaim#chad", "claimed_by": CHAD_OLD},
+        {"PK": "ratingpoll", "SK": "p1", "chat_id": OLD,
+         "participant_user_ids": [CHAD_OLD, 42]},
+        {"PK": "ratingpoll", "SK": "p2", "chat_id": -999, "participant_user_ids": [CHAD_OLD]},
+        {"PK": "pollmap#p3", "SK": "ref", "chat_id": _D(OLD), "film": {"owner": str(CHAD_OLD)}},
+        # junk in the new group
+        {"PK": npk, "SK": "chat", "chat_id": NEW},
+        {"PK": npk, "SK": f"member#{CHAD_NEW}", "user_id": CHAD_NEW},
+        {"PK": npk, "SK": "dedupe#9"},
+        {"PK": npk, "SK": f"lib#{CHAD_NEW}#red-river", "slug": "red-river"},
+        {"PK": npk, "SK": "lib#seed:asa#poetry", "slug": "poetry"},
+        {"PK": npk, "SK": "seedclaim#chad", "claimed_by": CHAD_NEW},
+        {"PK": npk, "SK": "history#junk"}, {"PK": npk, "SK": "rating#junk#1"},
+        {"PK": npk, "SK": "pending#1"}, {"PK": npk, "SK": "game#current"},
+        {"PK": npk, "SK": "watch_followup"}, {"PK": npk, "SK": "wildcardlog"},
+        {"PK": npk, "SK": "convo#log"},
+        {"PK": L._pk(MODE, CHAD_OLD), "SK": "lib#x", "owner_id": CHAD_OLD},   # DM partition
+    ]
+    for r in rows:
+        STORE[(r["PK"], r["SK"])] = r
+
+
+def test_remap_uids_sk_nested_and_map_keys():
+    m = {CHAD_OLD: CHAD_NEW}
+    assert L._remap_sk(f"lib#{CHAD_OLD}#mirror", m) == f"lib#{CHAD_NEW}#mirror"
+    assert L._remap_sk(f"rating#s{CHAD_OLD}#{CHAD_OLD}", m) == f"rating#s{CHAD_OLD}#{CHAD_NEW}"
+    v = L._remap_uids({str(CHAD_OLD): [CHAD_OLD, _D(CHAD_OLD), str(CHAD_OLD), 7,
+                                       {"x": {CHAD_OLD}}], "k": "15378344370", "b": True}, m)
+    assert v == {str(CHAD_NEW): [CHAD_NEW, _D(CHAD_NEW), str(CHAD_NEW), 7, {"x": {CHAD_NEW}}],
+                 "k": "15378344370", "b": True}
+
+
+def test_migrate_dry_run_writes_nothing_and_reports():
+    _mig_seed()
+    before = copy.deepcopy(STORE)
+    rep = L.migrate_group()                     # defaults: dry run
+    assert STORE == before
+    assert rep["dry_run"] is True
+    assert rep["chad_lib_under_new_uid"] == 2 and rep["new_group_lib_rows"] == 3
+    assert rep["new_group_history_rows"] == 1 and rep["new_group_rating_rows"] == 1
+    assert rep["C_updated"] == {"ratingpoll": 1, "pollmap": 1}
+    assert rep["D_old_chat_row_deleted"] is True
+    assert len(rep["samples"]) == 3
+    json.dumps(rep)                             # console-printable
+    # explicit non-False still dry
+    assert L.migrate_group(dry_run="false")["dry_run"] is True and STORE == before
+
+
+def test_migrate_step_a_keep_delete_lists():
+    _mig_seed()
+    rep = L.migrate_group(dry_run=False)
+    npk = L._pk(MODE, NEW)
+    assert rep["A_deleted"] == {"convo": 1, "game": 1, "history": 1, "lib": 2, "pending": 1,
+                                "rating": 1, "seedclaim": 1, "watch_followup": 1,
+                                "wildcardlog": 1}
+    sks = {s for (p, s) in STORE if p == npk}
+    assert {"chat", f"member#{CHAD_NEW}", "dedupe#9"} <= sks          # kept
+    assert STORE[(npk, "chat")]["chat_id"] == NEW
+    for gone in (f"lib#{CHAD_NEW}#red-river", "lib#seed:asa#poetry", "history#junk",
+                 "rating#junk#1", "pending#1", "game#current", "watch_followup",
+                 "wildcardlog", "convo#log"):
+        assert gone not in sks, gone
+
+
+def test_migrate_real_run_copies_remaps_and_is_rerunnable():
+    _mig_seed()
+    L.migrate_group(dry_run=False)
+    opk, npk = L._pk(MODE, OLD), L._pk(MODE, NEW)
+    sks = {s for (p, s) in STORE if p == npk}
+    assert f"member#{CHAD_OLD}" not in sks and "member#42" in sks
+    assert "seedclaim#chad" in sks and STORE[(npk, "seedclaim#chad")]["claimed_by"] == CHAD_NEW
+    lib = STORE[(npk, f"lib#{CHAD_NEW}#rear-window")]
+    assert lib["owner_id"] == _D(CHAD_NEW) and lib["added_by_id"] == str(CHAD_NEW)
+    assert lib["rating"] == "4.1"
+    h = STORE[(npk, "history#s1")]
+    assert h["winner_owner_id"] == CHAD_NEW and h["participants"] == [CHAD_NEW, 42]
+    assert h["players"] == {str(CHAD_NEW), "42"}
+    assert h["ratings"] == {str(CHAD_NEW): 5, "42": 3}
+    assert h["pool"][0]["owner"] == str(CHAD_NEW) and h["initiator"] == "1537834437"
+    assert (npk, f"rating#s1#{CHAD_NEW}") in STORE
+    assert STORE[("ratingpoll", "p1")]["chat_id"] == NEW
+    assert STORE[("ratingpoll", "p1")]["participant_user_ids"] == [CHAD_NEW, 42]
+    assert STORE[("ratingpoll", "p2")]["chat_id"] == -999                  # other chat
+    assert STORE[("ratingpoll", "p2")]["participant_user_ids"] == [CHAD_OLD]
+    assert STORE[("pollmap#p3", "ref")]["chat_id"] == NEW
+    assert STORE[("pollmap#p3", "ref")]["film"]["owner"] == str(CHAD_NEW)
+    # D: only the old chat row goes; backups stay; DM partition untouched
+    assert (opk, "chat") not in STORE and (opk, f"lib#{CHAD_OLD}#mirror") in STORE
+    assert STORE[(L._pk(MODE, CHAD_OLD), "lib#x")]["owner_id"] == CHAD_OLD
+    snap = copy.deepcopy({k: v for k, v in STORE.items() if k[0] == npk})
+    rep2 = L.migrate_group(dry_run=False)                                  # re-run
+    assert {k: v for k, v in STORE.items() if k[0] == npk} == snap
+    assert rep2["chad_lib_under_new_uid"] == 2 and rep2["new_group_lib_rows"] == 3
+
+
+def test_admin_migrate_only_from_direct_invoke():
+    _mig_seed()
+    before = copy.deepcopy(STORE)
+    out = L.lambda_handler({"admin_migrate": {}}, None)
+    assert out["statusCode"] == 200 and json.loads(out["body"])["dry_run"] is True
+    assert STORE == before
+    called = []
+    orig = L.migrate_group
+    L.migrate_group = lambda **k: called.append(k) or {}
+    try:
+        for ev in ({"admin_migrate": {"dry_run": False}, "rawPath": "/movie"},
+                   {"admin_migrate": {"dry_run": False}, "requestContext": {}}):
+            L.lambda_handler(ev, None)
+    finally:
+        L.migrate_group = orig
+    assert called == []
+
+
+# ---- Fix 1: short-pool wording ------------------------------------------- #
+def test_short_pool_blames_filter_only_when_it_removed_films():
+    _short_pool_setup(["drama", "horror"])                 # filter trimmed 1 of 2
+    assert any("only these qualify" in t for t, _ in SENT)
+    _short_pool_setup(["drama"])                           # filter on, removed nothing
+    assert not any("qualify" in t for t, _ in SENT)
+    assert any("you have 1 film on your shelf" in t for t, _ in SENT)
+
+
+# ---- Fix 2: one hint, one deadline reset --------------------------------- #
+def test_active_player_free_text_gets_one_hint_and_one_reset():
+    g = _short_pool_setup(["drama"])
+    d0 = g["turn_deadline"]
+    NOW[0] += 30
+    L.handle_movie(MODE, message(1, "You have it backwards"))
+    g = L.get_game(CHAT)
+    hints = [t for t, _ in SENT if "didn't catch that" in t]
+    assert len(hints) == 1 and "Play with these" in hints[0]
+    assert g["turn_deadline"] == NOW[0] + L._TURN_WINDOW > d0 and g["selection"]["1"]["hinted"]
+    d1 = g["turn_deadline"]
+    NOW[0] += 30
+    L.handle_movie(MODE, message(1, "Less than 180"))
+    g = L.get_game(CHAT)
+    assert len([t for t, _ in SENT if "didn't catch that" in t]) == 1
+    assert g["turn_deadline"] == d1                          # not reset again
+    NOW[0] = d1 + 1
+    L.run_tick()
+    assert any("didn't reply" in t for t, _ in SENT)
+
+
+def test_full_slate_hint_names_marks():
+    _two_player_to_selection()
+    L.handle_movie(MODE, message(1, "hmm not sure"))
+    assert any("reply 3 marks in order" in t for t, _ in SENT)
+
+
+# ---- Fix 3: truthful shelf results --------------------------------------- #
+def _shelf_ctx(uid):
+    return {"chat_id": CHAT, "user_id": uid, "mode": MODE, "user_name": "U", "username": None}
+
+
+def test_remove_not_found_on_unclaimed_seed_row():
+    _reset()
+    pk = L._pk(MODE, CHAT)
+    STORE[(pk, "lib#seed:asa#woman-in-the-dunes")] = {
+        "PK": pk, "SK": "lib#seed:asa#woman-in-the-dunes", "slug": "woman-in-the-dunes",
+        "owner_id": "seed:asa", "title": "Woman in the Dunes"}
+    res = L._dispatch_tool("remove_from_library", {"title": "woman in the dunes"}, _shelf_ctx(42))
+    assert res["status"] == "not_found" and res["changed"] == 0 and res["removed"] is None
+    assert (pk, "lib#seed:asa#woman-in-the-dunes") in STORE         # untouched
+    assert "status \"ok\" AND changed > 0" in L.MOVIE_SYSTEM
+    # the model reply is generated from this result; the code itself says nothing
+    assert not any("Done" in t for t, _ in SENT)
+
+
+def test_remove_own_row_case_insensitive_ok():
+    _reset()
+    L.add_to_library(CHAT, 42, "Woman in the Dunes")
+    res = L._dispatch_tool("remove_from_library", {"title": "WOMAN IN THE DUNES"}, _shelf_ctx(42))
+    assert res == {"status": "ok", "changed": 1, "removed": "Woman in the Dunes"}
+    assert L.get_library(CHAT, 42) == []
+
+
+def test_shelf_tools_report_status_and_changed():
+    _reset()
+    r = L._dispatch_tool("add_to_library", {"title": "Mirror"}, _shelf_ctx(1))
+    assert r["status"] == "ok" and r["changed"] == 1
+    r = L._dispatch_tool("add_to_library", {"title": "Mirror"}, _shelf_ctx(1))
+    assert r["status"] == "noop" and r["changed"] == 0
+    r = L._dispatch_tool("claim_library", {"name": "Nobody"}, _shelf_ctx(1))
+    assert r["status"] == "not_found" and r["changed"] == 0
+    r = L._dispatch_tool("seed_starter_libraries", {}, _shelf_ctx(1))
+    assert r["status"] == "ok" and r["changed"] > 0
+    r = L._dispatch_tool("claim_library", {"name": "Asa"}, _shelf_ctx(7))
+    assert r["status"] == "ok" and r["changed"] == 6
+    r = L._dispatch_tool("claim_library", {"name": "Asa"}, _shelf_ctx(8))
+    assert r["status"] == "noop" and r["reason"] == "taken"
+    r = L._dispatch_tool("correct_last_winner", {}, _shelf_ctx(1))
+    assert r["status"] == "not_found" and r["changed"] == 0
+    orig = L.remove_from_library
+    L.remove_from_library = lambda *a: (_ for _ in ()).throw(RuntimeError("boom"))
+    try:
+        r = L._dispatch_tool("remove_from_library", {"title": "x"}, _shelf_ctx(1))
+    finally:
+        L.remove_from_library = orig
+    assert r["status"] == "error" and r["changed"] == 0
 
 
 if __name__ == "__main__":

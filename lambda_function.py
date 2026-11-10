@@ -936,18 +936,22 @@ def mark_watched(chat_id, user_id, slug):
 
 
 def remove_from_library(chat_id, user_id, title):
-    """Best-effort remove by slug, then exact title, then substring."""
-    info = lookup_film_cached(title)
+    """Remove from the caller's OWN lib#<user_id># rows, matched case-insensitively
+    by slug (resolver's or the typed title's) or by title. None if nothing matched."""
     lib = get_library(chat_id, user_id)
-    slug = info.get("slug")
-    tl = title.strip().lower()
-    target = None
-    if slug:
-        target = next((f for f in lib if f.get("slug") == slug), None)
+    tl = (title or "").strip().lower()
+    if not tl or not lib:
+        return None
+    slugs = {_slugify(title).lower()}
+    try:
+        rs = (lookup_film_cached(title) or {}).get("slug")
+        if rs:
+            slugs.add(str(rs).lower())
+    except Exception as e:
+        log.warning("remove: lookup failed for %r: %s", title, e)
+    target = next((f for f in lib if str(f.get("slug", "")).lower() in slugs), None)
     if not target:
-        target = next((f for f in lib if f.get("title", "").strip().lower() == tl), None)
-    if not target:
-        target = next((f for f in lib if tl and tl in f.get("title", "").lower()), None)
+        target = next((f for f in lib if (f.get("title") or "").strip().lower() == tl), None)
     if not target:
         return None
     ddb_delete(_pk("movie", chat_id), f"lib#{user_id}#{target['slug']}")
@@ -1905,16 +1909,18 @@ def _post_short_pool(mode, chat_id, game, uid):
     who = mention_for(chat_id, uid)
     active = _filter_active(game["filter"])
     desc = _describe_filter(game["filter"]) or "tonight's filter"
+    # Blame the filter only when it actually removed films from this player's shelf.
+    lib_n = len([x for x in get_library(chat_id, uid) if not x.get("watched")])
     if n:
         lst = ", ".join(f"{i + 1}) {s['title']}" for i, s in enumerate(sel["slots"]))
-        if active:
+        if active and lib_n > n:
             text = (f"{who} — tonight's filter is {desc}, and only these qualify from your "
                     f"library: {lst}. Play with these, or add another that fits?")
         else:
-            text = (f"{who} — you've only got {n} film{'' if n == 1 else 's'} in your "
-                    f"library: {lst}. Play with these, or add another?")
+            text = (f"{who} — you have {n} film{'' if n == 1 else 's'} on your shelf: "
+                    f"{lst}. Play with these, or add another?")
     else:
-        if active:
+        if active and lib_n > 0:
             text = (f"{who} — nothing in your library fits tonight's filter ({desc}). "
                     "Add one that fits, or sit this round out (you keep your veto).")
         else:
@@ -2137,7 +2143,18 @@ def _handle_selection_reply(mode, chat_id, game, uid, text):
         _advance_player(mode, chat_id, game)
         return
     if not toks:
-        return  # not a keep/swap reply — ignore ambient chatter during this phase
+        # The active player spoke but not in keep/swap terms. Hint ONCE per turn and
+        # restart their clock once; later unrecognised chatter does nothing, so a
+        # chatty player can't stall the game forever.
+        if int(uid) == int(_current_selecting_uid(game) or -1) and not sel.get("hinted"):
+            sel["hinted"] = True
+            hint = ("tap ▶️ Play with these or ➕ Add a film" if sel.get("short_pool")
+                    else f"reply {n} marks in order — 👍 keep / 👎 swap")
+            send_message(mode, chat_id,
+                         f"{mention_for(chat_id, uid)}, I didn't catch that — {hint}")
+            _set_turn_deadline(game)
+            put_game(game)
+        return
     if len(toks) != n:
         send_message(mode, chat_id,
                      f"Send {n} marks in order — 👍 keep / 👎 swap (e.g. {'👍' * n}).")
@@ -3511,6 +3528,12 @@ MOVIE_SYSTEM = (
     "'We watched X instead', 'remove that as the winner', 'we didn't end up watching it' all "
     "mean call this. Do it ONLY for a real correction of what was watched, never for someone "
     "merely mentioning another film.\n"
+    "- TRUTHFUL CONFIRMATIONS: every shelf-changing ability (add, add a director, remove, "
+    "claim, load starter shelves, correct the winner) returns a status and a changed count. "
+    "NEVER tell anyone an action succeeded ('Done', '✅', 'it's off your shelf', 'added') "
+    "unless that result has status \"ok\" AND changed > 0. If status is not_found, noop or "
+    "error, or changed is 0, say plainly what actually happened (e.g. 'I couldn't find "
+    "Woman in the Dunes on your shelf, so nothing was removed') — no ✅.\n"
     "- Starting movie night: just start it; don't announce it yourself (the game posts its "
     "own card). If someone wants a FRESH game ('new game', 'start over', 'restart it') start "
     "it anew. Never lecture that a game is 'already going' — quietly do what they asked.\n"
@@ -3608,23 +3631,79 @@ def _tool_result_for_add(item, info):
             "alts": info.get("alts")}
 
 
+# Shelf-mutating tools always report what actually happened, so the model can never
+# confirm a change that didn't land: {"status": ok|not_found|noop|error, "changed": n}.
+_SHELF_TOOLS = ("add_to_library", "add_director", "remove_from_library",
+                "claim_library", "seed_starter_libraries", "correct_last_winner")
+
+
+def _shelf_slugs(chat_id, uid):
+    return {f.get("slug") for f in get_library(chat_id, str(uid))}
+
+
 def _dispatch_tool(name, tool_input, ctx):
+    if name in _SHELF_TOOLS:
+        try:
+            return _dispatch_shelf_tool(name, tool_input or {}, ctx)
+        except Exception as e:
+            log.exception("shelf tool %s failed: %s", name, e)
+            return {"status": "error", "changed": 0, "error": str(e)}
+    return _dispatch_other_tool(name, tool_input, ctx)
+
+
+def _dispatch_shelf_tool(name, tool_input, ctx):
+    chat_id, uid = ctx["chat_id"], ctx.get("user_id")
+    if name == "add_to_library":
+        before = _shelf_slugs(chat_id, uid)
+        item, info = add_to_library(chat_id, uid, tool_input["title"], tool_input.get("year"))
+        _clear_pending(chat_id, uid)
+        new = item.get("slug") not in before
+        return {**_tool_result_for_add(item, info),
+                "status": "ok" if new else "noop", "changed": 1 if new else 0,
+                **({} if new else {"note": "already on the sender's shelf"})}
+    if name == "add_director":
+        before = _shelf_slugs(chat_id, uid)
+        added = add_director(chat_id, uid, tool_input["director"])
+        changed = len(_shelf_slugs(chat_id, uid) - before)
+        return {"added_titles": added, "count": len(added), "changed": changed,
+                "status": "ok" if changed else ("noop" if added else "not_found")}
+    if name == "remove_from_library":
+        removed = remove_from_library(chat_id, uid, tool_input["title"])
+        if removed:
+            return {"status": "ok", "changed": 1, "removed": removed}
+        return {"status": "not_found", "changed": 0, "removed": None,
+                "title": tool_input["title"],
+                "note": "no film by that title on the sender's own shelf; nothing was removed"}
+    if name == "claim_library":
+        res = claim_library(chat_id, tool_input["name"], uid)
+        st = res.get("status")
+        if st == "ok":
+            remember_member(chat_id, uid, ctx.get("user_name"), ctx.get("username"))
+            moved = int(res.get("moved") or 0)
+            return {**res, "status": "ok" if moved else "noop", "changed": moved}
+        if st == "taken":
+            return {**res, "status": "noop", "reason": "taken", "changed": 0}
+        return {**res, "status": "not_found", "changed": 0}
+    if name == "seed_starter_libraries":
+        written = seed_starter_libraries(chat_id)
+        changed = sum(written.values())
+        return {"seeded": written, "names": list(_STARTER_LIBRARIES.keys()),
+                "status": "ok" if changed else "noop", "changed": changed}
+    if name == "correct_last_winner":
+        res = correct_last_winner(chat_id, tool_input.get("watched_title"),
+                                  tool_input.get("watched_year"))
+        ok = bool(res.get("corrected"))
+        return {**res, "status": "ok" if ok else "not_found", "changed": 1 if ok else 0}
+    return {"status": "error", "changed": 0, "error": f"unknown tool {name}"}
+
+
+def _dispatch_other_tool(name, tool_input, ctx):
     chat_id, uid, mode = ctx["chat_id"], ctx.get("user_id"), ctx["mode"]
     if name == "lookup_film":
         info = lookup_film_cached(tool_input["title"], tool_input.get("year"))
         if info.get("found"):   # remember it so a follow-up "yes/add it" can bind
             _set_pending(chat_id, uid, info["title"], info.get("year"))
         return info
-    if name == "add_to_library":
-        item, info = add_to_library(chat_id, uid, tool_input["title"], tool_input.get("year"))
-        _clear_pending(chat_id, uid)
-        return _tool_result_for_add(item, info)
-    if name == "add_director":
-        added = add_director(chat_id, uid, tool_input["director"])
-        return {"added_titles": added, "count": len(added)}
-    if name == "remove_from_library":
-        removed = remove_from_library(chat_id, uid, tool_input["title"])
-        return {"removed": removed}
     if name == "list_library":
         whose = (tool_input or {}).get("whose")
         if whose:                                  # another person, by name/handle
@@ -3637,11 +3716,6 @@ def _dispatch_tool(name, tool_input, ctx):
         return {"resolved": True, "owner": "your",  # the caller's own (their user_id)
                 "films": [{"title": f["title"], "year": f.get("year")}
                           for f in get_library(chat_id, str(uid))]}
-    if name == "claim_library":
-        res = claim_library(chat_id, tool_input["name"], uid)
-        if res.get("status") == "ok":
-            remember_member(chat_id, uid, ctx.get("user_name"), ctx.get("username"))
-        return res
     if name == "start_movie_night":
         start_game(mode, chat_id, uid, force_new=bool(tool_input.get("force_new")))
         ctx["suppress_reply"] = True   # the bot posts its own card/prompt; no LLM echo
@@ -3661,9 +3735,6 @@ def _dispatch_tool(name, tool_input, ctx):
         _post_rating_poll(mode, chat_id, title, info.get("year"), film_id=info.get("tmdb_id"))
         ctx["suppress_reply"] = True   # the poll itself is the output
         return {"polled": True, "title": title, "year": info.get("year")}
-    if name == "seed_starter_libraries":
-        written = seed_starter_libraries(chat_id)
-        return {"seeded": written, "names": list(_STARTER_LIBRARIES.keys())}
     if name == "recommend_films":
         whose = (tool_input or {}).get("whose")
         if whose:
@@ -3695,9 +3766,6 @@ def _dispatch_tool(name, tool_input, ctx):
     if name == "get_history":
         hist = get_history(chat_id, (tool_input or {}).get("limit") or 10)
         return {"count": len(hist), "history": hist}
-    if name == "correct_last_winner":
-        return correct_last_winner(chat_id, (tool_input or {}).get("watched_title"),
-                                   (tool_input or {}).get("watched_year"))
     return {"error": f"unknown tool {name}"}
 
 
@@ -4013,6 +4081,196 @@ def _header(event, name):
     return None
 
 
+# --------------------------------------------------------------------------- #
+# One-off group migration (admin only). Triggered by a DIRECT console invoke
+# {"admin_migrate": {...}} — never reachable from the Function URL / webhook
+# (lambda_handler refuses it when rawPath/requestContext is present).
+# Copies the old group's partition into the new one, remapping user ids.
+# --------------------------------------------------------------------------- #
+_MIGRATE_DEFAULTS = {
+    "old_chat": -5184764745,
+    "new_chat": -5160106592,
+    "uid_map": {537834437: 8999003543},
+}
+# Step A: SK prefixes / exact SKs cleared from the NEW partition.
+_MIG_CLEAR_PREFIXES = ("lib#", "seedclaim#", "history#", "rating#", "pending#")
+_MIG_CLEAR_EXACT = ("game#current", "watch_followup", "wildcardlog", "convo#log")
+# Step B: old-partition rows never copied.
+_MIG_SKIP_PREFIXES = ("dedupe#", "pending#")
+_MIG_SKIP_EXACT = ("chat", "convo#log", "watch_followup", "game#current")
+
+
+def _ddb_query_raw(pk):
+    """ddb_query without Decimal->float conversion, so rows round-trip unchanged."""
+    items, kwargs = [], {"KeyConditionExpression": boto3.dynamodb.conditions.Key("PK").eq(pk)}
+    while True:
+        resp = _table.query(**kwargs)
+        items.extend(resp.get("Items", []))
+        if "LastEvaluatedKey" not in resp:
+            return items
+        kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+
+
+def _ddb_scan_raw():
+    items, kwargs = [], {}
+    while True:
+        resp = _table.scan(**kwargs)
+        items.extend(resp.get("Items", []))
+        if "LastEvaluatedKey" not in resp:
+            return items
+        kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+
+
+def _remap_uids(v, m):
+    """Replace any value exactly equal to an old uid (int, Decimal or numeric string)
+    with the new uid, recursively through lists, sets, tuples and maps (keys too)."""
+    if isinstance(v, bool) or v is None:
+        return v
+    if isinstance(v, Decimal):
+        return Decimal(m[int(v)]) if v % 1 == 0 and int(v) in m else v
+    if isinstance(v, int):
+        return m.get(v, v)
+    if isinstance(v, str):
+        if v.lstrip("-").isdigit() and str(int(v)) == v and int(v) in m:
+            return str(m[int(v)])
+        return v
+    if isinstance(v, dict):
+        return {_remap_uids(k, m): _remap_uids(x, m) for k, x in v.items()}
+    if isinstance(v, list):
+        return [_remap_uids(x, m) for x in v]
+    if isinstance(v, tuple):
+        return tuple(_remap_uids(x, m) for x in v)
+    if isinstance(v, (set, frozenset)):
+        return {_remap_uids(x, m) for x in v}
+    return v
+
+
+def _remap_sk(sk, m):
+    strmap = {str(o): str(n) for o, n in m.items()}
+    return "#".join(strmap.get(seg, seg) for seg in str(sk).split("#"))
+
+
+def _mig_row_type(sk):
+    return str(sk).split("#", 1)[0]
+
+
+def _mig_jsonable(v):
+    if isinstance(v, Decimal):
+        return int(v) if v % 1 == 0 else float(v)
+    if isinstance(v, dict):
+        return {str(k): _mig_jsonable(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_mig_jsonable(x) for x in v]
+    if isinstance(v, (set, frozenset)):
+        return sorted((_mig_jsonable(x) for x in v), key=str)
+    return v
+
+
+def migrate_group(old_chat=None, new_chat=None, uid_map=None, dry_run=True, **_ignored):
+    """Copy movie#<old_chat> into movie#<new_chat> (see the admin_migrate notes above).
+    dry_run defaults to True; only an explicit False writes. Returns a report dict."""
+    old_chat = int(old_chat if old_chat is not None else _MIGRATE_DEFAULTS["old_chat"])
+    new_chat = int(new_chat if new_chat is not None else _MIGRATE_DEFAULTS["new_chat"])
+    m = {int(k): int(v) for k, v in
+         (uid_map if uid_map is not None else _MIGRATE_DEFAULTS["uid_map"]).items()}
+    dry = dry_run is not False
+    if old_chat == new_chat:
+        return {"error": "old_chat == new_chat"}
+    old_pk, new_pk = _pk("movie", old_chat), _pk("movie", new_chat)
+    skip_members = {f"member#{u}" for pair in m.items() for u in pair}
+
+    def count(rows):
+        out = {}
+        for r in rows:
+            t = _mig_row_type(r["SK"])
+            out[t] = out.get(t, 0) + 1
+        return dict(sorted(out.items()))
+
+    # A — what to clear in the new group.
+    to_delete = [r for r in _ddb_query_raw(new_pk)
+                 if str(r["SK"]).startswith(_MIG_CLEAR_PREFIXES)
+                 or r["SK"] in _MIG_CLEAR_EXACT]
+    # B — what to copy from the old group (remapped).
+    copies, samples = [], []
+    for r in _ddb_query_raw(old_pk):
+        sk = str(r["SK"])
+        if (sk in _MIG_SKIP_EXACT or sk.startswith(_MIG_SKIP_PREFIXES)
+                or sk in skip_members):
+            continue
+        new = {k: _remap_uids(v, m) for k, v in r.items() if k not in ("PK", "SK")}
+        new["PK"], new["SK"] = new_pk, _remap_sk(sk, m)
+        copies.append(new)
+        if new != {**r, "PK": new_pk}:
+            samples.append((r, new))
+    # C — global rating-poll / veto-poll lookups that point at the old chat.
+    poll_updates = []
+    for r in _ddb_scan_raw():
+        pk = str(r.get("PK", ""))
+        if pk != "ratingpoll" and not pk.startswith("pollmap#"):
+            continue
+        try:
+            if int(r.get("chat_id")) != old_chat:
+                continue
+        except (TypeError, ValueError):
+            continue
+        new = {k: (_remap_uids(v, m) if k not in ("PK", "SK") else v) for k, v in r.items()}
+        new["chat_id"] = new_chat
+        poll_updates.append(new)
+    old_chat_row = next((r for r in _ddb_query_raw(old_pk) if r["SK"] == "chat"), None)
+
+    if not dry:
+        for r in to_delete:
+            ddb_delete(new_pk, r["SK"])
+        for r in copies:
+            ddb_put(r)
+        for r in poll_updates:
+            ddb_put(r)
+        if old_chat_row:
+            ddb_delete(old_pk, "chat")
+
+    # Projected end state of the new partition's game data = exactly the copies
+    # (Step A cleared every lib/history/rating row). A real run re-reads to verify.
+    final = _ddb_query_raw(new_pk) if not dry else copies
+    lib = [r for r in final if str(r["SK"]).startswith("lib#")]
+    chad_new = next(iter(m.values()), None)
+    # one sample per row type where possible (lib, history, rating first)
+    picked, seen_types = [], set()
+    for pref in ("lib", "history", "rating"):
+        for before, after in samples:
+            if _mig_row_type(before["SK"]) == pref and pref not in seen_types:
+                picked.append((before, after)); seen_types.add(pref); break
+    for before, after in samples:
+        if len(picked) >= 3:
+            break
+        if (before, after) not in picked:
+            picked.append((before, after))
+    report = {
+        "dry_run": dry,
+        "old_chat": old_chat, "new_chat": new_chat,
+        "uid_map": {str(k): v for k, v in m.items()},
+        "A_deleted": count(to_delete), "A_deleted_total": len(to_delete),
+        "B_copied": count(copies), "B_copied_total": len(copies),
+        "C_updated": {"ratingpoll": sum(1 for r in poll_updates if r["PK"] == "ratingpoll"),
+                      "pollmap": sum(1 for r in poll_updates if r["PK"] != "ratingpoll")},
+        "D_old_chat_row_deleted": bool(old_chat_row),
+        "chad_lib_under_new_uid": sum(1 for r in lib
+                                      if str(r["SK"]).startswith(f"lib#{chad_new}#")),
+        "new_group_lib_rows": len(lib),
+        "new_group_history_rows": sum(1 for r in final if str(r["SK"]).startswith("history#")),
+        "new_group_rating_rows": sum(1 for r in final if str(r["SK"]).startswith("rating#")),
+        "samples": [{"before": _mig_jsonable(b), "after": _mig_jsonable(a)}
+                    for b, a in picked[:3]],
+    }
+    log.info("migrate_group report: %s", json.dumps(report, default=str)[:4000])
+    return report
+
+
+def _admin_migrate_event(event):
+    """True only for a direct (IAM-gated) console invoke — never a Function URL call."""
+    return (isinstance(event, dict) and "admin_migrate" in event
+            and "rawPath" not in event and "requestContext" not in event)
+
+
 def _mode_from_path(event):
     path = event.get("rawPath") or event.get("path") or ""
     if not path:
@@ -4029,6 +4287,11 @@ def _load_body(event):
 
 
 def lambda_handler(event, context):
+    # Admin one-off migration: direct console invoke only (no HTTP shape at all).
+    if _admin_migrate_event(event):
+        params = event.get("admin_migrate")
+        report = migrate_group(**(params if isinstance(params, dict) else {}))
+        return {"statusCode": 200, "body": json.dumps(report, default=str)}
     # Scheduled (EventBridge) invocation: no Telegram path/secret — dispatch by the
     # top-level `task` marker and return before the webhook-only checks below.
     task = _scheduled_task(event)

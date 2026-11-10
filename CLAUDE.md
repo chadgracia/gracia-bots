@@ -5,7 +5,7 @@ Multi-mode Telegram bot platform on a single AWS Lambda. One handler
 suffix of the Lambda Function URL (`.../movie`, `.../cleaning`, `.../salary`).
 
 ## Modes
-- **movie** — bot **@SirWatchalot_bot**. Film-night game (per-player libraries,
+- **movie** — bot **@SirWatchedALot_bot** (was @SirWatchalot_bot; that account died with Chad's old Telegram account). Film-night game (per-player libraries,
   stateful multi-phase game). Full spec: `docs/MOVIE_NIGHT_BRIEF.md`.
 - **cleaning** — stub. Intended: Ukrainian room-by-room checklist + daily tracking.
 - **salary** — stub. Intended: LLM parses time entries, **Python does all pay math**.
