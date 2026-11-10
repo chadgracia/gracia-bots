@@ -2431,6 +2431,108 @@ def test_backfill_only_from_direct_invoke():
         L.backfill_lb = saved
 
 
+
+# ---- webhook path end-to-end (Function URL-shaped events) ------------------ #
+_WEBHOOK_SECRET = "test-secret"
+
+
+def _furl_event(text, uid=1, update_id=1, secret=_WEBHOOK_SECRET):
+    body = {"update_id": update_id, "message": {
+        "message_id": update_id, "date": 0, "text": text,
+        "chat": {"id": CHAT, "type": "group", "title": "MovieNight"},
+        "from": {"id": uid, "first_name": "Chad", "username": "chad"}}}
+    return {"version": "2.0", "rawPath": "/movie", "rawQueryString": "",
+            "headers": {"content-type": "application/json",
+                        "x-telegram-bot-api-secret-token": secret},
+            "requestContext": {"http": {"method": "POST", "path": "/movie"}},
+            "body": json.dumps(body), "isBase64Encoded": False}
+
+
+class _FakeBedrock:
+    def __init__(self, text="I'm here."):
+        self.text, self.calls = text, 0
+
+    def converse(self, **kw):
+        self.calls += 1
+        return {"stopReason": "end_turn", "output": {"message": {
+            "role": "assistant", "content": [{"text": self.text}]}}}
+
+
+def _webhook(text, update_id, uid=1):
+    saved = (L.AI_ENABLED, L._bedrock, L.verify_token, os.environ.get("MOVIE_WEBHOOK_SECRET"))
+    fb = _FakeBedrock()
+    L.AI_ENABLED, L._bedrock, L.verify_token = True, fb, (lambda mode: None)
+    os.environ["MOVIE_WEBHOOK_SECRET"] = _WEBHOOK_SECRET
+    try:
+        n = len(SENT)
+        out = L.lambda_handler(_furl_event(text, uid=uid, update_id=update_id), None)
+        return out, SENT[n:], fb
+    finally:
+        L.AI_ENABLED, L._bedrock, L.verify_token = saved[:3]
+        if saved[3] is None:
+            os.environ.pop("MOVIE_WEBHOOK_SECRET", None)
+        else:
+            os.environ["MOVIE_WEBHOOK_SECRET"] = saved[3]
+
+
+def test_webhook_slash_command_replies_through_lambda_handler():
+    _reset()
+    out, sent, fb = _webhook("/movies", 501)
+    assert out["statusCode"] == 200
+    assert fb.calls >= 1 and sent and sent[0][0] == "I'm here."
+
+
+def test_webhook_mention_replies_through_lambda_handler():
+    _reset()
+    out, sent, _ = _webhook("@SirWatchedALot_bot you there?", 502)
+    assert out["statusCode"] == 200 and sent and sent[0][0] == "I'm here."
+
+
+def test_webhook_function_url_event_is_not_an_admin_invoke():
+    ev = _furl_event("/movies")
+    assert not L._admin_migrate_event(ev) and not L._admin_backfill_event(ev)
+    assert L._scheduled_task(ev) is None and L._mode_from_path(ev) == "movie"
+
+
+def test_webhook_wrong_secret_is_forbidden_and_silent():
+    _reset()
+    os.environ["MOVIE_WEBHOOK_SECRET"] = _WEBHOOK_SECRET
+    n = len(SENT)
+    out = L.lambda_handler(_furl_event("/movies", update_id=503, secret="nope"), None)
+    assert out["statusCode"] == 403 and SENT[n:] == []
+
+
+def _stuck_selecting_game(last_activity):
+    g = L.new_game(CHAT, 2)
+    g.update(phase="SELECTING", status="picking", players=[2, 3],
+             selection={}, turn_deadline=None, last_activity_at=last_activity)
+    STORE[(L._pk(MODE, CHAT), "game#current")] = g
+
+
+def test_stale_stuck_game_does_not_swallow_mentions():
+    _reset()
+    _stuck_selecting_game("2000-01-01T00:00:00+00:00")
+    saved = L._now_epoch
+    L._now_epoch = lambda: 2_000_000_000
+    try:
+        out, sent, _ = _webhook("@SirWatchedALot_bot my shelf", 504)
+    finally:
+        L._now_epoch = saved
+    assert sent and sent[0][0] == "I'm here."
+
+
+def test_live_game_still_gates_ambient_chat():
+    _reset()
+    _stuck_selecting_game("2000-01-01T00:00:00+00:00")
+    saved = L._now_epoch
+    L._now_epoch = lambda: 2_000_000_000
+    try:
+        out, sent, fb = _webhook("lol same", 505)        # not addressed to the bot
+    finally:
+        L._now_epoch = saved
+    assert sent == [] and fb.calls == 0
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

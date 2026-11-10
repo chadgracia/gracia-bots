@@ -4133,11 +4133,12 @@ def converse(system_prompt, user_text, ctx, tools=MOVIE_TOOLS, max_turns=6, prio
             try:
                 result = _dispatch_tool(tu["name"], tu.get("input", {}), ctx)
             except Exception as e:
-                log.error("tool %s failed: %s", tu["name"], e)
+                log.exception("tool %s failed", tu["name"])
                 result = {"error": str(e)}
             results.append({"toolResult": {"toolUseId": tu["toolUseId"],
                                            "content": [{"json": {"result": result}}]}})
         messages.append({"role": "user", "content": results})
+    log.warning("converse: no final reply after %d tool rounds", max_turns)
     return ""
 
 
@@ -4159,11 +4160,34 @@ def _meta_command(text):
     return None
 
 
+def _addressed_to_bot(text):
+    """An @mention of the movie bot or a slash command — someone explicitly wants it."""
+    t = (text or "").strip().lower()
+    return t.startswith("/") or "@sirwatch" in t
+
+
+# A game idle this long no longer gates messages addressed to the bot: a stuck phase
+# (e.g. a SELECTING turn with no current player, so no deadline ever fires) must
+# never silence the bot for everyone.
+_STALE_GAME_SEC = 20 * 60
+
+
+def _game_is_stale(game):
+    last = _iso_to_epoch(game.get("last_activity_at") or game.get("started_at"))
+    return _now_epoch() - last >= _STALE_GAME_SEC
+
+
 def on_message(mode, ev):
+    """Handle one group message. Returns a short outcome string (logged by the caller)."""
     chat_id, uid = ev["chat_id"], ev.get("user_id")
     text = (ev.get("text") or "").strip()
     remember_member(chat_id, uid, ev["user_name"], ev.get("username"))
     game = get_game(chat_id)
+    if (game and game.get("status") not in _TERMINAL_STATUS and _addressed_to_bot(text)
+            and _game_is_stale(game)):
+        log.warning("game in %s/%s idle since %s: not gating a message addressed to the bot",
+                    game.get("phase"), game.get("status"), game.get("last_activity_at"))
+        game = None
     # Escape hatch FIRST: cancel / new game must work in ANY phase, including while we're
     # waiting on a player mid-turn (the phase branches below otherwise swallow the text).
     if text and game and game.get("status") not in _TERMINAL_STATUS:
@@ -4171,20 +4195,20 @@ def on_message(mode, ev):
         if act == "cancel":
             _abandon_game(chat_id, game)
             send_message(mode, chat_id, "Movie night cancelled.")
-            return
+            return "handled: cancel game"
         if act == "new":
             start_game(mode, chat_id, uid, force_new=True)
-            return
+            return "handled: new game"
     # Lazy deadline backstops (no scheduler): a later event past a deadline
     # advances the corresponding window.
     if _veto_backstop(mode, chat_id, game):
-        return
+        return "handled: veto deadline"
     if _wildcard_backstop(mode, chat_id, game):
-        return
+        return "handled: wildcard deadline"
     if _relax_backstop(mode, chat_id, game):
-        return
+        return "handled: relax deadline"
     if _constraints_backstop(mode, chat_id, game):
-        return
+        return "handled: constraints deadline"
     # Wildcard consent window: classify the reply (handles negation + 'add it to my
     # library, not tonight'); emoji/keywords are the instant fallback. Only a game
     # participant's reply acts; others wait for the beat to lapse.
@@ -4198,17 +4222,17 @@ def on_message(mode, ev):
             elif intent == "decline":
                 _wildcard_decline(mode, chat_id, game)
             # 'other' -> wait for the beat to lapse
-        return
+        return "gated: WILDCARD consent window"
     # Empty-pool relax reply (within the window).
     if game and game.get("awaiting_relax"):
         if text:
             _relax_and_resume(mode, chat_id, game, text)
-        return
+        return "gated: awaiting relax reply"
     # Open constraints window: parse this reply into the filter / close on "go".
     if game and game.get("phase") == "CONSTRAINTS" and game.get("constraints_open"):
         if text:
             _handle_constraints_message(mode, chat_id, game, text)
-        return
+        return "gated: CONSTRAINTS window"
     # Selection: only the CURRENT player's reply matters; ignore others.
     if game and game.get("phase") == "SELECTING":
         cur = _current_selecting_uid(game)
@@ -4220,12 +4244,12 @@ def on_message(mode, ev):
                 _handle_short_pool_add(mode, chat_id, game, int(cur), text)
             else:
                 _handle_selection_reply(mode, chat_id, game, int(cur), text)
-            return
+            return "handled: selection reply"
         # Anyone else (or a no-text update) past the turn deadline -> the clock's up,
         # auto-keep the silent player's dealt films and move on. (The tick sweep does the
         # same on the clock when the chat is fully silent.)
         _turn_backstop(mode, chat_id, game)
-        return
+        return "gated: SELECTING, not this sender's turn"
     # Morning-after "what did you watch instead?" follow-up (after a 'No' on the
     # did-you-watch-it prompt). Capture the next reply as the film actually watched.
     if text:
@@ -4233,9 +4257,9 @@ def on_message(mode, ev):
         if fu:
             _clear_watch_followup(chat_id)
             _handle_watched_followup(mode, chat_id, fu, text)
-            return
+            return "handled: watched-instead follow-up"
     if not text:
-        return
+        return "ignored: no text"
     # Confirm -> save: a bare affirmative binds to the pending film (deterministic,
     # so "yes / I confirm / add it" always saves even if the model lost the thread).
     if _is_affirmative(text):
@@ -4245,9 +4269,9 @@ def on_message(mode, ev):
             item, info = add_to_library(chat_id, uid, pending["title"], yr)
             _clear_pending(chat_id, uid)
             send_message(mode, chat_id, f"Added ✅ {_film_card(item)}")
-            return
+            return "replied: pending add confirmed"
     if not AI_ENABLED:
-        return
+        return "ignored: AI disabled"
     ctx = {"chat_id": chat_id, "user_id": uid, "user_name": ev["user_name"],
            "username": ev.get("username"), "mode": mode, "suppress_reply": False}
     speaker = ev.get("user_name") or "Someone"
@@ -4265,9 +4289,9 @@ def on_message(mode, ev):
     try:
         reply = converse(MOVIE_SYSTEM, f"{speaker}: {text}", ctx, tools=_tools, prior=prior,
                          require_tool=_needs_film_lookup(text))
-    except Exception as e:
-        log.error("bedrock movie failed: %s", e)
-        return
+    except Exception:
+        log.exception("bedrock movie failed")
+        return "error: bedrock failed"
     reply = (reply or "").strip()
     # Record this exchange in the window. Always log what the human said; log the
     # bot's reply only when it actually spoke (a suppressed/placeholder turn is silence).
@@ -4278,6 +4302,10 @@ def on_message(mode, ev):
     if spoke:
         _convo_note(chat_id, reply)
         send_message(mode, chat_id, reply)
+        return "replied"
+    if ctx.get("suppress_reply"):
+        return "replied: tool posted its own message"
+    return f"ignored: model stayed silent (reply={reply[:40]!r})"
 
 
 # --------------------------------------------------------------------------- #
@@ -4286,7 +4314,7 @@ def on_message(mode, ev):
 def handle_movie(mode, ev):
     kind = ev.get("kind")
     if kind == "message":
-        on_message(mode, ev)
+        return on_message(mode, ev)
     elif kind == "callback":
         on_callback(mode, ev)
     elif kind == "reaction":
@@ -4703,13 +4731,16 @@ def lambda_handler(event, context):
 
     try:
         update = _load_body(event)
-    except Exception as e:
-        log.error("bad body: %s", e)
+    except Exception:
+        log.exception("bad body")
         return {"statusCode": 200, "body": "ok"}  # don't make Telegram retry
 
     try:
         ev = parse_update(update)
         chat_id = ev.get("chat_id")
+        log.info("update in: mode=%s update_id=%s chat_id=%s from=%s kind=%s text=%r",
+                 mode, ev.get("update_id"), chat_id, ev.get("user_id"), ev.get("kind"),
+                 (ev.get("text") or "")[:40])
 
         # poll / poll_answer updates carry no chat — resolve via the veto poll map
         # or the rating-poll lookup.
@@ -4718,6 +4749,7 @@ def lambda_handler(event, context):
             if ref:
                 chat_id = ref.get("chat_id")
         if chat_id is None:
+            log.info("update out: update_id=%s ignored: no chat_id", ev.get("update_id"))
             return {"statusCode": 200, "body": "ok"}
         ev["chat_id"] = chat_id
 
@@ -4726,19 +4758,22 @@ def lambda_handler(event, context):
 
         # Idempotency: drop Telegram's retried deliveries before any state change.
         if seen_update(mode, chat_id, ev.get("update_id")):
-            log.info("duplicate update %s ignored", ev.get("update_id"))
+            log.info("update out: update_id=%s ignored: duplicate", ev.get("update_id"))
             return {"statusCode": 200, "body": "ok"}
 
         # Handle migration service messages on the way in.
         if ev.get("migrate_to_chat_id"):
             migrate_chat(mode, chat_id, ev["migrate_to_chat_id"])
+            log.info("update out: update_id=%s handled: migrate_to", ev.get("update_id"))
             return {"statusCode": 200, "body": "ok"}
         if ev.get("migrate_from_chat_id"):
             migrate_chat(mode, ev["migrate_from_chat_id"], chat_id)
 
-        modes[mode]["handler"](mode, ev)
+        outcome = modes[mode]["handler"](mode, ev)
+        log.info("update out: update_id=%s chat_id=%s kind=%s %s", ev.get("update_id"),
+                 chat_id, ev.get("kind"), outcome or "handled")
     except Exception as e:
-        log.exception("handler error in mode %s: %s", mode, e)
+        log.exception("update out: error in mode %s: %s", mode, e)
         # Always 200 so Telegram doesn't hammer us with retries.
 
     return {"statusCode": 200, "body": "ok"}
