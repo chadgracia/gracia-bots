@@ -1050,79 +1050,22 @@ def _is_group_admin(chat_id, uid):
     return is_admin
 
 
-def _member_rows(chat_id, items=None):
-    items = ddb_query(_pk("movie", chat_id)) if items is None else items
-    return [i for i in items
-            if str(i.get("SK", "")).startswith("member#") and i.get("user_id") is not None]
-
-
-def _resolve_member(chat_id, ident, items=None):
-    """A group member's user_id from an @username or name, matched against member#*
-    rows in this chat. Tiers, first unique hit wins: exact @username, full display
-    name, first name, then the _SEED_ALIASES nickname map (Daria/Dariia/@dariuozy).
-    None if unknown or ambiguous. Shelf ownership never depends on a seedclaim."""
-    key = " ".join(str(ident or "").strip().lstrip("@").lower().split())
+def _resolve_member(chat_id, ident):
+    """A group member's user_id from an @username or display name (case-insensitive),
+    matched against member#* rows in this chat. None if unknown or ambiguous."""
+    key = str(ident or "").strip().lstrip("@").lower()
     if not key:
         return None
-    members = _member_rows(chat_id, items)
-
-    def uname(m):
-        return str(m.get("username") or "").lower()
-
-    def dname(m):
-        return " ".join(str(m.get("display_name") or "").lower().split())
-
-    def first(m):
-        return (dname(m).split() or [""])[0]
-    tiers = [
-        lambda m: uname(m) == key,
-        lambda m: dname(m) == key,
-        lambda m: first(m) == key,
-        lambda m: _canonical_seed_name(key) in {_canonical_seed_name(x) for x in
-                                                 (uname(m), dname(m), first(m)) if x},
-    ]
-    for match in tiers:
-        hits = {int(m["user_id"]) for m in members if match(m)}
-        if len(hits) == 1:
-            return hits.pop()
-        if len(hits) > 1:
-            return None          # ambiguous at this tier — don't guess
+    members = [i for i in ddb_query(_pk("movie", chat_id))
+               if str(i.get("SK", "")).startswith("member#") and i.get("user_id") is not None]
+    by_user = [m for m in members if str(m.get("username") or "").lower() == key]
+    if len(by_user) == 1:
+        return int(by_user[0]["user_id"])
+    by_name = [m for m in members if " ".join(str(m.get("display_name") or "").lower().split())
+               == " ".join(key.split())]
+    if len(by_name) == 1:
+        return int(by_name[0]["user_id"])
     return None
-
-
-def _unclaimed_seed_for(chat_id, uid, items=None):
-    """Display name of an unclaimed starter list that matches this member's
-    @username / name (via _SEED_ALIASES), else None."""
-    items = ddb_query(_pk("movie", chat_id)) if items is None else items
-    m = next((x for x in _member_rows(chat_id, items) if str(x["user_id"]) == str(uid)), None)
-    if not m:
-        return None
-    dn = " ".join(str(m.get("display_name") or "").split())
-    cands = {_canonical_seed_name(x) for x in (m.get("username"), dn, (dn.split() or [""])[0])
-             if x}
-    sks = {str(i.get("SK", "")) for i in items}
-    for key in sorted(cands):
-        if f"seedclaim#{key}" in sks:
-            continue
-        if any(sk.startswith(f"lib#seed:{key}#") for sk in sks):
-            return next((n for n in _STARTER_LIBRARIES if n.lower() == key), key.title())
-    return None
-
-
-def _shelf_listing(chat_id, owner_key, owner_label, caller_uid=None):
-    """list_library result for one owner, with explicit shelf facts so the model never
-    has to infer 'no shelf' from claim state: has_shelf is true iff lib rows exist."""
-    films = get_library(chat_id, owner_key)
-    out = {"resolved": True, "owner": owner_label, "count": len(films), "has_shelf": bool(films),
-           "films": [{"title": f["title"], "year": f.get("year")} for f in films]}
-    if not films and str(owner_key).lstrip("-").isdigit():
-        seed = _unclaimed_seed_for(chat_id, owner_key)
-        out["starter_to_claim"] = seed
-        if str(owner_key) == str(caller_uid):
-            out["next_step"] = (f"offer to link the unclaimed starter shelf '{seed}' "
-                                f"(they say \"I'm {seed}\")" if seed
-                                else "tell them their shelf is empty and to add films")
-    return out
 
 
 def _find_on_shelf(chat_id, owner, title):
@@ -1199,7 +1142,7 @@ def _film_brief(item):
 # "I'm Dasha" (seeded as Dasha but stored elsewhere as Daria) and username-only
 # accounts still find their library. Extend as new aliases turn up.
 _SEED_ALIASES = {
-    "daria": "dasha", "dariia": "dasha", "dariuozy": "dasha", "dash": "dasha",
+    "daria": "dasha", "dariuozy": "dasha", "dash": "dasha",
     "al": "alberto", "berto": "alberto",
     "anya": "anya", "anna": "anya",
     "asa": "asa", "asafoxcolorist": "asa",
@@ -1268,8 +1211,7 @@ def _canonical_for_user(chat_id, uid):
 def resolve_owner(chat_id, identifier):
     """The ONE resolver every read path uses. Maps a Telegram user_id or a
     name/handle to (owner_key, canonical_name), or (None, None) if unknown.
-    owner_key feeds get_library — a real user_id (a claimer, or any group member
-    matched by @username / name / nickname), else 'seed:<key>' for an unclaimed seed.
+    owner_key feeds get_library — a real user_id once claimed, else 'seed:<key>'.
     It NEVER falls back to the caller (that was the mis-attribution bug)."""
     if identifier is None or identifier == "":
         return None, None
@@ -1288,12 +1230,7 @@ def resolve_owner(chat_id, identifier):
             or key.title())
     if marker and marker.get("claimed_by") is not None:    # claimed -> their user_id
         return str(marker["claimed_by"]), disp
-    items = ddb_query(pk)
-    muid = _resolve_member(chat_id, identifier, items)     # any group member, claim or not
-    if muid is not None:
-        m = next((x for x in _member_rows(chat_id, items) if int(x["user_id"]) == muid), {})
-        return str(muid), _canonical_for_user(chat_id, muid) or m.get("display_name") or disp
-    if any(str(i.get("SK", "")).startswith(f"lib#seed:{key}#") for i in items):
+    if any(str(i.get("SK", "")).startswith(f"lib#seed:{key}#") for i in ddb_query(pk)):
         return f"seed:{key}", disp                          # seeded but unclaimed
     return None, None                                       # genuinely unknown
 
@@ -1440,8 +1377,6 @@ def get_history(chat_id, limit=10):
                     "year": h.get("winner_year") or "",
                     "date": (h.get("watched_date") or "")[:10],
                     "participants": h.get("participants") or [],
-                    "participant_names": [_canonical_for_user(chat_id, p) or mention_for(chat_id, p)
-                                          for p in (h.get("participants") or [])],
                     "pool": [e.get("title") for e in (h.get("pool") or []) if e.get("title")]})
     return out
 
@@ -3651,7 +3586,7 @@ MOVIE_TOOLS = [
                                                           "target": {"type": "string", "description": "Optional @username or display name of ANOTHER group member whose shelf to edit (group admins only). Omit for the sender's own shelf."}},
                                            "required": ["title"]}}}},
     {"toolSpec": {"name": "list_library",
-                  "description": "List films on a shelf. ALWAYS call this for any question about what is on a shelf ('what's on my shelf', 'show Asa's list') — never answer from memory. Omit whose for the sender's own (never pass the sender's own name); pass whose=<name or @username> for another person. The result's has_shelf/count are the truth. resolved=false means no such person — then DO NOT show anyone else's films.",
+                  "description": "List films in someone's library. Pass whose=<name> to view another person (e.g. 'Asa'); omit for the sender's own. If the person is unknown the result has resolved=false — then DO NOT show anyone else's films.",
                   "inputSchema": {"json": {"type": "object",
                                            "properties": {"whose": {"type": "string"}}}}}},
     {"toolSpec": {"name": "claim_library",
@@ -3746,14 +3681,9 @@ MOVIE_SYSTEM = (
     "gentle check, never a refusal. Never mention no_letterboxd_rating or the absence of a "
     "rating in your confirmation — just confirm the save.\n"
     "- Showing or changing a shelf is about WHOSE shelf it is. For another person pass their "
-    "name; for the asker's own, leave it off. ANY question about what's on a shelf means "
-    "call list_library first and answer only from its result — never decide from memory or "
-    "from who has 'claimed' anything. Claiming a starter shelf is optional and unrelated to "
-    "having a shelf: anyone with films has a shelf. If has_shelf is true, list the films. If "
-    "it is false: offer the starter shelf named in starter_to_claim (they just say \"I'm "
-    "<name>\") only when one is given, otherwise tell them their shelf is empty and invite "
-    "them to add films. Only if resolved=false do you not know that person — say so plainly "
-    "and never show someone else's films under the wrong name.\n"
+    "name; for the asker's own, leave it off. If you don't recognise the person yet (they "
+    "haven't claimed a shelf), say so plainly — never show someone else's films under the "
+    "wrong name.\n"
     "- 'Add X to @user's shelf' or 'put X on Jason's shelf': you can only add to the "
     "SENDER's own shelf — call add_to_library for X and tell them it went on their shelf; "
     "suggest they ask @user to add it themselves. This is still an add, NEVER a game start.\n"
@@ -4022,12 +3952,13 @@ def _dispatch_other_tool(name, tool_input, ctx):
         if whose:                                  # another person, by name/handle
             owner_key, canon = resolve_owner(chat_id, whose)
             if not owner_key:
-                return {"resolved": False, "whose": whose,   # fail loud — no fallback
-                        "note": "no group member or starter shelf by that name"}
-            if str(owner_key) == str(uid):
-                return _shelf_listing(chat_id, str(uid), "your", uid)
-            return _shelf_listing(chat_id, owner_key, canon or whose, uid)
-        return _shelf_listing(chat_id, str(uid), "your", uid)   # the caller's own
+                return {"resolved": False, "whose": whose}   # fail loud — no fallback
+            return {"resolved": True, "owner": canon or whose,
+                    "films": [{"title": f["title"], "year": f.get("year")}
+                              for f in get_library(chat_id, owner_key)]}
+        return {"resolved": True, "owner": "your",  # the caller's own (their user_id)
+                "films": [{"title": f["title"], "year": f.get("year")}
+                          for f in get_library(chat_id, str(uid))]}
     if name == "start_movie_night":
         start_game(mode, chat_id, uid, force_new=bool(tool_input.get("force_new")))
         ctx["suppress_reply"] = True   # the bot posts its own card/prompt; no LLM echo
