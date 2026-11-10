@@ -959,6 +959,129 @@ def remove_from_library(chat_id, user_id, title):
 
 
 # --------------------------------------------------------------------------- #
+# Admin shelf editing — group admins may edit another member's shelf.
+# --------------------------------------------------------------------------- #
+_ADMIN_CACHE_SECS = 600
+
+
+def _is_group_admin(chat_id, uid):
+    """True if uid is the group's creator or an administrator (Telegram getChatMember
+    with the movie bot token). Cached 10 min in DynamoDB; lookup failures are not
+    cached and count as not-admin."""
+    if uid is None:
+        return False
+    pk, sk = _pk("movie", chat_id), f"admincache#{uid}"
+    now = _now_epoch()
+    try:
+        cached = ddb_get(pk, sk)
+    except Exception as e:
+        log.warning("admin cache read failed: %s", e)
+        cached = None
+    if cached and int(cached.get("ttl") or 0) > now:
+        return bool(cached.get("is_admin"))
+    try:
+        resp = _tg_request(_token_for("movie"), "getChatMember",
+                           {"chat_id": chat_id, "user_id": int(uid)})
+    except Exception as e:
+        log.warning("getChatMember failed for %s in %s: %s", uid, chat_id, e)
+        return False
+    if not resp.get("ok"):
+        log.warning("getChatMember not ok for %s in %s: %s", uid, chat_id,
+                    resp.get("description"))
+        return False
+    is_admin = (resp.get("result") or {}).get("status") in ("creator", "administrator")
+    try:
+        ddb_put({"PK": pk, "SK": sk, "is_admin": is_admin, "checked_at": _now_iso(),
+                 "ttl": now + _ADMIN_CACHE_SECS})
+    except Exception as e:
+        log.warning("admin cache write failed: %s", e)
+    return is_admin
+
+
+def _resolve_member(chat_id, ident):
+    """A group member's user_id from an @username or display name (case-insensitive),
+    matched against member#* rows in this chat. None if unknown or ambiguous."""
+    key = str(ident or "").strip().lstrip("@").lower()
+    if not key:
+        return None
+    members = [i for i in ddb_query(_pk("movie", chat_id))
+               if str(i.get("SK", "")).startswith("member#") and i.get("user_id") is not None]
+    by_user = [m for m in members if str(m.get("username") or "").lower() == key]
+    if len(by_user) == 1:
+        return int(by_user[0]["user_id"])
+    by_name = [m for m in members if " ".join(str(m.get("display_name") or "").lower().split())
+               == " ".join(key.split())]
+    if len(by_name) == 1:
+        return int(by_name[0]["user_id"])
+    return None
+
+
+def _find_on_shelf(chat_id, owner, title):
+    """The owner's lib row matching title by slug or exact title (case-insensitive)."""
+    tl = " ".join(str(title or "").lower().split())
+    if not tl:
+        return None
+    slug = _slugify(title).lower()
+    lib = get_library(chat_id, owner)
+    return (next((f for f in lib if str(f.get("slug", "")).lower() == slug), None)
+            or next((f for f in lib if " ".join(str(f.get("title") or "").lower().split()) == tl),
+                    None))
+
+
+def correct_film(chat_id, title, year=None, director=None, target=None):
+    """Re-resolve a film already on target's shelf (target = owner user_id) and replace
+    the row in place under the new slug, keeping owner_id, added_at and watched.
+    The year / director hints steer the TMDB match; the rating comes from Letterboxd
+    via the normal lookup_film path."""
+    old = _find_on_shelf(chat_id, target, title)
+    if not old:
+        return {"status": "not_found", "changed": 0, "old": None, "new": None,
+                "note": f"no film titled {title!r} on that shelf"}
+    q_title, q_year = old.get("title") or title, year
+    if director and not q_year:          # pin the year from the director's filmography
+        want = _norm_title(q_title)
+        hit = next((f for f in _tmdb_director_films(director)
+                    if _norm_title(f.get("title")) == want and f.get("year")), None)
+        if hit:
+            q_year = hit["year"]
+    info = lookup_film(q_title, q_year)
+    if not info.get("found"):
+        return {"status": "not_found", "changed": 0, "old": _film_brief(old), "new": None,
+                "note": "the corrected film could not be resolved"}
+    slug = info.get("slug") or _slugify(info.get("title") or q_title)
+    new = dict(old)
+    new.update({
+        "SK": f"lib#{target}#{slug}", "slug": slug,
+        "title": info.get("title") or q_title,
+        "year": str(info.get("year") or q_year or ""),
+        "tmdb_id": info.get("tmdb_id"),
+        "runtime_min": info.get("runtime_min"),
+        "genres": info.get("genres") or [],
+        "language": info.get("language"),
+        "countries": info.get("countries") or [],
+        "description": info.get("description") or "",
+        "rating": (str(info["rating"]) if info.get("rating") is not None else None),
+        "rating_scale": info.get("rating_scale"),
+        "rt_rating": info.get("rt_rating"),
+    })
+    for k in ("owner_id", "added_at", "watched"):     # never touched by a correction
+        if k in old:
+            new[k] = old[k]
+    if new == old:
+        return {"status": "noop", "changed": 0, "old": _film_brief(old),
+                "new": _film_brief(new), "note": "already matches that film"}
+    ddb_put(new)
+    if new["SK"] != old["SK"]:
+        ddb_delete(_pk("movie", chat_id), old["SK"])
+    return {"status": "ok", "changed": 1, "old": _film_brief(old), "new": _film_brief(new)}
+
+
+def _film_brief(item):
+    return {k: item.get(k) for k in ("title", "year", "slug", "tmdb_id", "runtime_min",
+                                     "genres", "rating", "rating_scale")}
+
+
+# --------------------------------------------------------------------------- #
 # Seeding — link a named starter library to a real Telegram user_id (never a
 # phone number; bots can't see those). Starter films load under owner
 # "seed:<name>" (tools/seed_libraries.py); /claim or NL "I'm <name>" reassigns.
@@ -3385,10 +3508,11 @@ MOVIE_TOOLS = [
                                                           "year": {"type": "integer"}},
                                            "required": ["title"]}}}},
     {"toolSpec": {"name": "add_to_library",
-                  "description": "Add a film to the SENDER's personal library (also for 'I want to see X'). Pass year separately when known; NEVER concatenate the year into title.",
+                  "description": "Add a film to the SENDER's personal library (also for 'I want to see X'), or to another member's shelf via target (admins only). Pass year separately when known; NEVER concatenate the year into title.",
                   "inputSchema": {"json": {"type": "object",
                                            "properties": {"title": {"type": "string"},
-                                                          "year": {"type": "integer"}},
+                                                          "year": {"type": "integer"},
+                                                          "target": {"type": "string", "description": "Optional @username or display name of ANOTHER group member whose shelf to edit (group admins only). Omit for the sender's own shelf."}},
                                            "required": ["title"]}}}},
     {"toolSpec": {"name": "add_director",
                   "description": "Add every film directed by a person ('add all Lanthimos films') — resolves the filmography via TMDB, not from memory.",
@@ -3396,9 +3520,18 @@ MOVIE_TOOLS = [
                                            "properties": {"director": {"type": "string"}},
                                            "required": ["director"]}}}},
     {"toolSpec": {"name": "remove_from_library",
-                  "description": "Remove a film from the SENDER's library.",
+                  "description": "Remove a film from the SENDER's library, or from another member's shelf via target (admins only).",
                   "inputSchema": {"json": {"type": "object",
-                                           "properties": {"title": {"type": "string"}},
+                                           "properties": {"title": {"type": "string"},
+                                                          "target": {"type": "string", "description": "Optional @username or display name of ANOTHER group member whose shelf to edit (group admins only). Omit for the sender's own shelf."}},
+                                           "required": ["title"]}}}},
+    {"toolSpec": {"name": "correct_film",
+                  "description": "Fix a film that is ALREADY on a shelf but resolved to the wrong movie (wrong version/year/remake). Re-resolves it using the year and/or director hint and replaces the entry in place, keeping when it was added and whether it was watched. title = the film as it appears on the shelf now.",
+                  "inputSchema": {"json": {"type": "object",
+                                           "properties": {"title": {"type": "string"},
+                                                          "year": {"type": "integer"},
+                                                          "director": {"type": "string"},
+                                                          "target": {"type": "string", "description": "Optional @username or display name of ANOTHER group member whose shelf to edit (group admins only). Omit for the sender's own shelf."}},
                                            "required": ["title"]}}}},
     {"toolSpec": {"name": "list_library",
                   "description": "List films in someone's library. Pass whose=<name> to view another person (e.g. 'Asa'); omit for the sender's own. If the person is unknown the result has resolved=false — then DO NOT show anyone else's films.",
@@ -3528,8 +3661,18 @@ MOVIE_SYSTEM = (
     "'We watched X instead', 'remove that as the winner', 'we didn't end up watching it' all "
     "mean call this. Do it ONLY for a real correction of what was watched, never for someone "
     "merely mentioning another film.\n"
+    "- OTHER PEOPLE'S SHELVES: add, remove and correct_film take an optional target (an "
+    "@username or display name). Pass it only when the sender explicitly asks to change "
+    "SOMEONE ELSE's shelf; omit it for their own. Only group admins may do this: if the "
+    "result's status is \"forbidden\", say plainly that only group admins can edit someone "
+    "else's shelf and change nothing; if it is not_found with no such member, say you don't "
+    "know that person.\n"
+    "- WRONG FILM ON A SHELF: when someone says a shelf entry is the wrong version, year or "
+    "remake ('that's the 1960 one, not the remake', 'the Lynch Dune'), call correct_film with "
+    "the title as it is on the shelf plus the year and/or director they gave; report the old "
+    "and new film from the result.\n"
     "- TRUTHFUL CONFIRMATIONS: every shelf-changing ability (add, add a director, remove, "
-    "claim, load starter shelves, correct the winner) returns a status and a changed count. "
+    "correct a film, claim, load starter shelves, correct the winner) returns a status and a changed count. "
     "NEVER tell anyone an action succeeded ('Done', '✅', 'it's off your shelf', 'added') "
     "unless that result has status \"ok\" AND changed > 0. If status is not_found, noop or "
     "error, or changed is 0, say plainly what actually happened (e.g. 'I couldn't find "
@@ -3633,7 +3776,7 @@ def _tool_result_for_add(item, info):
 
 # Shelf-mutating tools always report what actually happened, so the model can never
 # confirm a change that didn't land: {"status": ok|not_found|noop|error, "changed": n}.
-_SHELF_TOOLS = ("add_to_library", "add_director", "remove_from_library",
+_SHELF_TOOLS = ("add_to_library", "add_director", "remove_from_library", "correct_film",
                 "claim_library", "seed_starter_libraries", "correct_last_winner")
 
 
@@ -3651,16 +3794,42 @@ def _dispatch_tool(name, tool_input, ctx):
     return _dispatch_other_tool(name, tool_input, ctx)
 
 
+def _shelf_owner(ctx, tool_input):
+    """(owner_uid, None) for the shelf a tool should act on, or (None, result) when
+    the target is unknown or the caller may not edit it. No target -> caller's own."""
+    chat_id, uid = ctx["chat_id"], ctx.get("user_id")
+    target = (tool_input.get("target") or "").strip()
+    if not target:
+        return uid, None
+    tuid = _resolve_member(chat_id, target)
+    if tuid is None:
+        return None, {"status": "not_found", "changed": 0, "target": target,
+                      "note": "no group member by that @username or name"}
+    if str(tuid) != str(uid) and not _is_group_admin(chat_id, uid):
+        return None, {"status": "forbidden", "changed": 0, "target": target,
+                      "note": "only group admins can edit someone else's shelf"}
+    return tuid, None
+
+
 def _dispatch_shelf_tool(name, tool_input, ctx):
     chat_id, uid = ctx["chat_id"], ctx.get("user_id")
+    if name in ("add_to_library", "remove_from_library", "correct_film"):
+        owner, refusal = _shelf_owner(ctx, tool_input)
+        if refusal:
+            return refusal
+        whose = {} if str(owner) == str(uid) else {"shelf_owner": mention_for(chat_id, owner)}
+    if name == "correct_film":
+        res = correct_film(chat_id, tool_input["title"], tool_input.get("year"),
+                           tool_input.get("director"), target=owner)
+        return {**res, **whose}
     if name == "add_to_library":
-        before = _shelf_slugs(chat_id, uid)
-        item, info = add_to_library(chat_id, uid, tool_input["title"], tool_input.get("year"))
+        before = _shelf_slugs(chat_id, owner)
+        item, info = add_to_library(chat_id, owner, tool_input["title"], tool_input.get("year"))
         _clear_pending(chat_id, uid)
         new = item.get("slug") not in before
-        return {**_tool_result_for_add(item, info),
+        return {**_tool_result_for_add(item, info), **whose,
                 "status": "ok" if new else "noop", "changed": 1 if new else 0,
-                **({} if new else {"note": "already on the sender's shelf"})}
+                **({} if new else {"note": "already on that shelf"})}
     if name == "add_director":
         before = _shelf_slugs(chat_id, uid)
         added = add_director(chat_id, uid, tool_input["director"])
@@ -3668,12 +3837,12 @@ def _dispatch_shelf_tool(name, tool_input, ctx):
         return {"added_titles": added, "count": len(added), "changed": changed,
                 "status": "ok" if changed else ("noop" if added else "not_found")}
     if name == "remove_from_library":
-        removed = remove_from_library(chat_id, uid, tool_input["title"])
+        removed = remove_from_library(chat_id, owner, tool_input["title"])
         if removed:
-            return {"status": "ok", "changed": 1, "removed": removed}
-        return {"status": "not_found", "changed": 0, "removed": None,
+            return {"status": "ok", "changed": 1, "removed": removed, **whose}
+        return {"status": "not_found", "changed": 0, "removed": None, **whose,
                 "title": tool_input["title"],
-                "note": "no film by that title on the sender's own shelf; nothing was removed"}
+                "note": "no film by that title on that shelf; nothing was removed"}
     if name == "claim_library":
         res = claim_library(chat_id, tool_input["name"], uid)
         st = res.get("status")

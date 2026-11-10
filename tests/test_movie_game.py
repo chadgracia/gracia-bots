@@ -2065,6 +2065,126 @@ def test_shelf_tools_report_status_and_changed():
     assert r["status"] == "error" and r["changed"] == 0
 
 
+# ---- admin shelf editing ------------------------------------------------- #
+def _admin_setup(admin_ids):
+    """Members 1 (Chad, @chad), 2 (Asa, @AsaFoxColorist); getChatMember stubbed so
+    admin_ids are administrators. Returns the list of getChatMember calls."""
+    _reset()
+    L.remember_member(CHAT, 1, "Chad", "chad")
+    L.remember_member(CHAT, 2, "Asa", "AsaFoxColorist")
+    calls = []
+
+    def fake_tg(token, method, payload):
+        calls.append((method, payload))
+        assert method == "getChatMember"
+        st = "administrator" if payload["user_id"] in admin_ids else "member"
+        return {"ok": True, "result": {"status": st}}
+    L._tg_request = fake_tg
+    L._token_for = lambda mode: "1234567890:AAFakeTokenForTestsOnly000000000000"
+    return calls
+
+
+_ORIG_TG, _ORIG_TOKEN_FOR = L._tg_request, L._token_for
+
+
+def _admin_teardown():
+    L._tg_request, L._token_for = _ORIG_TG, _ORIG_TOKEN_FOR
+
+
+def test_admin_edits_another_members_shelf():
+    calls = _admin_setup({1})
+    try:
+        r = L._dispatch_tool("add_to_library", {"title": "Poetry", "target": "@asafoxcolorist"},
+                             _shelf_ctx(1))
+        assert r["status"] == "ok" and r["changed"] == 1
+        assert [f["title"] for f in L.get_library(CHAT, 2)] == ["Poetry"]
+        assert L.get_library(CHAT, 1) == []
+        r = L._dispatch_tool("remove_from_library", {"title": "poetry", "target": "Asa"},
+                             _shelf_ctx(1))
+        assert r["status"] == "ok" and r["changed"] == 1 and L.get_library(CHAT, 2) == []
+        assert len(calls) == 1                     # second check served from the 10-min cache
+        cache = STORE[(L._pk(MODE, CHAT), "admincache#1")]
+        assert cache["is_admin"] is True and cache["ttl"] == NOW[0] + 600
+        NOW[0] += 601                               # cache expired -> asks Telegram again
+        assert L._is_group_admin(CHAT, 1) is True and len(calls) == 2
+    finally:
+        _admin_teardown()
+
+
+def test_non_admin_cannot_edit_another_shelf():
+    _admin_setup(set())
+    try:
+        L.add_to_library(CHAT, 1, "Mirror")
+        before = copy.deepcopy({k: v for k, v in STORE.items() if k[1].startswith("lib#")})
+        for tool, inp in (("add_to_library", {"title": "Poetry", "target": "chad"}),
+                          ("remove_from_library", {"title": "Mirror", "target": "@chad"}),
+                          ("correct_film", {"title": "Mirror", "year": 1975, "target": "Chad"})):
+            r = L._dispatch_tool(tool, inp, _shelf_ctx(2))
+            assert r == {"status": "forbidden", "changed": 0, "target": inp["target"],
+                         "note": "only group admins can edit someone else's shelf"}, r
+        assert {k: v for k, v in STORE.items() if k[1].startswith("lib#")} == before
+        assert "only group admins can edit someone else's shelf" in L.MOVIE_SYSTEM
+        # own shelf via own name is still fine for a non-admin
+        r = L._dispatch_tool("add_to_library", {"title": "Poetry", "target": "Asa"}, _shelf_ctx(2))
+        assert r["status"] == "ok"
+    finally:
+        _admin_teardown()
+
+
+def test_unknown_target_returns_not_found():
+    _admin_setup({1})
+    try:
+        r = L._dispatch_tool("add_to_library", {"title": "Poetry", "target": "@nobody"},
+                             _shelf_ctx(1))
+        assert r["status"] == "not_found" and r["changed"] == 0
+        assert not any(k[1].startswith("lib#") for k in STORE)
+    finally:
+        _admin_teardown()
+
+
+def test_correct_film_swaps_metadata_keeps_owner_added_watched():
+    _admin_setup({1})
+    pk = L._pk(MODE, CHAT)
+    STORE[(pk, "lib#2#solaris")] = {
+        "PK": pk, "SK": "lib#2#solaris", "slug": "solaris", "owner_id": 2,
+        "title": "Solaris", "year": "2002", "tmdb_id": 2103, "runtime_min": 99,
+        "genres": ["Science Fiction"], "rating": "3.1", "rating_scale": 5,
+        "added_at": "2026-01-01T00:00:00+00:00", "watched": True, "description": "Soderbergh"}
+    seen = {}
+
+    def fake_lookup_1972(title, year=None):
+        seen["q"] = (title, year)
+        return {"found": True, "title": "Solaris", "year": "1972", "slug": "solaris-1972",
+                "tmdb_id": 593, "runtime_min": 167, "genres": ["Drama", "Science Fiction"],
+                "description": "Tarkovsky", "language": "ru", "countries": ["SU"],
+                "rating": 4.2, "rating_scale": 5, "rt_rating": "93%", "alts": []}
+    orig_lookup, orig_dir = L.lookup_film, L._tmdb_director_films
+    L.lookup_film = fake_lookup_1972
+    L._tmdb_director_films = lambda name: [{"title": "Solaris", "year": "1972"}]
+    try:
+        r = L._dispatch_tool("correct_film",
+                             {"title": "solaris", "director": "Tarkovsky", "target": "Asa"},
+                             _shelf_ctx(1))
+    finally:
+        L.lookup_film, L._tmdb_director_films = orig_lookup, orig_dir
+        _admin_teardown()
+    assert seen["q"] == ("Solaris", "1972")              # director hint pinned the year
+    assert r["status"] == "ok" and r["changed"] == 1
+    assert r["old"]["year"] == "2002" and r["new"]["year"] == "1972"
+    assert (pk, "lib#2#solaris") not in STORE
+    row = STORE[(pk, "lib#2#solaris-1972")]
+    assert row["tmdb_id"] == 593 and row["runtime_min"] == 167 and row["rating"] == "4.2"
+    assert row["description"] == "Tarkovsky" and row["language"] == "ru"
+    assert row["owner_id"] == 2 and row["watched"] is True
+    assert row["added_at"] == "2026-01-01T00:00:00+00:00"
+
+
+def test_correct_film_not_on_shelf_is_not_found():
+    _reset()
+    r = L._dispatch_tool("correct_film", {"title": "Nope"}, _shelf_ctx(1))
+    assert r["status"] == "not_found" and r["changed"] == 0
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
