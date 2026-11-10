@@ -2533,6 +2533,67 @@ def test_live_game_still_gates_ambient_chat():
     assert sent == [] and fb.calls == 0
 
 
+# ---- shelf recognition without a seedclaim -------------------------------- #
+def _dariia_setup(n_films):
+    _reset()
+    L.remember_member(CHAT, 393306645, "Dariia", "dariuozy")
+    for i in range(n_films):
+        L.add_to_library(CHAT, 393306645, f"Film {i}")
+
+
+def test_member_with_rows_and_no_seedclaim_gets_shelf_listed():
+    _dariia_setup(28)
+    assert not any(s.startswith("seedclaim#") for (_p, s) in STORE)
+    own = L._dispatch_tool("list_library", {}, _shelf_ctx(393306645))
+    assert own["resolved"] and own["has_shelf"] and own["count"] == 28
+    assert len(own["films"]) == 28 and "next_step" not in own
+    for whose in ("Daria", "Dariia", "@dariuozy", "dariuozy"):     # by name / nickname
+        r = L._dispatch_tool("list_library", {"whose": whose}, _shelf_ctx(1))
+        assert r["resolved"] and r["count"] == 28, whose
+        r = L._dispatch_tool("list_library", {"whose": whose}, _shelf_ctx(393306645))
+        assert r["owner"] == "your" and r["count"] == 28, whose    # her own name -> own shelf
+    assert L.resolve_owner(CHAT, "Daria")[0] == "393306645"
+    assert "call list_library first" in L.MOVIE_SYSTEM
+    assert "haven't claimed a shelf" not in L.MOVIE_SYSTEM
+
+
+def test_member_with_zero_rows_and_matching_seed_is_offered_claim():
+    _reset()
+    L.remember_member(CHAT, 77, "Asa", "AsaFoxColorist")
+    L.seed_starter_libraries(CHAT)
+    r = L._dispatch_tool("list_library", {}, _shelf_ctx(77))
+    assert r["has_shelf"] is False and r["count"] == 0
+    assert r["starter_to_claim"] == "Asa" and "I'm Asa" in r["next_step"]
+    L.claim_library(CHAT, "Asa", 77)
+    r = L._dispatch_tool("list_library", {}, _shelf_ctx(77))
+    assert r["has_shelf"] and r["count"] == 6 and "next_step" not in r
+
+
+def test_member_with_zero_rows_and_no_seed_is_told_to_add():
+    _dariia_setup(0)
+    L.seed_starter_libraries(CHAT)                 # starters exist, none match Dariia
+    r = L._dispatch_tool("list_library", {}, _shelf_ctx(393306645))
+    assert r["has_shelf"] is False and r["starter_to_claim"] is None
+    assert "add films" in r["next_step"]
+
+
+def test_ratings_and_recommend_resolve_unclaimed_member_by_name():
+    _dariia_setup(2)
+    assert L.resolve_owner(CHAT, "@dariuozy") == ("393306645", "Dariia")
+    r = L._dispatch_tool("get_ratings", {"whose": "Daria"}, _shelf_ctx(1))
+    assert r.get("resolved") is not False and r["ratings"] == []
+    r = L._dispatch_tool("recommend_films", {"whose": "Dariia"}, _shelf_ctx(1))
+    assert r.get("resolved") is not False
+
+
+def test_history_names_participants():
+    _dariia_setup(0)
+    pk = L._pk(MODE, CHAT)
+    L.ddb_put({"PK": pk, "SK": "history#s1", "winner_title": "Mirror", "watched_date": "2026-11-01",
+               "participants": [393306645]})
+    assert L.get_history(CHAT)[0]["participant_names"] == ["Dariia"]
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
